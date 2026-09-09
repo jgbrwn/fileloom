@@ -39,7 +39,16 @@ The app creates a starter site on first run. To use another workspace:
 
 Set `FILELOOM_OWNER_EMAIL` (or pass `-owner-email`) to restrict CMS routes when the exe.dev proxy sends `X-ExeDev-Email`. Local requests without that header remain convenient for development.
 
-## Workspace layout
+## Run as a service
+
+The repository includes `fileloom.service` for the VM:
+
+```bash
+sudo cp fileloom.service /etc/systemd/system/fileloom.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now fileloom
+```
+
 
 ```text
 site/
