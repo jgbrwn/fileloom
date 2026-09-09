@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fileloom · Dashboard</title>
+  <link rel="stylesheet" href="/_cms/assets/admin.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="wordmark" href="/_cms/"><span class="mark">✦</span> Fileloom</a>
+      <nav class="topnav">
+        <a class="active" href="/_cms/">Dashboard</a>
+        <a href="/" target="_blank" rel="noreferrer">View site ↗</a>
+        <a href="/_cms/new?type=page">New page</a>
+        <a class="button button-primary button-small" href="/_cms/new?type=post">New post <span>＋</span></a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="app-shell">
+    <section class="intro-row">
+      <div>
+        <p class="kicker">Visual static publishing</p>
+        <h1 id="site-title">Your site is a folder of files.</h1>
+        <p class="intro-copy" id="site-description">Loading your workspace…</p>
+      </div>
+      <div class="intro-actions">
+        <button id="build-button" class="button button-dark"><span class="button-icon">↻</span> Build site</button>
+        <a class="button button-quiet" href="/_cms/new?type=post">Write something <span>→</span></a>
+      </div>
+    </section>
+
+    <section class="stats-grid" aria-label="Site summary">
+      <article class="stat-card"><span class="stat-label">Posts</span><strong id="posts-count">—</strong><span class="stat-hint">HTML files</span></article>
+      <article class="stat-card"><span class="stat-label">Pages</span><strong id="pages-count">—</strong><span class="stat-hint">Always yours</span></article>
+      <article class="stat-card"><span class="stat-label">Media</span><strong id="media-count">—</strong><span class="stat-hint">Files in /media</span></article>
+      <article class="stat-card accent-card"><span class="stat-label">Published files</span><strong id="published-count">—</strong><span class="stat-hint" id="last-built">Not built yet</span></article>
+    </section>
+
+    <section class="workspace-grid">
+      <div class="panel content-panel">
+        <div class="panel-heading">
+          <div><p class="kicker">Content</p><h2>Everything you write</h2></div>
+          <div class="filter-pills" role="tablist" aria-label="Filter content">
+            <button class="filter-pill active" data-filter="all">All</button>
+            <button class="filter-pill" data-filter="post">Posts</button>
+            <button class="filter-pill" data-filter="page">Pages</button>
+            <button class="filter-pill" data-filter="draft">Drafts</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Title</th><th>Type</th><th>Updated</th><th>Status</th><th></th></tr></thead>
+            <tbody id="content-list"><tr><td colspan="5" class="empty-cell">Loading content…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <aside class="side-stack">
+        <section class="panel workflow-panel">
+          <p class="kicker">The Fileloom way</p>
+          <h2>No database. No lock-in.</h2>
+          <ol class="workflow-list">
+            <li><span>01</span><div><strong>Edit HTML</strong><small>Use the visual editor or your favorite code editor.</small></div></li>
+            <li><span>02</span><div><strong>Build static files</strong><small>Indexes, tags, RSS, and sitemap are regenerated.</small></div></li>
+            <li><span>03</span><div><strong>Ship the public folder</strong><small>Visitors only ever see ordinary HTML.</small></div></li>
+          </ol>
+        </section>
+        <section class="panel quick-panel">
+          <div class="quick-icon">⌘</div>
+          <div><h3>Theme editing is next</h3><p>The site is already driven by plain HTML templates and CSS in <code>site/themes</code>.</p></div>
+        </section>
+      </aside>
+    </section>
+    <p class="toast" id="toast" role="status" aria-live="polite"></p>
+  </main>
+  <script src="/_cms/assets/admin.js"></script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fileloom · New content</title>
+  <link rel="stylesheet" href="/_cms/assets/admin.css">
+</head>
+<body>
+  <header class="topbar"><div class="topbar-inner"><a class="wordmark" href="/_cms/"><span class="mark">✦</span> Fileloom</a><nav class="topnav"><a href="/_cms/">← Dashboard</a></nav></div></header>
+  <main class="form-shell">
+    <section class="panel form-card">
+      <div class="form-heading"><p class="kicker" id="form-kicker">New content</p><h1 id="form-title">Make a new thing.</h1></div>
+      <form id="content-form">
+        <div class="form-grid">
+          <div class="form-field full"><label for="title">Title</label><input id="title" name="title" required autofocus placeholder="A title worth clicking"></div>
+          <div class="form-field"><label for="slug">Slug</label><input id="slug" name="slug" placeholder="generated-from-title"></div>
+          <div class="form-field"><label for="date">Date</label><input id="date" name="date" type="date"></div>
+          <div class="form-field"><label for="status">Status</label><select id="status" name="status"><option value="draft">Draft</option><option value="published">Published</option></select></div>
+          <div class="form-field"><label for="tags">Tags</label><input id="tags" name="tags" placeholder="design, notes"></div>
+          <div class="form-field full"><label for="excerpt">Excerpt</label><input id="excerpt" name="excerpt" placeholder="A short description for cards and feeds"></div>
+          <div class="form-field full"><label for="html">HTML content</label><textarea id="html" name="html"><h1>Start here</h1>
+<p>Write ordinary HTML. Fileloom will let you refine it visually, then generate the public site.</p></textarea></div>
+        </div>
+        <div class="form-actions"><span class="form-note">HTML is the source of truth.</span><button class="button button-primary" type="submit">Create and open editor <span>→</span></button></div>
+      </form>
+      <p class="toast" id="toast" role="status" aria-live="polite"></p>
+    </section>
+  </main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const type = params.get("type") === "page" ? "page" : "post";
+    const title = document.querySelector("#form-title");
+    const kicker = document.querySelector("#form-kicker");
+    const date = document.querySelector("#date");
+    const now = new Date();
+    date.value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    if (type === "page") { title.textContent = "Make a new page."; kicker.textContent = "New page"; }
+    else { title.textContent = "Make a new post."; kicker.textContent = "New post"; }
+    const slug = document.querySelector("#slug");
+    document.querySelector("#title").addEventListener("input", (event) => { if (!slug.dataset.touched) slug.value = event.target.value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); });
+    slug.addEventListener("input", () => { slug.dataset.touched = "1"; });
+    function escapeHTML(value) { return String(value ?? "").replace(/[&<>\"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c])); }
+    document.querySelector("#content-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = event.target.querySelector("button");
+      button.disabled = true;
+      const payload = Object.fromEntries(new FormData(event.target));
+      payload.type = type;
+      try {
+        const response = await fetch("/_cms/api/items", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || response.statusText);
+        location.href = data.item.editor_url;
+      } catch (error) {
+        const toast = document.querySelector("#toast"); toast.textContent = error.message; toast.classList.add("visible", "error");
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

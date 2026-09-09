@@ -1,0 +1,19 @@
+[Unit]
+Description=Fileloom HTML-first static CMS
+After=network.target
+
+[Service]
+Type=simple
+User=exedev
+Group=exedev
+WorkingDirectory=/home/exedev/playground/fileloom
+ExecStart=/home/exedev/playground/fileloom/fileloom -listen :8000 -site site -web web
+Restart=always
+RestartSec=5
+Environment=HOME=/home/exedev
+Environment=USER=exedev
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

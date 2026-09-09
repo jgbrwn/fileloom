@@ -1,0 +1,7 @@
+{
+  "title": "A Fileloom site",
+  "description": "An HTML-first static site made with Fileloom.",
+  "base_url": "http://localhost:8000",
+  "theme": "default",
+  "footer": "Made with Fileloom."
+}
