@@ -74,6 +74,7 @@ function renderGit(data) {
   $("#git-remote").textContent = status.remote || "none";
   $("#git-commit").disabled = !status.available;
   $("#git-push").disabled = !status.available || !status.remote;
+  $("#git-init").hidden = !!status.available;
   $("#git-configure").onclick = () => $("#git-dialog")?.showModal();
   $("#git-auto-commit").checked = !!config.auto_commit;
   $("#git-auto-push").checked = !!config.auto_push;
@@ -144,6 +145,12 @@ $("#git-config-form")?.addEventListener("submit", async (event) => {
     $("#git-dialog").close(); showToast("Git settings saved."); await loadDashboard();
   } catch (error) { showToast(error.message, true); }
   finally { button.disabled = false; }
+});
+
+$("#git-init")?.addEventListener("click", async () => {
+  if (!confirm("Initialize a separate Git repository inside site/?")) return;
+  try { await getJSON("/_cms/api/git/init", { method: "POST" }); showToast("Initialized the site repository."); await loadDashboard(); }
+  catch (error) { showToast(error.message, true); }
 });
 
 $("#git-commit")?.addEventListener("click", async () => {

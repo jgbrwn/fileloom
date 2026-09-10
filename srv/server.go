@@ -280,6 +280,9 @@ func (s *Server) ensureSite() error {
 		}
 	}
 
+	if err := writeIfMissing(filepath.Join(s.SiteDir, ".gitignore"), []byte("/public/\n*.tmp\n")); err != nil {
+		return err
+	}
 	if err := writeIfMissing(filepath.Join(s.SiteDir, "site.json"), []byte(defaultSiteJSON)); err != nil {
 		return err
 	}
@@ -1324,6 +1327,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleGitAPI(w, r)
 	case "/_cms/api/git/config":
 		s.handleGitConfigAPI(w, r)
+	case "/_cms/api/git/init":
+		s.handleGitInitAPI(w, r)
 	case "/_cms/api/git/commit":
 		s.handleGitCommitAPI(w, r)
 	case "/_cms/api/git/push":
@@ -1998,23 +2003,38 @@ func runGit(repo string, args ...string) (string, error) {
 }
 
 func (s *Server) gitRepo() (string, error) {
-	repo, err := runGit(s.SiteDir, "rev-parse", "--show-toplevel")
+	repo := filepath.Clean(s.SiteDir)
+	gitDir := filepath.Join(repo, ".git")
+	if _, err := os.Stat(gitDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", errors.New("no Git repository at site/.git; initialize the site repository first")
+		}
+		return "", err
+	}
+	root, err := runGit(repo, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", err
 	}
-	return filepath.Clean(repo), nil
+	rootAbs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return "", err
+	}
+	repoAbs, err := filepath.Abs(repo)
+	if err != nil {
+		return "", err
+	}
+	if rootAbs != repoAbs {
+		return "", errors.New("site Git repository resolves outside the site workspace")
+	}
+	return repo, nil
 }
 
 func (s *Server) gitScope(repo string) ([]string, error) {
 	rel, err := filepath.Rel(repo, s.SiteDir)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return nil, errors.New("site directory is not inside the git repository")
+	if err != nil || rel != "." {
+		return nil, errors.New("site Git repository must be the site workspace")
 	}
-	rel = filepath.ToSlash(rel)
-	if rel != "." {
-		return []string{rel}, nil
-	}
-	return []string{"site.json", "content", "themes", "media"}, nil
+	return []string{".gitignore", "site.json", "content", "themes", "media"}, nil
 }
 
 func (s *Server) gitStatus(config GitConfig) GitStatus {
@@ -2140,6 +2160,29 @@ func (s *Server) handleGitAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"config": config.Git, "status": s.gitStatus(config.Git)})
 }
 
+func (s *Server) handleGitInitAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if _, err := os.Stat(filepath.Join(s.SiteDir, ".git")); err == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": s.gitStatus(GitConfig{Remote: "origin"})})
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if _, err := runGit(s.SiteDir, "init", "-b", "main"); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": config.Git, "status": s.gitStatus(config.Git)})
+}
 func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)

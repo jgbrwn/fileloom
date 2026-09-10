@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -110,6 +111,23 @@ func TestThemeActivation(t *testing.T) {
 	config, err := server.loadSiteConfig()
 	if err != nil || config.Theme != "sunset" {
 		t.Fatalf("theme = %q, err=%v", config.Theme, err)
+	}
+}
+func TestGitIntegrationDoesNotWalkParentRepo(t *testing.T) {
+	root := t.TempDir()
+	if output, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("init parent repo: %v: %s", err, output)
+	}
+	server, err := New(filepath.Join(root, "site"), filepath.Join(t.TempDir(), "web"), "")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	status := server.gitStatus(GitConfig{Remote: "origin"})
+	if status.Available {
+		t.Fatal("git integration incorrectly discovered the parent project repository")
+	}
+	if !strings.Contains(status.Error, "site/.git") {
+		t.Fatalf("unexpected Git status error: %q", status.Error)
 	}
 }
 func TestPathValidation(t *testing.T) {
