@@ -124,7 +124,7 @@ code { padding: 2px 5px; border-radius: 5px; background: rgba(0,0,0,.06); font-s
 .git-facts dt { color: var(--muted); font-size: .65rem; font-weight: 800; text-transform: uppercase; }
 .git-facts dd { overflow: hidden; margin: 3px 0 0; font-size: .78rem; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
 .git-actions { display: flex; gap: 8px; }
-@media (max-width: 920px) { .lower-grid { grid-template-columns: 1fr; } }
+@media (max-width: 920px) { .workspace-grid { grid-template-columns: 1fr; } .side-stack { grid-template-columns: 1fr 1fr; } .lower-grid { grid-template-columns: 1fr; } }
 
-@media (max-width: 720px) { .topbar-inner, .app-shell { width: min(100% - 28px, 1240px); } .topnav a:not(.button) { display: none; } .intro-row { display: block; } .intro-actions { justify-content: start; margin-top: 24px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } .panel-heading { display: block; } .filter-pills { justify-content: start; margin-top: 18px; } .side-stack { grid-template-columns: 1fr; } .form-grid { grid-template-columns: 1fr; } .form-field.full { grid-column: auto; } }
+@media (max-width: 720px) { .topbar-inner, .app-shell { width: min(100% - 28px, 1240px); } .topnav a:not(.button) { display: none; } .intro-row { display: block; } .intro-actions { justify-content: start; margin-top: 24px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } .workspace-grid { grid-template-columns: 1fr; } .content-panel, .side-stack, .lower-grid { min-width: 0; width: 100%; } .panel-heading { display: block; } .filter-pills { justify-content: start; margin-top: 18px; } .side-stack { grid-template-columns: 1fr; } .form-grid { grid-template-columns: 1fr; } .form-field.full { grid-column: auto; } }
 @media (max-width: 460px) { .stats-grid { gap: 8px; } .stat-card { min-height: 120px; padding: 14px; } .stat-card strong { font-size: 2.1rem; } .app-shell { padding-top: 48px; } }

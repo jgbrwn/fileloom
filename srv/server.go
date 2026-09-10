@@ -730,6 +730,7 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		return BuildResult{}, err
 	}
 	themeDir := filepath.Join(s.SiteDir, "themes", config.Theme)
+	themeStylesheetURL := fmt.Sprintf("/theme/style.css?v=%d", time.Now().UnixNano())
 	if err := copyDir(filepath.Join(themeDir, "assets"), filepath.Join(publicDir, "theme")); err != nil {
 		return BuildResult{}, fmt.Errorf("copy theme assets: %w", err)
 	}
@@ -749,14 +750,17 @@ func (s *Server) buildLocked() (BuildResult, error) {
 
 	indexDoc := Document{Type: "page", Title: config.Title, Date: time.Now().Format(dateFormat), URL: "/"}
 	indexValues := templateValues(indexDoc, config, navigation, postCards)
+	indexValues["theme.css"] = themeStylesheetURL
 	indexValues["content"] = applyTokens(indexTemplate, indexValues)
-	if err := writePublic(filepath.Join(publicDir, "index.html"), applyTokens(layout, indexValues)); err != nil {
+	indexOutput := applyTokens(layout, indexValues)
+	if err := writePublic(filepath.Join(publicDir, "index.html"), indexOutput); err != nil {
 		return BuildResult{}, err
 	}
 
 	files := 1
 	for _, doc := range published {
 		values := templateValues(doc, config, navigation, postCards)
+		values["theme.css"] = themeStylesheetURL
 		values["content"] = doc.HTML
 		bodyTemplate := pageTemplate
 		if doc.Type == "post" {
@@ -808,6 +812,7 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		}
 		doc := Document{Type: "page", Title: tagName, Date: time.Now().Format(dateFormat), URL: "/tag/" + slugify(tagName) + "/"}
 		values := templateValues(doc, config, navigation, postCardsHTML(tagPosts))
+		values["theme.css"] = themeStylesheetURL
 		values["tag"] = html.EscapeString(tagName)
 		values["content"] = applyTokens(tagTemplate, values)
 		output := applyTokens(layout, values)
@@ -824,6 +829,7 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		}
 		doc := Document{Type: "page", Title: categoryName, Date: time.Now().Format(dateFormat), URL: "/category/" + slugify(categoryName) + "/"}
 		values := templateValues(doc, config, navigation, postCardsHTML(categoryPosts))
+		values["theme.css"] = themeStylesheetURL
 		values["category"] = html.EscapeString(categoryName)
 		values["content"] = applyTokens(categoryTemplate, values)
 		output := applyTokens(layout, values)
@@ -836,6 +842,7 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	for year, yearPosts := range yearMap {
 		doc := Document{Type: "page", Title: year, Date: year, URL: "/archive/" + year + "/"}
 		values := templateValues(doc, config, navigation, postCardsHTML(yearPosts))
+		values["theme.css"] = themeStylesheetURL
 		values["year"] = html.EscapeString(year)
 		values["content"] = applyTokens(archiveTemplate, values)
 		output := applyTokens(layout, values)

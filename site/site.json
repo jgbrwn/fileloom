@@ -2,7 +2,7 @@
   "title": "A Fileloom site",
   "description": "An HTML-first static site made with Fileloom.",
   "base_url": "https://jgbrwn-playground.exe.xyz",
-  "theme": "default",
+  "theme": "terminal",
   "footer": "Made with Fileloom.",
   "git": {
     "enabled": false,
