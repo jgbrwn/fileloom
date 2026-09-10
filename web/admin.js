@@ -74,6 +74,13 @@ function renderGit(data) {
   $("#git-remote").textContent = status.remote || "none";
   $("#git-commit").disabled = !status.available;
   $("#git-push").disabled = !status.available || !status.remote;
+  $("#git-configure").onclick = () => $("#git-dialog")?.showModal();
+  $("#git-auto-commit").checked = !!config.auto_commit;
+  $("#git-auto-push").checked = !!config.auto_push;
+  $("#git-commit-on").value = config.commit_on || "build";
+  $("#git-remote-name").value = config.remote || status.remote_name || "origin";
+  $("#git-branch-name").value = config.branch || status.branch || "";
+  $("#git-remote-url").value = config.remote_url || status.remote || "";
 }
 
 function filteredItems() {
@@ -121,6 +128,22 @@ $("#build-button")?.addEventListener("click", async () => {
   try { const data = await getJSON("/_cms/api/build", { method: "POST" }); showToast(`Built ${data.build.files} files.`); await loadDashboard(); }
   catch (error) { showToast(error.message, true); }
   finally { button.disabled = false; button.innerHTML = '<span class="button-icon">↻</span> Build site'; }
+});
+
+$("#git-configure")?.addEventListener("click", () => $("#git-dialog")?.showModal());
+$("#git-cancel")?.addEventListener("click", () => $("#git-dialog")?.close());
+$("#git-config-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const payload = new URLSearchParams();
+  ["enabled", "auto_commit", "auto_push"].forEach((name) => payload.set(name, form.elements[name].checked ? "true" : "false"));
+  ["commit_on", "remote", "branch", "remote_url"].forEach((name) => payload.set(name, form.elements[name].value));
+  const button = $("#git-save"); button.disabled = true;
+  try {
+    await getJSON("/_cms/api/git/config", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: payload.toString() });
+    $("#git-dialog").close(); showToast("Git settings saved."); await loadDashboard();
+  } catch (error) { showToast(error.message, true); }
+  finally { button.disabled = false; }
 });
 
 $("#git-commit")?.addEventListener("click", async () => {

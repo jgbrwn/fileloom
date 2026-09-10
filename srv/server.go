@@ -54,6 +54,7 @@ type GitConfig struct {
 	AutoPush   bool   `json:"auto_push"`
 	CommitOn   string `json:"commit_on"`
 	Remote     string `json:"remote"`
+	RemoteURL  string `json:"remote_url,omitempty"`
 	Branch     string `json:"branch"`
 }
 
@@ -69,13 +70,14 @@ type ThemeInfo struct {
 }
 
 type GitStatus struct {
-	Available bool   `json:"available"`
-	Repo      string `json:"repo"`
-	Branch    string `json:"branch"`
-	Remote    string `json:"remote"`
-	Clean     bool   `json:"clean"`
-	Changes   int    `json:"changes"`
-	Error     string `json:"error,omitempty"`
+	Available  bool   `json:"available"`
+	Repo       string `json:"repo"`
+	Branch     string `json:"branch"`
+	Remote     string `json:"remote"`
+	RemoteName string `json:"remote_name"`
+	Clean      bool   `json:"clean"`
+	Changes    int    `json:"changes"`
+	Error      string `json:"error,omitempty"`
 }
 
 type Document struct {
@@ -1320,6 +1322,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleItemStatusAPI(w, r)
 	case "/_cms/api/git":
 		s.handleGitAPI(w, r)
+	case "/_cms/api/git/config":
+		s.handleGitConfigAPI(w, r)
 	case "/_cms/api/git/commit":
 		s.handleGitCommitAPI(w, r)
 	case "/_cms/api/git/push":
@@ -1368,7 +1372,7 @@ func (s *Server) handleSiteAPI(w http.ResponseWriter, r *http.Request) {
 		"media_count": mediaCount(filepath.Join(s.SiteDir, "media")),
 		"last_build":  lastBuild,
 		"themes":      themes,
-		"git":         s.gitStatus(config.Git),
+		"git":         map[string]any{"config": config.Git, "status": s.gitStatus(config.Git)},
 	})
 }
 
@@ -2046,6 +2050,7 @@ func (s *Server) gitStatus(config GitConfig) GitStatus {
 	status.Available = true
 	status.Repo = repo
 	status.Branch = branch
+	status.RemoteName = remote
 	status.Remote = remoteURL
 	status.Changes = changes
 	status.Clean = changes == 0
@@ -2135,6 +2140,101 @@ func (s *Server) handleGitAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"config": config.Git, "status": s.gitStatus(config.Git)})
 }
 
+func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	gitConfig := GitConfig{
+		Enabled:    formBool(r, "enabled"),
+		AutoCommit: formBool(r, "auto_commit"),
+		AutoPush:   formBool(r, "auto_push"),
+		CommitOn:   strings.ToLower(strings.TrimSpace(r.FormValue("commit_on"))),
+		Remote:     strings.TrimSpace(r.FormValue("remote")),
+		RemoteURL:  strings.TrimSpace(r.FormValue("remote_url")),
+		Branch:     strings.TrimSpace(r.FormValue("branch")),
+	}
+	if gitConfig.CommitOn != "build" && gitConfig.CommitOn != "change" {
+		writeJSONError(w, http.StatusBadRequest, "commit trigger must be build or change")
+		return
+	}
+	if gitConfig.Remote == "" {
+		gitConfig.Remote = "origin"
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9._-]+$`).MatchString(gitConfig.Remote) {
+		writeJSONError(w, http.StatusBadRequest, "remote name contains invalid characters")
+		return
+	}
+	if gitConfig.Branch != "" && !regexp.MustCompile(`^[A-Za-z0-9._/-]+$`).MatchString(gitConfig.Branch) {
+		writeJSONError(w, http.StatusBadRequest, "branch name contains invalid characters")
+		return
+	}
+	if err := validateRemoteURL(gitConfig.RemoteURL); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if gitConfig.RemoteURL != "" {
+		repo, err := s.gitRepo()
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "cannot configure a remote: "+err.Error())
+			return
+		}
+		if _, remoteErr := runGit(repo, "remote", "get-url", gitConfig.Remote); remoteErr != nil {
+			if _, addErr := runGit(repo, "remote", "add", gitConfig.Remote, gitConfig.RemoteURL); addErr != nil {
+				writeJSONError(w, http.StatusBadRequest, addErr.Error())
+				return
+			}
+		} else if _, setErr := runGit(repo, "remote", "set-url", gitConfig.Remote, gitConfig.RemoteURL); setErr != nil {
+			writeJSONError(w, http.StatusBadRequest, setErr.Error())
+			return
+		}
+	}
+	config.Git = gitConfig
+	if err := s.saveSiteConfig(config); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": config.Git, "status": s.gitStatus(config.Git)})
+}
+
+func formBool(r *http.Request, key string) bool {
+	value := strings.ToLower(strings.TrimSpace(r.FormValue(key)))
+	return value == "1" || value == "true" || value == "on" || value == "yes"
+}
+
+func validateRemoteURL(value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return errors.New("remote URL cannot contain newlines")
+	}
+	if strings.HasPrefix(value, "git@") && strings.Contains(value, ":") {
+		return nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || (parsed.Host == "" && !(parsed.Scheme == "file" && parsed.Path != "")) {
+		return errors.New("remote URL must be https://, ssh://, git://, file://, or git@host:path format")
+	}
+	if parsed.User != nil {
+		return errors.New("remote URL must not contain embedded credentials")
+	}
+	switch parsed.Scheme {
+	case "http", "https", "ssh", "git", "file":
+		return nil
+	default:
+		return errors.New("unsupported remote URL scheme")
+	}
+}
 func (s *Server) handleGitCommitAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)

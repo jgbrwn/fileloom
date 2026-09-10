@@ -85,12 +85,23 @@
         <div class="git-body">
           <p id="git-summary">Fileloom can commit source changes after a successful build. Push remains opt-in.</p>
           <dl class="git-facts"><div><dt>Branch</dt><dd id="git-branch">—</dd></div><div><dt>Changes</dt><dd id="git-changes">—</dd></div><div><dt>Remote</dt><dd id="git-remote">—</dd></div></dl>
-          <div class="git-actions"><button id="git-commit" class="button button-dark button-small">Commit source</button><button id="git-push" class="button button-quiet button-small">Push</button></div>
+          <div class="git-actions"><button id="git-configure" class="button button-quiet button-small">Configure</button><button id="git-commit" class="button button-dark button-small">Commit source</button><button id="git-push" class="button button-quiet button-small">Push</button></div>
         </div>
       </section>
     </section>
+    <dialog id="git-dialog" class="git-dialog">
+      <form method="dialog" id="git-config-form" class="git-config-form">
+        <div class="dialog-heading"><div><p class="kicker">Git setup</p><h2>Configure version control</h2></div><button class="dialog-close" value="cancel" aria-label="Close">×</button></div>
+        <p class="dialog-help">Fileloom stores these settings in <code>site/site.json</code>. Remote credentials are never stored here; use SSH keys or your Git credential helper.</p>
+        <label class="check-row"><input id="git-enabled" name="enabled" type="checkbox"><span><strong>Enable Git automation</strong><small>Allow automatic commits after changes or builds.</small></span></label>
+        <label class="check-row"><input id="git-auto-commit" name="auto_commit" type="checkbox"><span><strong>Auto-commit</strong><small>Commit the Fileloom source scope automatically.</small></span></label>
+        <div class="dialog-grid"><label>Commit trigger<select id="git-commit-on" name="commit_on"><option value="build">After successful build</option><option value="change">After each source change</option></select></label><label>Remote name<input id="git-remote-name" name="remote" value="origin" autocomplete="off"></label><label>Branch<input id="git-branch-name" name="branch" placeholder="current branch" autocomplete="off"></label><label>Remote URL<input id="git-remote-url" name="remote_url" placeholder="git@github.com:you/site.git" autocomplete="off"></label></div>
+        <label class="check-row"><input id="git-auto-push" name="auto_push" type="checkbox"><span><strong>Auto-push</strong><small>Push after an automatic commit. Configure credentials outside Fileloom.</small></span></label>
+        <div class="dialog-actions"><button type="button" id="git-cancel" class="button button-quiet">Cancel</button><button type="submit" id="git-save" class="button button-primary">Save Git settings</button></div>
+      </form>
+    </dialog>
     <p class="toast" id="toast" role="status" aria-live="polite"></p>
   </main>
-  <script src="/_cms/assets/admin.js?v=3"></script>
+  <script src="/_cms/assets/admin.js?v=6"></script>
 </body>
 </html>
