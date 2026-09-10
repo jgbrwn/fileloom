@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Fileloom · Dashboard</title>
-  <link rel="stylesheet" href="/_cms/assets/admin.css">
+  <link rel="stylesheet" href="/_cms/assets/admin.css?v=2">
 </head>
 <body>
   <header class="topbar">
@@ -70,12 +70,27 @@
         </section>
         <section class="panel quick-panel">
           <div class="quick-icon">⌘</div>
-          <div><h3>Theme editing is next</h3><p>The site is already driven by plain HTML templates and CSS in <code>site/themes</code>.</p></div>
+          <div><h3>Theme editing is live</h3><p>Choose a theme below, then use <strong>Edit visually</strong> to modify its HTML layout. CSS remains plain and inspectable in <code>site/themes</code>.</p></div>
         </section>
       </aside>
     </section>
+
+    <section class="lower-grid">
+      <section class="panel theme-panel">
+        <div class="panel-heading compact-heading"><div><p class="kicker">Appearance</p><h2>Choose a theme</h2></div><span class="panel-note">Plain HTML + CSS</span></div>
+        <div class="theme-grid" id="theme-list"><p class="empty-cell">Loading themes…</p></div>
+      </section>
+      <section class="panel git-panel">
+        <div class="panel-heading compact-heading"><div><p class="kicker">Version control</p><h2>Git workflow</h2></div><span id="git-status-pill" class="status draft">Checking…</span></div>
+        <div class="git-body">
+          <p id="git-summary">Fileloom can commit source changes after a successful build. Push remains opt-in.</p>
+          <dl class="git-facts"><div><dt>Branch</dt><dd id="git-branch">—</dd></div><div><dt>Changes</dt><dd id="git-changes">—</dd></div><div><dt>Remote</dt><dd id="git-remote">—</dd></div></dl>
+          <div class="git-actions"><button id="git-commit" class="button button-dark button-small">Commit source</button><button id="git-push" class="button button-quiet button-small">Push</button></div>
+        </div>
+      </section>
+    </section>
     <p class="toast" id="toast" role="status" aria-live="polite"></p>
   </main>
-  <script src="/_cms/assets/admin.js"></script>
+  <script src="/_cms/assets/admin.js?v=3"></script>
 </body>
 </html>

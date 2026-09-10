@@ -13,9 +13,10 @@ func main() {
 	site := flag.String("site", "site", "site workspace directory")
 	web := flag.String("web", "web", "web assets directory")
 	owner := flag.String("owner-email", os.Getenv("FILELOOM_OWNER_EMAIL"), "optional exe.dev email allowed into the CMS")
+	baseURL := flag.String("base-url", os.Getenv("FILELOOM_BASE_URL"), "canonical public URL used in feeds and sitemaps")
 	flag.Parse()
 
-	server, err := srv.New(*site, *web, *owner)
+	server, err := srv.NewWithOptions(*site, *web, *owner, *baseURL)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

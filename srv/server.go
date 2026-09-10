@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -29,33 +30,66 @@ const (
 )
 
 type Server struct {
-	SiteDir    string
-	WebDir     string
-	OwnerEmail string
+	SiteDir         string
+	WebDir          string
+	OwnerEmail      string
+	BaseURLOverride string
 
 	mu        sync.RWMutex
 	lastBuild BuildResult
 }
 
 type SiteConfig struct {
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	BaseURL     string    `json:"base_url"`
+	Theme       string    `json:"theme"`
+	Footer      string    `json:"footer"`
+	Git         GitConfig `json:"git"`
+}
+
+type GitConfig struct {
+	Enabled    bool   `json:"enabled"`
+	AutoCommit bool   `json:"auto_commit"`
+	AutoPush   bool   `json:"auto_push"`
+	CommitOn   string `json:"commit_on"`
+	Remote     string `json:"remote"`
+	Branch     string `json:"branch"`
+}
+
+type ThemeInfo struct {
+	Name        string `json:"name"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
-	BaseURL     string `json:"base_url"`
-	Theme       string `json:"theme"`
-	Footer      string `json:"footer"`
+	Author      string `json:"author"`
+	License     string `json:"license"`
+	Active      bool   `json:"active"`
+	HasLayout   bool   `json:"has_layout"`
+	HasStyles   bool   `json:"has_styles"`
+}
+
+type GitStatus struct {
+	Available bool   `json:"available"`
+	Repo      string `json:"repo"`
+	Branch    string `json:"branch"`
+	Remote    string `json:"remote"`
+	Clean     bool   `json:"clean"`
+	Changes   int    `json:"changes"`
+	Error     string `json:"error,omitempty"`
 }
 
 type Document struct {
-	Path    string   `json:"path"`
-	Type    string   `json:"type"`
-	Title   string   `json:"title"`
-	Slug    string   `json:"slug"`
-	Date    string   `json:"date"`
-	Status  string   `json:"status"`
-	Tags    []string `json:"tags"`
-	Excerpt string   `json:"excerpt"`
-	HTML    string   `json:"html,omitempty"`
-	URL     string   `json:"url"`
+	Path     string   `json:"path"`
+	Type     string   `json:"type"`
+	Title    string   `json:"title"`
+	Slug     string   `json:"slug"`
+	Date     string   `json:"date"`
+	Status   string   `json:"status"`
+	Tags     []string `json:"tags"`
+	Excerpt  string   `json:"excerpt"`
+	Category string   `json:"category,omitempty"`
+	HTML     string   `json:"html,omitempty"`
+	URL      string   `json:"url"`
 }
 
 type BuildResult struct {
@@ -75,11 +109,18 @@ const defaultSiteJSON = `{
   "title": "A Fileloom site",
   "description": "An HTML-first static site made with Fileloom.",
   "base_url": "http://localhost:8000",
-  "theme": "default",
-  "footer": "Made with Fileloom."
+	"theme": "default",
+  "footer": "Made with Fileloom.",
+  "git": {
+    "enabled": false,
+    "auto_commit": false,
+    "auto_push": false,
+    "commit_on": "build",
+    "remote": "origin",
+    "branch": ""
+  }
 }
 `
-
 const defaultLayoutTemplate = `<!doctype html>
 <html lang="en">
 <head>
@@ -133,6 +174,20 @@ const defaultTagTemplate = `<section class="hero compact">
 <div class="post-grid">{{posts}}</div>
 `
 
+const defaultCategoryTemplate = `<section class="hero compact">
+  <p class="eyebrow">Category</p>
+  <h1>{{category}}</h1>
+</section>
+<div class="post-grid">{{posts}}</div>
+`
+
+const defaultArchiveTemplate = `<section class="hero compact">
+  <p class="eyebrow">Archive</p>
+  <h1>{{year}}</h1>
+</section>
+<div class="post-grid">{{posts}}</div>
+`
+
 const defaultStyleCSS = `:root {
   color-scheme: light;
   --ink: #18212b;
@@ -177,6 +232,10 @@ h2 { font-size: 1.55rem; margin: 0; }
 `
 
 func New(siteDir, webDir, ownerEmail string) (*Server, error) {
+	return NewWithOptions(siteDir, webDir, ownerEmail, "")
+}
+
+func NewWithOptions(siteDir, webDir, ownerEmail, baseURL string) (*Server, error) {
 	if siteDir == "" {
 		siteDir = "site"
 	}
@@ -191,7 +250,12 @@ func New(siteDir, webDir, ownerEmail string) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve web directory: %w", err)
 	}
-	s := &Server{SiteDir: absSite, WebDir: absWeb, OwnerEmail: strings.TrimSpace(ownerEmail)}
+	s := &Server{
+		SiteDir:         absSite,
+		WebDir:          absWeb,
+		OwnerEmail:      strings.TrimSpace(ownerEmail),
+		BaseURLOverride: strings.TrimSpace(baseURL),
+	}
 	if err := s.ensureSite(); err != nil {
 		return nil, err
 	}
@@ -219,17 +283,28 @@ func (s *Server) ensureSite() error {
 	}
 	themeDir := filepath.Join(s.SiteDir, "themes", "default")
 	for name, contents := range map[string]string{
-		"layout.html": defaultLayoutTemplate,
-		"index.html":  defaultIndexTemplate,
-		"post.html":   defaultPostTemplate,
-		"page.html":   defaultPageTemplate,
-		"tag.html":    defaultTagTemplate,
+		"layout.html":   defaultLayoutTemplate,
+		"index.html":    defaultIndexTemplate,
+		"post.html":     defaultPostTemplate,
+		"page.html":     defaultPageTemplate,
+		"tag.html":      defaultTagTemplate,
+		"category.html": defaultCategoryTemplate,
+		"archive.html":  defaultArchiveTemplate,
 	} {
 		if err := writeIfMissing(filepath.Join(themeDir, name), []byte(contents)); err != nil {
 			return err
 		}
 	}
 	if err := writeIfMissing(filepath.Join(themeDir, "assets", "style.css"), []byte(defaultStyleCSS)); err != nil {
+		return err
+	}
+	if err := writeIfMissing(filepath.Join(themeDir, "theme.json"), []byte(`{
+  "title": "Daybreak",
+  "description": "The original Fileloom light theme.",
+  "author": "Fileloom",
+  "license": "MIT"
+}
+`)); err != nil {
 		return err
 	}
 
@@ -250,15 +325,16 @@ func (s *Server) ensureSite() error {
 			return err
 		}
 		if err := s.writeDocument(Document{
-			Path:    filepath.ToSlash(filepath.Join("posts", time.Now().Format("2006"), "welcome-to-fileloom.html")),
-			Type:    "post",
-			Title:   "Welcome to Fileloom",
-			Slug:    "welcome-to-fileloom",
-			Date:    time.Now().Format(dateFormat),
-			Status:  "published",
-			Tags:    []string{"fileloom", "static-sites"},
-			Excerpt: "A tiny visual CMS where HTML files are the source of truth.",
-			HTML:    "<p>Fileloom keeps the source close to the metal: content is HTML, the filesystem is the database, and publishing produces ordinary static files.</p><p>Try editing this post, then build the site.</p>",
+			Path:     filepath.ToSlash(filepath.Join("posts", time.Now().Format("2006"), "welcome-to-fileloom.html")),
+			Type:     "post",
+			Title:    "Welcome to Fileloom",
+			Slug:     "welcome-to-fileloom",
+			Date:     time.Now().Format(dateFormat),
+			Status:   "published",
+			Tags:     []string{"fileloom", "static-sites"},
+			Category: "Notes",
+			Excerpt:  "A tiny visual CMS where HTML files are the source of truth.",
+			HTML:     "<p>Fileloom keeps the source close to the metal: content is HTML, the filesystem is the database, and publishing produces ordinary static files.</p><p>Try editing this post, then build the site.</p>",
 		}); err != nil {
 			return err
 		}
@@ -288,6 +364,7 @@ func (s *Server) loadSiteConfig() (SiteConfig, error) {
 		BaseURL:     "http://localhost:8000",
 		Theme:       "default",
 		Footer:      "Made with Fileloom.",
+		Git:         GitConfig{CommitOn: "build", Remote: "origin"},
 	}
 	data, err := os.ReadFile(filepath.Join(s.SiteDir, "site.json"))
 	if err != nil {
@@ -304,6 +381,17 @@ func (s *Server) loadSiteConfig() (SiteConfig, error) {
 	}
 	if config.BaseURL == "" {
 		config.BaseURL = "http://localhost:8000"
+	}
+	if config.Git.CommitOn == "" {
+		config.Git.CommitOn = "build"
+	}
+	if config.Git.Remote == "" {
+		config.Git.Remote = "origin"
+	}
+	if override := strings.TrimSpace(s.BaseURLOverride); override != "" {
+		config.BaseURL = normalizeBaseURL(override)
+	} else if envBaseURL := strings.TrimSpace(os.Getenv("FILELOOM_BASE_URL")); envBaseURL != "" {
+		config.BaseURL = normalizeBaseURL(envBaseURL)
 	}
 	return config, nil
 }
@@ -352,15 +440,16 @@ func (s *Server) listDocuments() ([]Document, error) {
 func parseDocument(rel string, data []byte, modified time.Time) (Document, error) {
 	meta, body := parseFrontMatter(string(data))
 	doc := Document{
-		Path:    filepath.ToSlash(rel),
-		Type:    documentType(rel),
-		Title:   strings.TrimSpace(meta["title"]),
-		Slug:    strings.TrimSpace(meta["slug"]),
-		Date:    strings.TrimSpace(meta["date"]),
-		Status:  strings.ToLower(strings.TrimSpace(meta["status"])),
-		Tags:    parseTags(meta["tags"]),
-		Excerpt: strings.TrimSpace(meta["excerpt"]),
-		HTML:    strings.TrimSpace(body),
+		Path:     filepath.ToSlash(rel),
+		Type:     documentType(rel),
+		Title:    strings.TrimSpace(meta["title"]),
+		Slug:     strings.TrimSpace(meta["slug"]),
+		Date:     strings.TrimSpace(meta["date"]),
+		Status:   strings.ToLower(strings.TrimSpace(meta["status"])),
+		Tags:     parseTags(meta["tags"]),
+		Category: strings.TrimSpace(meta["category"]),
+		Excerpt:  strings.TrimSpace(meta["excerpt"]),
+		HTML:     strings.TrimSpace(body),
 	}
 	if doc.Title == "" {
 		doc.Title = friendlyTitle(strings.TrimSuffix(filepath.Base(rel), filepath.Ext(rel)))
@@ -484,6 +573,9 @@ func serializeDocument(doc Document) string {
 	if len(doc.Tags) > 0 {
 		fmt.Fprintf(&b, "tags: [%s]\n", strings.Join(doc.Tags, ", "))
 	}
+	if strings.TrimSpace(doc.Category) != "" {
+		fmt.Fprintf(&b, "category: %s\n", strings.TrimSpace(doc.Category))
+	}
 	if strings.TrimSpace(doc.Excerpt) != "" {
 		fmt.Fprintf(&b, "excerpt: %s\n", strings.TrimSpace(doc.Excerpt))
 	}
@@ -544,6 +636,18 @@ func friendlyTitle(value string) string {
 		}
 	}
 	return strings.Join(words, " ")
+}
+
+func normalizeBaseURL(value string) string {
+	value = strings.TrimSpace(strings.TrimRight(value, "/"))
+	if value == "" {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		return value
+	}
+	return "https://" + value
 }
 
 func slugify(value string) string {
@@ -638,6 +742,8 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	postTemplate := readThemeTemplate(themeDir, "post.html", defaultPostTemplate)
 	pageTemplate := readThemeTemplate(themeDir, "page.html", defaultPageTemplate)
 	tagTemplate := readThemeTemplate(themeDir, "tag.html", defaultTagTemplate)
+	categoryTemplate := readThemeTemplate(themeDir, "category.html", defaultCategoryTemplate)
+	archiveTemplate := readThemeTemplate(themeDir, "archive.html", defaultArchiveTemplate)
 	navigation := navigationHTML(pages)
 	postCards := postCardsHTML(posts)
 
@@ -670,12 +776,24 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	}
 
 	tagMap := map[string][]Document{}
+	categoryMap := map[string][]Document{}
+	yearMap := map[string][]Document{}
 	for _, post := range posts {
 		for _, tag := range post.Tags {
 			key := strings.ToLower(strings.TrimSpace(tag))
 			if key != "" {
 				tagMap[key] = append(tagMap[key], post)
 			}
+		}
+		if category := strings.TrimSpace(post.Category); category != "" {
+			categoryMap[strings.ToLower(category)] = append(categoryMap[strings.ToLower(category)], post)
+		}
+		year := post.Date
+		if len(year) >= 4 {
+			year = year[:4]
+		}
+		if year != "" {
+			yearMap[year] = append(yearMap[year], post)
 		}
 	}
 	for tag, tagPosts := range tagMap {
@@ -699,20 +817,161 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		files++
 	}
 
+	for category, categoryPosts := range categoryMap {
+		categoryName := category
+		if len(categoryPosts) > 0 && categoryPosts[0].Category != "" {
+			categoryName = categoryPosts[0].Category
+		}
+		doc := Document{Type: "page", Title: categoryName, Date: time.Now().Format(dateFormat), URL: "/category/" + slugify(categoryName) + "/"}
+		values := templateValues(doc, config, navigation, postCardsHTML(categoryPosts))
+		values["category"] = html.EscapeString(categoryName)
+		values["content"] = applyTokens(categoryTemplate, values)
+		output := applyTokens(layout, values)
+		if err := writePublic(filepath.Join(publicDir, "category", slugify(categoryName), "index.html"), output); err != nil {
+			return BuildResult{}, err
+		}
+		files++
+	}
+
+	for year, yearPosts := range yearMap {
+		doc := Document{Type: "page", Title: year, Date: year, URL: "/archive/" + year + "/"}
+		values := templateValues(doc, config, navigation, postCardsHTML(yearPosts))
+		values["year"] = html.EscapeString(year)
+		values["content"] = applyTokens(archiveTemplate, values)
+		output := applyTokens(layout, values)
+		if err := writePublic(filepath.Join(publicDir, "archive", year, "index.html"), output); err != nil {
+			return BuildResult{}, err
+		}
+		files++
+	}
+
 	if err := writePublic(filepath.Join(publicDir, "rss.xml"), renderRSS(config, posts)); err != nil {
 		return BuildResult{}, err
 	}
 	files++
-	if err := writePublic(filepath.Join(publicDir, "sitemap.xml"), renderSitemap(config, published, tagMap)); err != nil {
+	if err := writePublic(filepath.Join(publicDir, "sitemap.xml"), renderSitemap(config, published, tagMap, categoryMap, yearMap)); err != nil {
 		return BuildResult{}, err
 	}
 	files++
 
 	result := BuildResult{GeneratedAt: time.Now().Format(time.RFC3339), Files: files, Published: len(published)}
 	s.lastBuild = result
+	if config.Git.Enabled && config.Git.AutoCommit && strings.ToLower(config.Git.CommitOn) == "build" {
+		if _, gitErr := s.gitCommitAndPush(config.Git, "Build Fileloom site", false); gitErr != nil {
+			slog.Warn("git sync after build failed", "error", gitErr)
+		}
+	}
 	return result, nil
 }
 
+func (s *Server) listThemes() ([]ThemeInfo, error) {
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		return nil, err
+	}
+	root := filepath.Join(s.SiteDir, "themes")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("list themes: %w", err)
+	}
+	var themes []ThemeInfo
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if _, err := normalizeThemeName(name); err != nil {
+			continue
+		}
+		meta := struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			Author      string `json:"author"`
+			License     string `json:"license"`
+		}{}
+		if data, readErr := os.ReadFile(filepath.Join(root, name, "theme.json")); readErr == nil {
+			_ = json.Unmarshal(data, &meta)
+		}
+		if meta.Title == "" {
+			meta.Title = friendlyTitle(name)
+		}
+		themes = append(themes, ThemeInfo{
+			Name: name, Title: meta.Title, Description: meta.Description,
+			Author: meta.Author, License: meta.License, Active: name == config.Theme,
+			HasLayout: fileExists(filepath.Join(root, name, "layout.html")),
+			HasStyles: fileExists(filepath.Join(root, name, "assets", "style.css")),
+		})
+	}
+	sort.Slice(themes, func(i, j int) bool {
+		if themes[i].Active != themes[j].Active {
+			return themes[i].Active
+		}
+		return themes[i].Title < themes[j].Title
+	})
+	return themes, nil
+}
+
+func normalizeThemeName(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "." || value == ".." || value != filepath.Base(value) {
+		return "", errors.New("invalid theme name")
+	}
+	if slugify(value) != value {
+		return "", errors.New("theme name must be a slug")
+	}
+	return value, nil
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func (s *Server) saveSiteConfig(config SiteConfig) error {
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	path := filepath.Join(s.SiteDir, "site.json")
+	tmp, err := os.CreateTemp(s.SiteDir, ".fileloom-site-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func (s *Server) activateTheme(name string) error {
+	name, err := normalizeThemeName(name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(s.SiteDir, "themes", name)); err != nil {
+		return fmt.Errorf("theme %q not found", name)
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		return err
+	}
+	config.Theme = name
+	if err := s.saveSiteConfig(config); err != nil {
+		return err
+	}
+	_, err = s.Build()
+	if err != nil {
+		return err
+	}
+	return s.gitChangeIfConfigured("Activate theme " + name)
+}
 func readThemeTemplate(themeDir, name, fallback string) string {
 	data, err := os.ReadFile(filepath.Join(themeDir, name))
 	if err != nil {
@@ -739,6 +998,7 @@ func templateValues(doc Document, config SiteConfig, navigation, posts string) m
 		"type":             html.EscapeString(doc.Type),
 		"year":             html.EscapeString(year),
 		"tags":             strings.Join(tags, " · "),
+		"category":         html.EscapeString(doc.Category),
 		"site.title":       html.EscapeString(config.Title),
 		"site.description": html.EscapeString(config.Description),
 		"site.footer":      html.EscapeString(config.Footer),
@@ -792,7 +1052,7 @@ func renderRSS(config SiteConfig, posts []Document) string {
 	return b.String()
 }
 
-func renderSitemap(config SiteConfig, docs []Document, tags map[string][]Document) string {
+func renderSitemap(config SiteConfig, docs []Document, tags map[string][]Document, categories map[string][]Document, years map[string][]Document) string {
 	base := strings.TrimRight(config.BaseURL, "/")
 	urls := []string{"/"}
 	for _, doc := range docs {
@@ -800,6 +1060,12 @@ func renderSitemap(config SiteConfig, docs []Document, tags map[string][]Documen
 	}
 	for tag := range tags {
 		urls = append(urls, "/tag/"+slugify(tag)+"/")
+	}
+	for category := range categories {
+		urls = append(urls, "/category/"+slugify(category)+"/")
+	}
+	for year := range years {
+		urls = append(urls, "/archive/"+slugify(year)+"/")
 	}
 	sort.Strings(urls)
 	var b strings.Builder
@@ -1039,6 +1305,18 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleEditorSaveAPI(w, r)
 	case "/_cms/api/media":
 		s.handleMediaAPI(w, r)
+	case "/_cms/api/themes":
+		s.handleThemesAPI(w, r)
+	case "/_cms/api/themes/activate":
+		s.handleThemeActivateAPI(w, r)
+	case "/_cms/api/items/status":
+		s.handleItemStatusAPI(w, r)
+	case "/_cms/api/git":
+		s.handleGitAPI(w, r)
+	case "/_cms/api/git/commit":
+		s.handleGitCommitAPI(w, r)
+	case "/_cms/api/git/push":
+		s.handleGitPushAPI(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -1070,6 +1348,11 @@ func (s *Server) handleSiteAPI(w http.ResponseWriter, r *http.Request) {
 			pages++
 		}
 	}
+	themes, themeErr := s.listThemes()
+	if themeErr != nil {
+		writeJSONError(w, http.StatusInternalServerError, themeErr.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"app":         appName,
 		"site":        config,
@@ -1077,6 +1360,8 @@ func (s *Server) handleSiteAPI(w http.ResponseWriter, r *http.Request) {
 		"posts":       posts,
 		"media_count": mediaCount(filepath.Join(s.SiteDir, "media")),
 		"last_build":  lastBuild,
+		"themes":      themes,
+		"git":         s.gitStatus(config.Git),
 	})
 }
 
@@ -1097,6 +1382,7 @@ func (s *Server) handleItemsAPI(w http.ResponseWriter, r *http.Request) {
 				"date":       doc.Date,
 				"status":     doc.Status,
 				"tags":       doc.Tags,
+				"category":   doc.Category,
 				"excerpt":    doc.Excerpt,
 				"url":        doc.URL,
 				"editor_url": "/_cms/editor?path=" + url.QueryEscape(doc.Path),
@@ -1111,14 +1397,15 @@ func (s *Server) handleItemsAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 type createItemInput struct {
-	Type    string `json:"type"`
-	Title   string `json:"title"`
-	Slug    string `json:"slug"`
-	Date    string `json:"date"`
-	Status  string `json:"status"`
-	Tags    string `json:"tags"`
-	Excerpt string `json:"excerpt"`
-	HTML    string `json:"html"`
+	Type     string `json:"type"`
+	Title    string `json:"title"`
+	Slug     string `json:"slug"`
+	Date     string `json:"date"`
+	Status   string `json:"status"`
+	Tags     string `json:"tags"`
+	Excerpt  string `json:"excerpt"`
+	Category string `json:"category"`
+	HTML     string `json:"html"`
 }
 
 func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
@@ -1136,7 +1423,7 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 		input = createItemInput{
 			Type: r.FormValue("type"), Title: r.FormValue("title"), Slug: r.FormValue("slug"),
 			Date: r.FormValue("date"), Status: r.FormValue("status"), Tags: r.FormValue("tags"),
-			Excerpt: r.FormValue("excerpt"), HTML: r.FormValue("html"),
+			Category: r.FormValue("category"), Excerpt: r.FormValue("excerpt"), HTML: r.FormValue("html"),
 		}
 	}
 	input.Type = strings.ToLower(strings.TrimSpace(input.Type))
@@ -1176,7 +1463,7 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	doc := Document{
 		Path: path, Type: input.Type, Title: input.Title, Slug: input.Slug,
 		Date: input.Date, Status: input.Status, Tags: parseTags(input.Tags),
-		Excerpt: input.Excerpt, HTML: input.HTML,
+		Category: strings.TrimSpace(input.Category), Excerpt: input.Excerpt, HTML: input.HTML,
 	}
 	if err := s.writeDocument(doc); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -1188,6 +1475,10 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if err := s.gitChangeIfConfigured("Create " + path); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"ok": true, "item": map[string]string{
 			"path": path, "editor_url": "/_cms/editor?path=" + url.QueryEscape(path),
@@ -1195,6 +1486,74 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleThemesAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	themes, err := s.listThemes()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"themes": themes})
+}
+
+func (s *Server) handleThemeActivateAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	name := r.FormValue("name")
+	if err := s.activateTheme(name); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "theme": name})
+}
+
+func (s *Server) handleItemStatusAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	doc, err := s.loadDocument(r.FormValue("path"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	status := strings.ToLower(strings.TrimSpace(r.FormValue("status")))
+	if status != "draft" && status != "published" && status != "private" {
+		writeJSONError(w, http.StatusBadRequest, "status must be draft, published, or private")
+		return
+	}
+	doc.Status = status
+	if err := s.writeDocument(doc); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var build BuildResult
+	if status == "published" {
+		build, err = s.Build()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "status saved but build failed: "+err.Error())
+			return
+		}
+	}
+	if err := s.gitChangeIfConfigured("Change status for " + doc.Path); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": doc.Path, "status": status, "build": build})
+}
 func (s *Server) handleBuildAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -1216,6 +1575,10 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxEditorSize)
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if themeName := strings.TrimSpace(r.FormValue("theme")); themeName != "" || strings.HasPrefix(strings.TrimPrefix(r.FormValue("file"), "/"), "themes/") {
+		s.handleThemeSaveAPI(w, r, themeName, r.FormValue("file"))
 		return
 	}
 	path := r.FormValue("file")
@@ -1240,9 +1603,75 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if err := s.gitChangeIfConfigured("Edit " + doc.Path); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": doc.Path, "build": build})
 }
 
+func normalizeThemeLayoutPath(value string) (string, string, error) {
+	value = strings.TrimPrefix(strings.TrimSpace(value), "/")
+	value = strings.TrimPrefix(value, "themes/")
+	parts := strings.Split(filepath.ToSlash(value), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] != "layout.html" {
+		return "", "", errors.New("theme editor only saves a theme layout")
+	}
+	name, err := normalizeThemeName(parts[0])
+	if err != nil {
+		return "", "", err
+	}
+	return name, filepath.ToSlash(filepath.Join("themes", name, "layout.html")), nil
+}
+
+func stripThemePreview(source string) string {
+	previewStyle := regexp.MustCompile(`(?is)<style[^>]*data-fileloom-preview[^>]*>.*?</style>\s*`)
+	return previewStyle.ReplaceAllString(source, "")
+}
+
+func (s *Server) handleThemeSaveAPI(w http.ResponseWriter, r *http.Request, themeName, file string) {
+	if themeName == "" {
+		var err error
+		themeName, file, err = normalizeThemeLayoutPath(file)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	name, err := normalizeThemeName(themeName)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if file == "" {
+		file = filepath.ToSlash(filepath.Join("themes", name, "layout.html"))
+	}
+	_, file, err = normalizeThemeLayoutPath(file)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	contents := stripThemePreview(r.FormValue("html"))
+	path := filepath.Join(s.SiteDir, filepath.FromSlash(file))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := os.WriteFile(path, []byte(contents+"\n"), 0o644); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	build, err := s.Build()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "theme saved but build failed: "+err.Error())
+		return
+	}
+	if err := s.gitChangeIfConfigured("Edit " + file); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "theme": name, "file": file, "build": build})
+}
 func extractBodyHTML(source string) string {
 	lower := strings.ToLower(source)
 	start := strings.Index(lower, "<body")
@@ -1261,6 +1690,10 @@ func extractBodyHTML(source string) string {
 }
 
 func (s *Server) handleEditor(w http.ResponseWriter, r *http.Request) {
+	if themeName := strings.TrimSpace(r.URL.Query().Get("theme")); themeName != "" {
+		s.handleThemeEditor(w, r, themeName)
+		return
+	}
 	path := r.URL.Query().Get("path")
 	if path == "" {
 		http.Redirect(w, r, "/_cms/", http.StatusFound)
@@ -1285,7 +1718,43 @@ func (s *Server) handleEditor(w http.ResponseWriter, r *http.Request) {
 	}
 	pagesJSON, _ := json.Marshal(pages)
 	pagesJSON = bytes.ReplaceAll(pagesJSON, []byte("<"), []byte(`\\u003c`))
-	htmlSource := string(source)
+	htmlSource := s.prepareVvvebEditor(string(source), pagesJSON, "visual editor")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, htmlSource)
+}
+
+func (s *Server) handleThemeEditor(w http.ResponseWriter, r *http.Request, themeName string) {
+	name, err := normalizeThemeName(themeName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	layoutPath := filepath.Join(s.SiteDir, "themes", name, "layout.html")
+	if !fileExists(layoutPath) {
+		http.Error(w, "Theme layout not found", http.StatusNotFound)
+		return
+	}
+	source, err := os.ReadFile(filepath.Join(s.WebDir, "vvvebjs", "editor.html"))
+	if err != nil {
+		http.Error(w, "VvvebJs editor is not installed", http.StatusNotFound)
+		return
+	}
+	pageURL := "/_cms/editor/frame?theme=" + url.QueryEscape(name)
+	pages := map[string]map[string]string{
+		"current": {
+			"name": "current", "file": filepath.ToSlash(filepath.Join("themes", name, "layout.html")),
+			"url": pageURL, "title": friendlyTitle(name) + " theme", "theme": name,
+		},
+	}
+	pagesJSON, _ := json.Marshal(pages)
+	pagesJSON = bytes.ReplaceAll(pagesJSON, []byte("<"), []byte(`\\u003c`))
+	htmlSource := s.prepareVvvebEditor(string(source), pagesJSON, friendlyTitle(name)+" theme")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, htmlSource)
+}
+
+func (s *Server) prepareVvvebEditor(source string, pagesJSON []byte, label string) string {
+	htmlSource := source
 	htmlSource = strings.ReplaceAll(htmlSource, `<base href="">`, `<base href="/_cms/vvveb/">`)
 	htmlSource = strings.ReplaceAll(htmlSource, `<title>VvvebJs</title>`, `<title>Fileloom · Visual editor</title>`)
 	htmlSource = strings.ReplaceAll(htmlSource, `window.mediaPath = '../../media';`, `window.mediaPath = '/_cms/media/'; window.mediaScanUrl = '/_cms/api/media'; window.uploadUrl = '/_cms/api/media';`)
@@ -1296,20 +1765,52 @@ func (s *Server) handleEditor(w http.ResponseWriter, r *http.Request) {
 	htmlSource = strings.ReplaceAll(htmlSource, `<script src="libs/builder/plugin-ai-assistant.js"></script>`, "")
 	htmlSource = regexp.MustCompile(`data-vvveb-url="[^"]*"`).ReplaceAllString(htmlSource, `data-vvveb-url="/_cms/api/editor-save"`)
 	htmlSource = strings.ReplaceAll(htmlSource, "save.php", "/_cms/api/editor-save")
-	badge := `<style>#fileloom-editor-badge{position:fixed;left:16px;bottom:16px;z-index:9999;background:#7557ff;color:#fff;border-radius:999px;padding:7px 12px;font:700 11px/1 system-ui;letter-spacing:.1em;box-shadow:0 8px 20px #0002}#fileloom-editor-badge span{opacity:.7;font-weight:500;letter-spacing:0}</style><div id="fileloom-editor-badge">FILELOOM <span>visual editor</span></div>`
+	badge := `<style>#fileloom-editor-badge{position:fixed;left:16px;bottom:16px;z-index:9999;background:#7557ff;color:#fff;border-radius:999px;padding:7px 12px;font:700 11px/1 system-ui;letter-spacing:.1em;box-shadow:0 8px 20px #0002}#fileloom-editor-badge span{opacity:.7;font-weight:500;letter-spacing:0}</style><div id="fileloom-editor-badge">FILELOOM <span>` + html.EscapeString(label) + `</span></div>`
 	htmlSource = strings.Replace(htmlSource, "</head>", badge+"</head>", 1)
-	marker := "let pages = defaultPages;"
 	boot := `window.fileloomPages = ` + string(pagesJSON) + `;` + "\n\t" + "let pages = window.fileloomPages || defaultPages;"
-	if !strings.Contains(htmlSource, marker) {
-		http.Error(w, "VvvebJs editor template is incompatible", http.StatusInternalServerError)
-		return
-	}
-	htmlSource = strings.Replace(htmlSource, marker, boot, 1)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, htmlSource)
+	htmlSource = strings.Replace(htmlSource, "let pages = defaultPages;", boot, 1)
+	htmlSource = addMobileEditorShell(htmlSource)
+	return htmlSource
 }
 
+func addMobileEditorShell(source string) string {
+	mobileCSS := `<style>
+@media (max-width:700px){
+  html,body{overflow:hidden!important}
+  #container{width:100vw!important;min-width:0!important}
+  #container .sidebar{display:none!important}
+  #container .main{width:100vw!important;margin:0!important;padding:0!important}
+  #vvveb-builder{--builder-left-panel-width:0px;--builder-right-panel-width:0px;--builder-sidebar-width:0px;--builder-canvas-margin:0px;--builder-header-top-height:50px;--builder-bottom-panel-height:0px}
+  #vvveb-builder #top-panel{height:50px;overflow:hidden;padding:0 5px;justify-content:flex-start;gap:4px}
+  #vvveb-builder #top-panel>div:nth-child(2){display:none!important}
+  #vvveb-builder #top-panel>div:first-child>.btn-group .btn:not(.menu-toggle){display:none!important}
+  #vvveb-builder #top-panel>div:first-child>.btn-group .menu-toggle{display:inline-flex!important}
+  #vvveb-builder #top-panel>div:last-child{margin-left:auto!important}
+  #vvveb-builder #top-panel>div:last-child>.btn-group>div:first-child{display:none!important}
+  #vvveb-builder #top-panel .save-btn{display:inline-flex!important}
+  #vvveb-builder #top-panel .save-btn .button-text{font-size:11px!important}
+  #vvveb-builder #left-panel,#vvveb-builder #right-panel{top:50px;bottom:44px;width:min(88vw,330px);max-width:330px;height:auto;z-index:2001;box-shadow:0 12px 40px #0003;display:none!important}
+  #vvveb-builder.fileloom-mobile-left #left-panel{display:block!important;left:0}
+  #vvveb-builder.fileloom-mobile-right #right-panel{display:block!important;right:0}
+  #vvveb-builder #canvas{top:50px;bottom:44px;left:0;right:0;width:100vw!important;height:calc(100vh - 94px)!important;margin:0!important}
+  #vvveb-builder #bottom-panel{display:none!important}
+  #fileloom-mobile-scrim{display:none;position:fixed;inset:50px 0 44px;z-index:2000;background:rgba(16,20,30,.36)}
+  #fileloom-mobile-scrim.open{display:block}
+  #fileloom-mobile-bar{position:fixed;left:0;right:0;bottom:0;height:44px;z-index:3000;display:flex;align-items:stretch;background:#fff;border-top:1px solid #dfe3e9;box-shadow:0 -5px 18px #0001}
+  #fileloom-mobile-bar button{flex:1;border:0;border-right:1px solid #edf0f4;background:#fff;color:#4f5b6b;font:700 10px/1 system-ui;letter-spacing:.02em}
+  #fileloom-mobile-bar button:active,#fileloom-mobile-bar button.active{color:#5038c8;background:#f0edff}
+  #fileloom-mobile-bar button span{display:block;font-size:16px;line-height:18px;margin-bottom:2px}
+  #fileloom-editor-badge{bottom:52px!important;left:8px!important;font-size:9px!important;padding:6px 9px!important}
+}
+</style>`
+	mobileUI := `<div id="fileloom-mobile-scrim"></div><div id="fileloom-mobile-bar" aria-label="Mobile editor controls"><button data-mobile-action="pages"><span>☷</span>Pages</button><button data-mobile-action="elements"><span>✚</span>Blocks</button><button data-mobile-action="style"><span>◌</span>Style</button><button data-mobile-action="preview"><span>◉</span>Preview</button><button data-mobile-action="save"><span>↥</span>Save</button></div><script>(function(){const builder=document.getElementById('vvveb-builder'),scrim=document.getElementById('fileloom-mobile-scrim'),bar=document.getElementById('fileloom-mobile-bar');if(!builder||!bar)return;function close(){builder.classList.remove('fileloom-mobile-left','fileloom-mobile-right');scrim.classList.remove('open');}function left(tab){close();builder.classList.add('fileloom-mobile-left');scrim.classList.add('open');document.querySelector(tab)?.click();}function right(tab){close();builder.classList.add('fileloom-mobile-right');scrim.classList.add('open');document.querySelector(tab)?.click();}bar.addEventListener('click',function(e){const button=e.target.closest('button');if(!button)return;const action=button.dataset.mobileAction;if(action==='pages')left('#pages-tab');if(action==='elements')left('#components-tab');if(action==='style')right('#configuration-tab');if(action==='preview'){close();document.querySelector('#preview-btn')?.click();}if(action==='save'){const save=document.querySelector('#top-panel .save-btn:not([disabled])')||document.querySelector('#top-panel .save-btn');save?.click();}});scrim.addEventListener('click',close);window.addEventListener('resize',function(){if(window.innerWidth>700)close();});})();</script>`
+	return strings.Replace(source, "</body>", mobileCSS+mobileUI+"</body>", 1)
+}
 func (s *Server) handleEditorFrame(w http.ResponseWriter, r *http.Request) {
+	if themeName := strings.TrimSpace(r.URL.Query().Get("theme")); themeName != "" {
+		s.handleThemeFrame(w, r, themeName)
+		return
+	}
 	path := r.URL.Query().Get("path")
 	doc, err := s.loadDocument(path)
 	if err != nil {
@@ -1329,9 +1830,33 @@ func (s *Server) handleEditorFrame(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, frame)
 }
 
+func (s *Server) handleThemeFrame(w http.ResponseWriter, r *http.Request, themeName string) {
+	name, err := normalizeThemeName(themeName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	layout, err := os.ReadFile(filepath.Join(s.SiteDir, "themes", name, "layout.html"))
+	if err != nil {
+		http.Error(w, "Theme layout not found", http.StatusNotFound)
+		return
+	}
+	css, _ := os.ReadFile(filepath.Join(s.SiteDir, "themes", name, "assets", "style.css"))
+	cssText := strings.ReplaceAll(string(css), "</style>", "<\\/style>")
+	frame := strings.Replace(string(layout), "</head>", `<style data-fileloom-preview>`+cssText+`</style></head>`, 1)
+	if !strings.Contains(strings.ToLower(frame), "<html") {
+		frame = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style data-fileloom-preview>` + cssText + `</style></head><body>` + frame + `</body></html>`
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, frame)
+}
 func (s *Server) handleMediaAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		s.handleMediaUploadAPI(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
-		writeJSONError(w, http.StatusNotImplemented, "media uploads are coming next; add files under site/media for now")
+		methodNotAllowed(w)
 		return
 	}
 	root := filepath.Join(s.SiteDir, "media")
@@ -1341,6 +1866,71 @@ func (s *Server) handleMediaAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<20)
+	if err := r.ParseMultipartForm(16 << 20); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid upload: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "file is required")
+		return
+	}
+	defer file.Close()
+	name := filepath.Base(header.Filename)
+	if name == "." || name == "" || !allowedMediaName(name) {
+		writeJSONError(w, http.StatusBadRequest, "unsupported media filename")
+		return
+	}
+	name = uniqueMediaName(filepath.Join(s.SiteDir, "media"), name)
+	path := filepath.Join(s.SiteDir, "media", name)
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_, copyErr := io.Copy(out, file)
+	closeErr := out.Close()
+	if copyErr != nil {
+		writeJSONError(w, http.StatusInternalServerError, copyErr.Error())
+		return
+	}
+	if closeErr != nil {
+		writeJSONError(w, http.StatusInternalServerError, closeErr.Error())
+		return
+	}
+	if _, err := s.Build(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "media saved but build failed: "+err.Error())
+		return
+	}
+	if err := s.gitChangeIfConfigured("Add media " + name); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "name": name, "path": name, "url": "/media/" + url.PathEscape(name)})
+}
+
+func allowedMediaName(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp", ".mp3", ".mp4", ".pdf", ".webm":
+		return true
+	default:
+		return false
+	}
+}
+
+func uniqueMediaName(root, name string) string {
+	candidate := name
+	base := strings.TrimSuffix(name, filepath.Ext(name))
+	ext := filepath.Ext(name)
+	for i := 2; fileExists(filepath.Join(root, candidate)); i++ {
+		candidate = fmt.Sprintf("%s-%d%s", base, i, ext)
+	}
+	return candidate
 }
 
 func mediaTree(root string) ([]map[string]any, error) {
@@ -1382,7 +1972,203 @@ func mediaCount(root string) int {
 	return len(files)
 }
 
+func runGit(repo string, args ...string) (string, error) {
+	commandArgs := append([]string{"-C", repo}, args...)
+	command := exec.Command("git", commandArgs...)
+	output, err := command.CombinedOutput()
+	text := strings.TrimSpace(string(output))
+	if err != nil {
+		if text == "" {
+			text = err.Error()
+		}
+		return text, fmt.Errorf("git %s: %s", strings.Join(args, " "), text)
+	}
+	return text, nil
+}
+
+func (s *Server) gitRepo() (string, error) {
+	repo, err := runGit(s.SiteDir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(repo), nil
+}
+
+func (s *Server) gitScope(repo string) ([]string, error) {
+	rel, err := filepath.Rel(repo, s.SiteDir)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return nil, errors.New("site directory is not inside the git repository")
+	}
+	rel = filepath.ToSlash(rel)
+	if rel != "." {
+		return []string{rel}, nil
+	}
+	return []string{"site.json", "content", "themes", "media"}, nil
+}
+
+func (s *Server) gitStatus(config GitConfig) GitStatus {
+	status := GitStatus{}
+	repo, err := s.gitRepo()
+	if err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	scope, err := s.gitScope(repo)
+	if err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	branch, _ := runGit(repo, "branch", "--show-current")
+	remote := config.Remote
+	if remote == "" {
+		remote = "origin"
+	}
+	remoteURL, remoteErr := runGit(repo, "remote", "get-url", remote)
+	if remoteErr != nil {
+		remoteURL = ""
+	}
+	porcelain, err := runGit(repo, append([]string{"status", "--porcelain"}, append([]string{"--"}, scope...)...)...)
+	if err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	changes := 0
+	if strings.TrimSpace(porcelain) != "" {
+		changes = len(strings.Split(strings.TrimSpace(porcelain), "\n"))
+	}
+	status.Available = true
+	status.Repo = repo
+	status.Branch = branch
+	status.Remote = remoteURL
+	status.Changes = changes
+	status.Clean = changes == 0
+	return status
+}
+
+func (s *Server) gitCommitAndPush(config GitConfig, message string, push bool) (bool, error) {
+	repo, err := s.gitRepo()
+	if err != nil {
+		return false, err
+	}
+	scope, err := s.gitScope(repo)
+	if err != nil {
+		return false, err
+	}
+	porcelain, err := runGit(repo, append([]string{"status", "--porcelain"}, append([]string{"--"}, scope...)...)...)
+	if err != nil {
+		return false, err
+	}
+	committed := false
+	if strings.TrimSpace(porcelain) != "" {
+		if _, err := runGit(repo, append([]string{"add", "--"}, scope...)...); err != nil {
+			return false, err
+		}
+		message = strings.TrimSpace(message)
+		if message == "" {
+			message = "Update Fileloom site"
+		}
+		if len(message) > 160 {
+			message = message[:160]
+		}
+		if _, err := runGit(repo, "commit", "-m", message); err != nil {
+			return false, err
+		}
+		committed = true
+	}
+	if push || config.AutoPush {
+		if err := s.gitPush(config); err != nil {
+			return committed, err
+		}
+	}
+	return committed, nil
+}
+
+func (s *Server) gitPush(config GitConfig) error {
+	repo, err := s.gitRepo()
+	if err != nil {
+		return err
+	}
+	remote := config.Remote
+	if remote == "" {
+		remote = "origin"
+	}
+	branch := strings.TrimSpace(config.Branch)
+	if branch == "" {
+		branch, _ = runGit(repo, "branch", "--show-current")
+	}
+	if branch == "" {
+		return errors.New("git branch is not configured")
+	}
+	_, err = runGit(repo, "push", remote, branch)
+	return err
+}
+
+func (s *Server) gitChangeIfConfigured(message string) error {
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		return err
+	}
+	if !config.Git.Enabled || !config.Git.AutoCommit || strings.ToLower(config.Git.CommitOn) != "change" {
+		return nil
+	}
+	_, err = s.gitCommitAndPush(config.Git, message, false)
+	return err
+}
+
+func (s *Server) handleGitAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"config": config.Git, "status": s.gitStatus(config.Git)})
+}
+
+func (s *Server) handleGitCommitAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	push := strings.EqualFold(r.FormValue("push"), "true")
+	committed, err := s.gitCommitAndPush(config.Git, r.FormValue("message"), push)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "committed": committed, "status": s.gitStatus(config.Git)})
+}
+
+func (s *Server) handleGitPushAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.gitPush(config.Git); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": s.gitStatus(config.Git)})
+}
 func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)

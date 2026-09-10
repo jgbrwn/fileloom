@@ -4,7 +4,7 @@
 # generated site output
 /site/public/
 
-# local editor/OS files
-.DS_Store
+# local secrets/config
+.env
 *.swp
 *.tmp
