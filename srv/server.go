@@ -3,9 +3,11 @@ package srv
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
@@ -31,9 +33,25 @@ import (
 )
 
 const (
-	appName       = "Fileloom"
-	dateFormat    = "2006-01-02"
-	maxEditorSize = 12 << 20
+	appName                    = "Fileloom"
+	dateFormat                 = "2006-01-02"
+	maxEditorSize              = 12 << 20
+	maxFormSize                = 2 << 20
+	maxUploadSize              = 16 << 20
+	maxConcurrentCMSMutations  = 2
+	maxRevisionsPerPath        = 100
+	maxRevisionBytes           = 128 << 20
+	maxExportFiles             = 10000
+	maxExportBytes             = 64 << 20
+	maxExportUncompressedBytes = 256 << 20
+	maxExportFileBytes         = 64 << 20
+	maxBuildAssetFileBytes     = 256 << 20
+	maxGitCommandDuration      = 30 * time.Second
+	maxGitPushDuration         = 2 * time.Minute
+	maxHTTPReadHeaderDuration  = 10 * time.Second
+	maxHTTPReadDuration        = 2 * time.Minute
+	maxHTTPWriteDuration       = 5 * time.Minute
+	maxHTTPIdleDuration        = 2 * time.Minute
 )
 
 type Server struct {
@@ -41,11 +59,15 @@ type Server struct {
 	WebDir          string
 	OwnerEmail      string
 	BaseURLOverride string
+	CMSCSP          string
+	PublicCSP       string
 
-	mu        sync.RWMutex
-	writeMu   sync.Mutex
-	lastBuild BuildResult
-	scheduler sync.Once
+	mu            sync.RWMutex
+	publicMu      sync.RWMutex
+	writeMu       sync.Mutex
+	lastBuild     BuildResult
+	scheduler     sync.Once
+	mutationSlots chan struct{}
 }
 
 type SiteConfig struct {
@@ -148,6 +170,8 @@ type documentMeta struct {
 
 var tokenPattern = regexp.MustCompile(`\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}`)
 
+const defaultCMSCSP = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-src 'self' blob:; worker-src 'self' blob:; form-action 'self'"
+const defaultPublicCSP = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'"
 const defaultSiteJSON = `{
   "title": "A Fileloom site",
   "description": "An HTML-first static site made with Fileloom.",
@@ -274,6 +298,17 @@ h2 { font-size: 1.55rem; margin: 0; }
 @media (max-width: 640px) { .shell { width: min(100% - 28px, 1080px); } .header-inner { min-height: 60px; } nav { gap: 12px; } .hero { padding-top: 58px; } }
 `
 
+func configuredCSP(value, defaultProfile string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.EqualFold(value, "1") || strings.EqualFold(value, "true") || strings.EqualFold(value, "default") {
+		return defaultProfile
+	}
+	return value
+}
+
 func New(siteDir, webDir, ownerEmail string) (*Server, error) {
 	return NewWithOptions(siteDir, webDir, ownerEmail, "")
 }
@@ -298,6 +333,9 @@ func NewWithOptions(siteDir, webDir, ownerEmail, baseURL string) (*Server, error
 		WebDir:          absWeb,
 		OwnerEmail:      strings.TrimSpace(ownerEmail),
 		BaseURLOverride: strings.TrimSpace(baseURL),
+		CMSCSP:          configuredCSP(os.Getenv("FILELOOM_CMS_CSP"), defaultCMSCSP),
+		PublicCSP:       configuredCSP(os.Getenv("FILELOOM_PUBLIC_CSP"), defaultPublicCSP),
+		mutationSlots:   make(chan struct{}, maxConcurrentCMSMutations),
 	}
 	if err := s.ensureSite(); err != nil {
 		return nil, err
@@ -309,6 +347,9 @@ func NewWithOptions(siteDir, webDir, ownerEmail, baseURL string) (*Server, error
 }
 
 func (s *Server) ensureSite() error {
+	if err := rejectExistingSymlinkComponents(s.SiteDir, ""); err != nil {
+		return fmt.Errorf("site root is not safe: %w", err)
+	}
 	for _, dir := range []string{
 		filepath.Join(s.SiteDir, "content", "pages"),
 		filepath.Join(s.SiteDir, "content", "posts"),
@@ -316,8 +357,18 @@ func (s *Server) ensureSite() error {
 		filepath.Join(s.SiteDir, "themes", "default", "assets"),
 		filepath.Join(s.SiteDir, "public"),
 	} {
+		rel, relErr := filepath.Rel(s.SiteDir, dir)
+		if relErr != nil {
+			return relErr
+		}
+		if err := rejectExistingSymlinkComponents(s.SiteDir, rel); err != nil {
+			return fmt.Errorf("unsafe site path %s: %w", rel, err)
+		}
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("create %s: %w", dir, err)
+		}
+		if err := rejectSymlinkPath(s.SiteDir, rel); err != nil {
+			return fmt.Errorf("unsafe site path %s: %w", rel, err)
 		}
 	}
 
@@ -389,9 +440,17 @@ func (s *Server) ensureSite() error {
 }
 
 func writeIfMissing(path string, contents []byte) error {
-	if _, err := os.Stat(path); err == nil {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlink at %s", path)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing non-regular file at %s", path)
+		}
 		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
+	}
+	if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat %s: %w", path, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -412,7 +471,17 @@ func (s *Server) loadSiteConfig() (SiteConfig, error) {
 		Footer:      "Made with Fileloom.",
 		Git:         GitConfig{CommitOn: "build", Remote: "origin"},
 	}
-	data, err := os.ReadFile(filepath.Join(s.SiteDir, "site.json"))
+	path, info, err := safeResolvedPath(s.SiteDir, "site.json")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return config, nil
+		}
+		return config, err
+	}
+	if !info.Mode().IsRegular() {
+		return config, errors.New("site.json must be a regular file")
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return config, nil
@@ -425,6 +494,11 @@ func (s *Server) loadSiteConfig() (SiteConfig, error) {
 	if config.Theme == "" {
 		config.Theme = "default"
 	}
+	normalizedTheme, err := normalizeThemeName(config.Theme)
+	if err != nil {
+		return config, fmt.Errorf("invalid configured theme: %w", err)
+	}
+	config.Theme = normalizedTheme
 	if config.BaseURL == "" {
 		config.BaseURL = "http://localhost:8000"
 	}
@@ -444,19 +518,32 @@ func (s *Server) loadSiteConfig() (SiteConfig, error) {
 
 func (s *Server) listDocuments() ([]Document, error) {
 	root := filepath.Join(s.SiteDir, "content")
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return nil, fmt.Errorf("content root is not accessible: %w", err)
+	}
+	if !rootInfo.IsDir() {
+		return nil, errors.New("content root must be a directory")
+	}
 	var docs []Document
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("symlinks are not allowed in content: %s", path)
 		}
 		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".html") {
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
-		info, err := entry.Info()
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("non-regular content file is not allowed: %s", path)
+		}
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
@@ -615,7 +702,10 @@ func (s *Server) writeDocument(doc Document) error {
 	if doc.Excerpt == "" {
 		doc.Excerpt = excerptFromHTML(doc.HTML)
 	}
-	path := filepath.Join(s.SiteDir, "content", filepath.FromSlash(rel))
+	path, err := safeWorkspacePath(filepath.Join(s.SiteDir, "content"), rel)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create content directory: %w", err)
 	}
@@ -745,12 +835,18 @@ func (s *Server) loadDocument(value string) (Document, error) {
 	if err != nil {
 		return Document{}, err
 	}
-	path := filepath.Join(s.SiteDir, "content", filepath.FromSlash(rel))
+	path, info, err := safeResolvedPath(filepath.Join(s.SiteDir, "content"), rel)
+	if err != nil {
+		return Document{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return Document{}, errors.New("content file must be regular")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Document{}, err
 	}
-	info, err := os.Stat(path)
+	info, err = os.Stat(path)
 	if err != nil {
 		return Document{}, err
 	}
@@ -762,12 +858,18 @@ func (s *Server) loadSourceDocument(value string) (sourceDocument, error) {
 	if err != nil {
 		return sourceDocument{}, err
 	}
-	path := filepath.Join(s.SiteDir, "content", filepath.FromSlash(rel))
+	path, info, err := safeResolvedPath(filepath.Join(s.SiteDir, "content"), rel)
+	if err != nil {
+		return sourceDocument{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return sourceDocument{}, errors.New("content file must be regular")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return sourceDocument{}, err
 	}
-	info, err := os.Stat(path)
+	info, err = os.Stat(path)
 	if err != nil {
 		return sourceDocument{}, err
 	}
@@ -780,6 +882,10 @@ func sourceSHA256(source []byte) string {
 }
 
 func fileSHA256(filePath string) string {
+	info, err := os.Lstat(filePath)
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return ""
@@ -880,7 +986,8 @@ func patchFrontMatter(source []byte, updates map[string]string) []byte {
 	if len(missing) > 0 && closingOffset >= 0 {
 		sort.Strings(missing)
 		addition := strings.Join(missing, "")
-		text = text[:closingOffset] + addition + text[closingOffset:]
+		insertAt := closingOffset + 1
+		text = text[:insertAt] + addition + text[insertAt:]
 	}
 	return []byte(text)
 }
@@ -923,11 +1030,41 @@ func (s *Server) patchDocumentSource(pathValue string, body string, patchBody bo
 	if err != nil {
 		return Document{}, err
 	}
-	filePath := filepath.Join(s.SiteDir, "content", filepath.FromSlash(path))
+	filePath, err := safeWorkspacePath(filepath.Join(s.SiteDir, "content"), path)
+	if err != nil {
+		return Document{}, err
+	}
 	if err := writeAtomicFile(filePath, patched); err != nil {
 		return Document{}, fmt.Errorf("write %s: %w", path, err)
 	}
 	return s.loadDocument(path)
+}
+
+func (s *Server) writeContentSource(rel string, source []byte) error {
+	rel, err := normalizeContentPath(rel)
+	if err != nil {
+		return err
+	}
+	path, err := safeWorkspacePath(filepath.Join(s.SiteDir, "content"), rel)
+	if err != nil {
+		return err
+	}
+	return writeAtomicFile(path, source)
+}
+
+func (s *Server) removeContentSource(rel string) error {
+	rel, err := normalizeContentPath(rel)
+	if err != nil {
+		return err
+	}
+	path, err := safeWorkspacePath(filepath.Join(s.SiteDir, "content"), rel)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func revisionDirectory(siteDir, rel string) string {
@@ -939,7 +1076,10 @@ func (s *Server) recordRevision(rel, reason string) error {
 	if err != nil {
 		return err
 	}
-	filePath := filepath.Join(s.SiteDir, "content", filepath.FromSlash(rel))
+	filePath, _, err := safeResolvedPath(filepath.Join(s.SiteDir, "content"), rel)
+	if err != nil {
+		return err
+	}
 	source, err := os.ReadFile(filePath)
 	if err != nil {
 		return err
@@ -948,13 +1088,17 @@ func (s *Server) recordRevision(rel, reason string) error {
 }
 
 func (s *Server) recordWorkspaceRevision(rel string, source []byte, reason string) error {
-	rel = filepath.ToSlash(filepath.Clean(rel))
-	if rel == "." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
+	revisionPath, err := safeRelativePath(rel)
+	if err != nil {
 		return errors.New("invalid revision path")
 	}
+	rel = revisionPath
 	created := time.Now().UTC()
 	id := created.Format("20060102T150405.000000000Z") + "-" + sourceSHA256(source)[:12]
 	dir := filepath.Join(s.SiteDir, ".fileloom", "revisions", filepath.FromSlash(rel))
+	if err := rejectExistingSymlinkComponents(s.SiteDir, filepath.ToSlash(filepath.Join(".fileloom", "revisions", rel))); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -964,9 +1108,130 @@ func (s *Server) recordWorkspaceRevision(rel string, source []byte, reason strin
 	}
 	metadata, err := json.MarshalIndent(revision, "", "  ")
 	if err != nil {
+		_ = os.Remove(filepath.Join(dir, id+".html"))
 		return err
 	}
-	return writeAtomicFile(filepath.Join(dir, id+".json"), append(metadata, '\n'))
+	if err := writeAtomicFile(filepath.Join(dir, id+".json"), append(metadata, '\n')); err != nil {
+		_ = os.Remove(filepath.Join(dir, id+".html"))
+		return err
+	}
+	return s.pruneRevisions()
+}
+
+func (s *Server) pruneRevisions() error {
+	root := filepath.Join(s.SiteDir, ".fileloom", "revisions")
+	if err := rejectExistingSymlinkComponents(s.SiteDir, ".fileloom/revisions"); err != nil {
+		return err
+	}
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	type revisionFile struct {
+		path      string
+		id        string
+		createdAt string
+		size      int64
+	}
+	var files []revisionFile
+	err := filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("symlink in revisions: %s", filePath)
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			return nil
+		}
+		jsonInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !jsonInfo.Mode().IsRegular() {
+			return fmt.Errorf("non-regular revision metadata is not allowed: %s", filePath)
+		}
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
+		var revision Revision
+		if err := json.Unmarshal(data, &revision); err != nil || revision.ID == "" {
+			return nil
+		}
+		htmlPath := strings.TrimSuffix(filePath, ".json") + ".html"
+		htmlInfo, err := os.Lstat(htmlPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !htmlInfo.Mode().IsRegular() {
+			return fmt.Errorf("non-regular revision source is not allowed: %s", htmlPath)
+		}
+		files = append(files, revisionFile{path: filePath, id: revision.ID, createdAt: revision.CreatedAt, size: htmlInfo.Size() + int64(len(data))})
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	byPath := map[string][]revisionFile{}
+	for _, file := range files {
+		data, readErr := os.ReadFile(file.path)
+		if readErr != nil {
+			continue
+		}
+		var revision Revision
+		if json.Unmarshal(data, &revision) == nil {
+			byPath[revision.Path] = append(byPath[revision.Path], file)
+		}
+	}
+	remove := map[string]bool{}
+	for _, group := range byPath {
+		sort.Slice(group, func(i, j int) bool { return group[i].createdAt > group[j].createdAt })
+		for _, file := range group[maxInt(0, minInt(len(group), maxRevisionsPerPath)):] {
+			remove[file.path] = true
+		}
+	}
+	kept := files[:0]
+	for _, file := range files {
+		if remove[file.path] {
+			_ = os.Remove(file.path)
+			_ = os.Remove(strings.TrimSuffix(file.path, ".json") + ".html")
+			continue
+		}
+		kept = append(kept, file)
+	}
+	total := int64(0)
+	for _, file := range kept {
+		total += file.size
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].createdAt < kept[j].createdAt })
+	for _, file := range kept {
+		if total <= maxRevisionBytes || len(kept) == 1 {
+			break
+		}
+		total -= file.size
+		_ = os.Remove(file.path)
+		_ = os.Remove(strings.TrimSuffix(file.path, ".json") + ".html")
+	}
+	return nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (s *Server) listRevisions(rel string) ([]Revision, error) {
@@ -974,7 +1239,20 @@ func (s *Server) listRevisions(rel string) ([]Revision, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(revisionDirectory(s.SiteDir, rel))
+	dir := revisionDirectory(s.SiteDir, rel)
+	if err := rejectExistingSymlinkComponents(s.SiteDir, filepath.ToSlash(filepath.Join(".fileloom", "revisions", rel))); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []Revision{}, nil
+		}
+		return nil, err
+	}
+	if err := rejectSymlinkPath(filepath.Join(s.SiteDir, ".fileloom", "revisions"), rel); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []Revision{}, nil
+		}
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return []Revision{}, nil
@@ -983,10 +1261,20 @@ func (s *Server) listRevisions(rel string) ([]Revision, error) {
 	}
 	var revisions []Revision
 	for _, entry := range entries {
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return nil, errors.New("symlinks are not allowed in revisions")
+		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(revisionDirectory(s.SiteDir, rel), entry.Name()))
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, errors.New("non-regular revision metadata is not allowed")
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
 		if err != nil {
 			return nil, err
 		}
@@ -1009,7 +1297,20 @@ func (s *Server) restoreRevision(rel, id string) (Document, error) {
 		return Document{}, errors.New("invalid revision id")
 	}
 	dir := revisionDirectory(s.SiteDir, rel)
-	metadata, err := os.ReadFile(filepath.Join(dir, id+".json"))
+	if err := rejectExistingSymlinkComponents(s.SiteDir, filepath.ToSlash(filepath.Join(".fileloom", "revisions", rel))); err != nil {
+		return Document{}, err
+	}
+	if err := rejectSymlinkPath(filepath.Join(s.SiteDir, ".fileloom", "revisions"), rel); err != nil {
+		return Document{}, err
+	}
+	metadataPath, metadataInfo, err := safeResolvedPath(dir, id+".json")
+	if err != nil {
+		return Document{}, err
+	}
+	if !metadataInfo.Mode().IsRegular() {
+		return Document{}, errors.New("revision metadata must be regular")
+	}
+	metadata, err := os.ReadFile(metadataPath)
 	if err != nil {
 		return Document{}, err
 	}
@@ -1017,7 +1318,14 @@ func (s *Server) restoreRevision(rel, id string) (Document, error) {
 	if err := json.Unmarshal(metadata, &revision); err != nil {
 		return Document{}, err
 	}
-	source, err := os.ReadFile(filepath.Join(dir, id+".html"))
+	sourcePath, sourceInfo, err := safeResolvedPath(dir, id+".html")
+	if err != nil {
+		return Document{}, err
+	}
+	if !sourceInfo.Mode().IsRegular() {
+		return Document{}, errors.New("revision source must be regular")
+	}
+	source, err := os.ReadFile(sourcePath)
 	if err != nil {
 		return Document{}, err
 	}
@@ -1027,7 +1335,11 @@ func (s *Server) restoreRevision(rel, id string) (Document, error) {
 	if err := s.recordRevision(rel, "Before restore "+id); err != nil {
 		return Document{}, err
 	}
-	if err := writeAtomicFile(filepath.Join(s.SiteDir, "content", filepath.FromSlash(rel)), source); err != nil {
+	filePath, err := safeWorkspacePath(filepath.Join(s.SiteDir, "content"), rel)
+	if err != nil {
+		return Document{}, err
+	}
+	if err := writeAtomicFile(filePath, source); err != nil {
 		return Document{}, err
 	}
 	return s.loadDocument(rel)
@@ -1070,7 +1382,13 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		return BuildResult{}, fmt.Errorf("create build directory: %w", err)
 	}
 	defer os.RemoveAll(outputDir)
-	themeDir := filepath.Join(s.SiteDir, "themes", config.Theme)
+	themeDir, themeInfo, err := safeResolvedPath(filepath.Join(s.SiteDir, "themes"), config.Theme)
+	if err != nil || !themeInfo.IsDir() {
+		if err != nil {
+			return BuildResult{}, fmt.Errorf("theme %q is not available: %w", config.Theme, err)
+		}
+		return BuildResult{}, fmt.Errorf("theme %q is not a directory", config.Theme)
+	}
 	themeStylesheetURL := fmt.Sprintf("/theme/style.css?v=%d", time.Now().UnixNano())
 	if err := copyDir(filepath.Join(themeDir, "assets"), filepath.Join(outputDir, "theme")); err != nil {
 		return BuildResult{}, fmt.Errorf("copy theme assets: %w", err)
@@ -1079,13 +1397,34 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		return BuildResult{}, fmt.Errorf("copy media: %w", err)
 	}
 
-	layout := readThemeTemplate(themeDir, "layout.html", defaultLayoutTemplate)
-	indexTemplate := readThemeTemplate(themeDir, "index.html", defaultIndexTemplate)
-	postTemplate := readThemeTemplate(themeDir, "post.html", defaultPostTemplate)
-	pageTemplate := readThemeTemplate(themeDir, "page.html", defaultPageTemplate)
-	tagTemplate := readThemeTemplate(themeDir, "tag.html", defaultTagTemplate)
-	categoryTemplate := readThemeTemplate(themeDir, "category.html", defaultCategoryTemplate)
-	archiveTemplate := readThemeTemplate(themeDir, "archive.html", defaultArchiveTemplate)
+	layout, err := readThemeTemplateSafe(themeDir, "layout.html", defaultLayoutTemplate)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("read theme layout: %w", err)
+	}
+	indexTemplate, err := readThemeTemplateSafe(themeDir, "index.html", defaultIndexTemplate)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("read theme index: %w", err)
+	}
+	postTemplate, err := readThemeTemplateSafe(themeDir, "post.html", defaultPostTemplate)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("read theme post: %w", err)
+	}
+	pageTemplate, err := readThemeTemplateSafe(themeDir, "page.html", defaultPageTemplate)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("read theme page: %w", err)
+	}
+	tagTemplate, err := readThemeTemplateSafe(themeDir, "tag.html", defaultTagTemplate)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("read theme tag: %w", err)
+	}
+	categoryTemplate, err := readThemeTemplateSafe(themeDir, "category.html", defaultCategoryTemplate)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("read theme category: %w", err)
+	}
+	archiveTemplate, err := readThemeTemplateSafe(themeDir, "archive.html", defaultArchiveTemplate)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("read theme archive: %w", err)
+	}
 	navigation := navigationHTML(pages)
 	postCards := postCardsHTML(posts)
 
@@ -1206,7 +1545,10 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("run build checks: %w", err)
 	}
-	if err := swapPublicDirectory(outputDir, publicDir); err != nil {
+	s.publicMu.Lock()
+	err = swapPublicDirectory(outputDir, publicDir)
+	s.publicMu.Unlock()
+	if err != nil {
 		return BuildResult{}, err
 	}
 
@@ -1429,13 +1771,20 @@ func (s *Server) listThemes() ([]ThemeInfo, error) {
 		return nil, err
 	}
 	root := filepath.Join(s.SiteDir, "themes")
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return nil, fmt.Errorf("themes root is not accessible: %w", err)
+	}
+	if !rootInfo.IsDir() {
+		return nil, errors.New("themes root must be a directory")
+	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, fmt.Errorf("list themes: %w", err)
 	}
 	var themes []ThemeInfo
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || entry.Type()&fs.ModeSymlink != 0 {
 			continue
 		}
 		name := entry.Name()
@@ -1448,8 +1797,10 @@ func (s *Server) listThemes() ([]ThemeInfo, error) {
 			Author      string `json:"author"`
 			License     string `json:"license"`
 		}{}
-		if data, readErr := os.ReadFile(filepath.Join(root, name, "theme.json")); readErr == nil {
-			_ = json.Unmarshal(data, &meta)
+		if themePath, themeInfo, themeErr := safeResolvedPath(root, filepath.ToSlash(filepath.Join(name, "theme.json"))); themeErr == nil && themeInfo.Mode().IsRegular() {
+			if data, readErr := os.ReadFile(themePath); readErr == nil {
+				_ = json.Unmarshal(data, &meta)
+			}
 		}
 		if meta.Title == "" {
 			meta.Title = friendlyTitle(name)
@@ -1482,8 +1833,8 @@ func normalizeThemeName(value string) (string, error) {
 }
 
 func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 func (s *Server) saveSiteConfig(config SiteConfig) error {
@@ -1492,7 +1843,10 @@ func (s *Server) saveSiteConfig(config SiteConfig) error {
 		return err
 	}
 	data = append(data, '\n')
-	path := filepath.Join(s.SiteDir, "site.json")
+	path, err := safeWorkspacePath(s.SiteDir, "site.json")
+	if err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(s.SiteDir, ".fileloom-site-*.tmp")
 	if err != nil {
 		return err
@@ -1514,29 +1868,57 @@ func (s *Server) activateTheme(name string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(s.SiteDir, "themes", name)); err != nil {
-		return fmt.Errorf("theme %q not found", name)
+	if themeDir, info, err := safeResolvedPath(filepath.Join(s.SiteDir, "themes"), name); err != nil || !info.IsDir() {
+		if err != nil {
+			return fmt.Errorf("theme %q not found: %w", name, err)
+		}
+		return fmt.Errorf("theme %q is not a directory", name)
+	} else {
+		_ = themeDir
 	}
 	config, err := s.loadSiteConfig()
 	if err != nil {
 		return err
 	}
+	originalConfig := config
 	config.Theme = name
 	if err := s.saveSiteConfig(config); err != nil {
 		return err
 	}
 	_, err = s.Build()
 	if err != nil {
-		return err
+		rollbackErr := s.saveSiteConfig(originalConfig)
+		if rollbackErr != nil {
+			return fmt.Errorf("theme build failed: %v; config rollback failed: %w", err, rollbackErr)
+		}
+		return fmt.Errorf("theme activation rolled back because build failed: %w", err)
 	}
 	return s.gitChangeIfConfigured("Activate theme " + name)
 }
 func readThemeTemplate(themeDir, name, fallback string) string {
-	data, err := os.ReadFile(filepath.Join(themeDir, name))
+	contents, err := readThemeTemplateSafe(themeDir, name, fallback)
 	if err != nil {
 		return fallback
 	}
-	return string(data)
+	return contents
+}
+
+func readThemeTemplateSafe(themeDir, name, fallback string) (string, error) {
+	path, info, err := safeResolvedPath(themeDir, name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fallback, nil
+		}
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("theme template must be a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func templateValues(doc Document, config SiteConfig, navigation, posts string) map[string]string {
@@ -1638,45 +2020,83 @@ func renderSitemap(config SiteConfig, docs []Document, tags map[string][]Documen
 }
 
 func copyDir(source, destination string) error {
-	if _, err := os.Stat(source); errors.Is(err, os.ErrNotExist) {
+	rootInfo, err := os.Lstat(source)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("symlinks are not allowed in generated assets: %s", source)
+	}
+	if !rootInfo.IsDir() {
+		return fmt.Errorf("asset root is not a directory: %s", source)
 	}
 	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("symlinks are not allowed in generated assets: %s", path)
+		}
 		rel, err := filepath.Rel(source, path)
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(destination, rel)
-		if entry.Type()&fs.ModeSymlink != 0 {
-			return fmt.Errorf("symlinks are not allowed in generated assets: %s", path)
+		if rel != "." && privateGeneratedPath(filepath.ToSlash(rel)) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
+		target := filepath.Join(destination, rel)
 		if entry.IsDir() {
 			return os.MkdirAll(target, 0o755)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("non-regular asset is not allowed: %s", path)
+		}
+		if info.Size() > maxBuildAssetFileBytes {
+			return fmt.Errorf("asset exceeds the per-file size limit: %s", path)
 		}
 		in, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		defer in.Close()
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			_ = in.Close()
 			return err
 		}
 		out, err := os.Create(target)
 		if err != nil {
+			_ = in.Close()
 			return err
 		}
 		_, copyErr := io.Copy(out, in)
 		closeErr := out.Close()
+		inputCloseErr := in.Close()
 		if copyErr != nil {
 			return copyErr
 		}
-		return closeErr
+		if closeErr != nil {
+			return closeErr
+		}
+		return inputCloseErr
 	})
+}
+
+func privateGeneratedPath(rel string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == ".git" || part == ".fileloom" || part == ".env" || strings.HasPrefix(part, ".env.") || strings.HasPrefix(part, ".fileloom-") {
+			return true
+		}
+	}
+	return false
 }
 
 func writePublic(path, contents string) error {
@@ -1706,7 +2126,16 @@ func (s *Server) Serve(addr string) error {
 	s.startScheduler()
 	mux := s.Handler()
 	slog.Info("starting Fileloom", "addr", addr, "site", s.SiteDir)
-	return http.ListenAndServe(addr, mux)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: maxHTTPReadHeaderDuration,
+		ReadTimeout:       maxHTTPReadDuration,
+		WriteTimeout:      maxHTTPWriteDuration,
+		IdleTimeout:       maxHTTPIdleDuration,
+		MaxHeaderBytes:    1 << 20,
+	}
+	return server.ListenAndServe()
 }
 
 func (s *Server) startScheduler() {
@@ -1731,7 +2160,11 @@ func (s *Server) publishDue() {
 		return
 	}
 	now := time.Now().UTC()
-	changed := false
+	type scheduledChange struct {
+		path   string
+		source []byte
+	}
+	var changes []scheduledChange
 	for _, doc := range docs {
 		if strings.ToLower(strings.TrimSpace(doc.Status)) != "scheduled" || strings.TrimSpace(doc.PublishAt) == "" {
 			continue
@@ -1740,21 +2173,134 @@ func (s *Server) publishDue() {
 		if err != nil || publishAt.After(now) {
 			continue
 		}
+		source, err := s.loadSourceDocument(doc.Path)
+		if err != nil {
+			slog.Warn("scheduled publish source read failed", "path", doc.Path, "error", err)
+			continue
+		}
 		if _, err := s.patchDocumentSource(doc.Path, "", false, map[string]string{"status": "published", "publish_at": ""}, "", "Publish scheduled "+doc.Path); err != nil {
 			slog.Warn("scheduled publish failed", "path", doc.Path, "error", err)
 			continue
 		}
-		changed = true
+		changes = append(changes, scheduledChange{path: doc.Path, source: source.Source})
 	}
-	if changed {
-		if _, err := s.Build(); err != nil {
-			slog.Warn("scheduled build failed", "error", err)
+	if len(changes) == 0 {
+		return
+	}
+	if _, err := s.Build(); err != nil {
+		slog.Warn("scheduled build failed; restoring scheduled sources", "error", err)
+		for index := len(changes) - 1; index >= 0; index-- {
+			change := changes[index]
+			path, pathErr := safeWorkspacePath(filepath.Join(s.SiteDir, "content"), change.path)
+			if pathErr != nil {
+				slog.Warn("scheduled source restore path failed", "path", change.path, "error", pathErr)
+				continue
+			}
+			if writeErr := writeAtomicFile(path, change.source); writeErr != nil {
+				slog.Warn("scheduled source restore failed", "path", change.path, "error", writeErr)
+			}
 		}
+		return
 	}
+	slog.Info("scheduled publishing completed", "published", len(changes))
 }
 
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(s.route)
+}
+
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (s *Server) acquireMutationSlot() bool {
+	if s.mutationSlots == nil {
+		return true
+	}
+	select {
+	case s.mutationSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseMutationSlot() {
+	if s.mutationSlots == nil {
+		return
+	}
+	<-s.mutationSlots
+}
+
+func auditValue(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, value)
+	if len(value) > 200 {
+		return value[:200] + "…"
+	}
+	return value
+}
+
+func (s *Server) auditMutation(r *http.Request, status int) {
+	actor := "anonymous"
+	values := r.Header.Values("X-ExeDev-Email")
+	if len(values) == 1 && strings.TrimSpace(values[0]) != "" {
+		actor = auditValue(values[0])
+	} else if len(values) > 1 {
+		actor = "multiple-identity-headers"
+	}
+	result := "success"
+	if status >= 400 && status < 500 {
+		result = "rejected"
+	} else if status >= 500 {
+		result = "failure"
+	}
+	level := slog.LevelInfo
+	if result == "failure" {
+		level = slog.LevelWarn
+	}
+	slog.LogAttrs(context.Background(), level, "cms mutation", slog.String("action", r.Method), slog.String("path", auditValue(r.URL.Path)), slog.String("actor", actor), slog.Int("status", status), slog.String("result", result))
+}
+
+func (s *Server) applySecurityHeaders(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	if strings.HasPrefix(r.URL.Path, "/_cms") {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Add("Vary", "X-ExeDev-Email")
+		if s.CMSCSP != "" {
+			w.Header().Set("Content-Security-Policy", s.CMSCSP)
+		}
+		return
+	}
+	if s.PublicCSP != "" {
+		w.Header().Set("Content-Security-Policy", s.PublicCSP)
+	}
 }
 
 func setSecurityHeaders(w http.ResponseWriter) {
@@ -1762,15 +2308,37 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 }
+
+func setSVGSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'")
+	w.Header().Set("Content-Disposition", "inline")
+}
+
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
+	s.applySecurityHeaders(w, r)
 	if r.URL.Path == "/_cms" || r.URL.Path == "/_cms/" || strings.HasPrefix(r.URL.Path, "/_cms/") {
 		if !s.cmsAllowed(r) {
 			http.NotFound(w, r)
 			return
 		}
-		if isMutationMethod(r.Method) && !sameOriginRequest(r) {
+		if isMutationMethod(r.Method) && !s.sameOriginRequest(r) {
 			http.NotFound(w, r)
+			return
+		}
+		if isMutationMethod(r.Method) {
+			if !s.acquireMutationSlot() {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "too many CMS mutations in progress", http.StatusTooManyRequests)
+				return
+			}
+			defer s.releaseMutationSlot()
+			recorded := &statusResponseWriter{ResponseWriter: w}
+			s.routeCMS(recorded, r)
+			status := recorded.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			s.auditMutation(r, status)
 			return
 		}
 		if r.URL.Path == "/_cms" {
@@ -1827,12 +2395,15 @@ func (s *Server) routeCMS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveWebFile(w http.ResponseWriter, r *http.Request, name string) {
-	path, _, err := safeResolvedPath(s.WebDir, name)
-	if err != nil {
+	path, info, err := safeResolvedPath(s.WebDir, name)
+	if err != nil || !info.Mode().IsRegular() {
 		http.Error(w, "Fileloom web asset not found", http.StatusNotFound)
 		return
 	}
 	setContentType(w, path)
+	if strings.EqualFold(filepath.Ext(path), ".svg") {
+		setSVGSecurityHeaders(w)
+	}
 	http.ServeFile(w, r, path)
 }
 
@@ -1847,12 +2418,19 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, root, prefix 
 		http.NotFound(w, r)
 		return
 	}
+	if privateGeneratedPath(rel) {
+		http.NotFound(w, r)
+		return
+	}
 	path, info, err := safeResolvedPath(root, rel)
-	if err != nil || info.IsDir() {
+	if err != nil || info.IsDir() || !info.Mode().IsRegular() {
 		http.NotFound(w, r)
 		return
 	}
 	setContentType(w, path)
+	if strings.EqualFold(filepath.Ext(path), ".svg") {
+		setSVGSecurityHeaders(w)
+	}
 	http.ServeFile(w, r, path)
 }
 
@@ -1873,17 +2451,123 @@ func safeRelativePath(value string) (string, error) {
 	return clean, nil
 }
 
+func rejectSymlinkPath(root, rel string) error {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	if err := rejectExistingSymlinkComponents(filepath.Dir(rootAbs), filepath.Base(rootAbs)); err != nil {
+		return err
+	}
+	rootInfo, err := os.Lstat(rootAbs)
+	if err != nil {
+		return err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("root must not be a symlink")
+	}
+	clean, err := safeRelativePath(rel)
+	if err != nil && rel != "" {
+		return err
+	}
+	if clean == "." {
+		clean = ""
+	}
+	current := rootAbs
+	parts := []string{}
+	if clean != "" {
+		parts = strings.Split(filepath.FromSlash(clean), string(filepath.Separator))
+	}
+	for index, part := range parts {
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) && index == len(parts)-1 {
+				return nil
+			}
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlinks are not allowed: %s", current)
+		}
+	}
+	return nil
+}
+
+func rejectExistingSymlinkComponents(root, rel string) error {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	rootInfo, err := os.Lstat(rootAbs)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("root must not be a symlink")
+	}
+	clean, err := safeRelativePath(rel)
+	if err != nil && rel != "" {
+		return err
+	}
+	if clean == "." {
+		clean = ""
+	}
+	current := rootAbs
+	if clean == "" {
+		return nil
+	}
+	for _, part := range strings.Split(filepath.FromSlash(clean), string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlinks are not allowed: %s", current)
+		}
+	}
+	return nil
+}
+func safeWorkspacePath(root, rel string) (string, error) {
+	clean, err := safeRelativePath(rel)
+	if err != nil {
+		return "", err
+	}
+	if err := rejectExistingSymlinkComponents(root, clean); err != nil {
+		return "", err
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(rootAbs, filepath.FromSlash(clean)), nil
+}
+
 func safeResolvedPath(root, rel string) (string, fs.FileInfo, error) {
+	clean, err := safeRelativePath(rel)
+	if err != nil {
+		return "", nil, err
+	}
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return "", nil, err
 	}
-	rootReal, err := filepath.EvalSymlinks(rootAbs)
+	if err := rejectSymlinkPath(rootAbs, clean); err != nil {
+		return "", nil, err
+	}
+	candidate := filepath.Join(rootAbs, filepath.FromSlash(clean))
+	resolved, err := filepath.EvalSymlinks(candidate)
 	if err != nil {
 		return "", nil, err
 	}
-	candidate := filepath.Join(rootAbs, filepath.FromSlash(rel))
-	resolved, err := filepath.EvalSymlinks(candidate)
+	rootReal, err := filepath.EvalSymlinks(rootAbs)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1909,41 +2593,59 @@ func (s *Server) servePublic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Add("Vary", "X-ExeDev-Email")
+	ownerView := s.cmsAllowed(r)
+	var ownerDocument Document
+	var hasOwnerDocument bool
+	if ownerView {
+		ownerDocument, hasOwnerDocument = s.publicDocument(r.URL.Path)
+	}
 	requested := strings.TrimPrefix(r.URL.Path, "/")
 	candidates := []string{}
 	if requested == "" {
 		candidates = append(candidates, "index.html")
+	} else if strings.HasSuffix(requested, "/") {
+		candidates = append(candidates, requested+"index.html")
 	} else {
-		if strings.HasSuffix(requested, "/") {
-			candidates = append(candidates, requested+"index.html")
-		} else {
-			candidates = append(candidates, requested, requested+"/index.html", requested+".html")
-		}
+		candidates = append(candidates, requested, requested+"/index.html", requested+".html")
 	}
 	publicDir := filepath.Join(s.SiteDir, "public")
 	for _, candidate := range candidates {
 		rel, err := safeRelativePath(candidate)
-		if err != nil {
+		if err != nil || privateGeneratedPath(rel) {
 			continue
 		}
+		s.publicMu.RLock()
 		path, info, err := safeResolvedPath(publicDir, rel)
-		if err == nil && !info.IsDir() {
-			setContentType(w, path)
-			if doc, ok := s.publicDocument(r.URL.Path); ok && s.cmsAllowed(r) {
-				data, readErr := os.ReadFile(path)
-				if readErr != nil {
-					http.NotFound(w, r)
-					return
-				}
-				data = injectOwnerEditToolbar(data, doc)
-				w.Header().Set("Cache-Control", "private, no-store")
-				w.Header().Add("Vary", "X-ExeDev-Email")
-				http.ServeContent(w, r, filepath.Base(path), info.ModTime(), bytes.NewReader(data))
-				return
-			}
-			http.ServeFile(w, r, path)
+		if err != nil || info.IsDir() || !info.Mode().IsRegular() {
+			s.publicMu.RUnlock()
+			continue
+		}
+		file, openErr := os.Open(path)
+		s.publicMu.RUnlock()
+		if openErr != nil {
+			http.NotFound(w, r)
 			return
 		}
+		setContentType(w, path)
+		if strings.EqualFold(filepath.Ext(path), ".svg") {
+			setSVGSecurityHeaders(w)
+		}
+		if ownerView && hasOwnerDocument {
+			data, readErr := io.ReadAll(file)
+			_ = file.Close()
+			if readErr != nil {
+				http.NotFound(w, r)
+				return
+			}
+			data = injectOwnerEditToolbar(data, ownerDocument)
+			w.Header().Set("Cache-Control", "private, no-store")
+			w.Header().Add("Vary", "X-ExeDev-Email")
+			http.ServeContent(w, r, filepath.Base(path), info.ModTime(), bytes.NewReader(data))
+			return
+		}
+		http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
+		_ = file.Close()
+		return
 	}
 	http.NotFound(w, r)
 }
@@ -1987,7 +2689,7 @@ func isMutationMethod(method string) bool {
 	return method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 }
 
-func sameOriginRequest(r *http.Request) bool {
+func (s *Server) sameOriginRequest(r *http.Request) bool {
 	fetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
 	if fetchSite == "cross-site" {
 		return false
@@ -1996,15 +2698,69 @@ func sameOriginRequest(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
-	parsed, err := url.Parse(origin)
-	return err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host)
+	parsedOrigin := normalizedOrigin(origin)
+	if parsedOrigin == "" {
+		return false
+	}
+	allowed := map[string]bool{requestOrigin(r): true}
+	if config, err := s.loadSiteConfig(); err == nil {
+		if configured := normalizedOrigin(config.BaseURL); configured != "" {
+			allowed[configured] = true
+		}
+	}
+	return allowed[parsedOrigin]
 }
+
+func sameOriginRequest(r *http.Request) bool {
+	fetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+	if fetchSite == "cross-site" {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	return origin == "" || normalizedOrigin(origin) == requestOrigin(r)
+}
+
+func requestOrigin(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return normalizedOrigin(scheme + "://" + r.Host)
+}
+
+func normalizedOrigin(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return ""
+	}
+	port := parsed.Port()
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + host
+}
+
 func (s *Server) cmsAllowed(r *http.Request) bool {
 	owner := strings.TrimSpace(s.OwnerEmail)
 	if owner == "" {
 		return false
 	}
-	email := strings.TrimSpace(r.Header.Get("X-ExeDev-Email"))
+	values := r.Header.Values("X-ExeDev-Email")
+	if len(values) != 1 || strings.ContainsAny(values[0], "\r\n,") {
+		return false
+	}
+	email := strings.TrimSpace(values[0])
 	return email != "" && strings.EqualFold(email, owner)
 }
 
@@ -2138,11 +2894,12 @@ type createItemInput struct {
 }
 
 func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
+	limitRequestBody(w, r, maxEditorSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	var input createItemInput
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-		if err := json.NewDecoder(io.LimitReader(r.Body, maxEditorSize)).Decode(&input); err != nil {
+		if err := decodeJSONBody(r, &input); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 			return
 		}
@@ -2215,7 +2972,12 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.Status == "published" || input.Status == "scheduled" {
 		if _, err := s.Build(); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "item saved but build failed: "+err.Error())
+			rollbackErr := s.removeContentSource(path)
+			message := "item creation rolled back because build failed: " + err.Error()
+			if rollbackErr != nil {
+				message += "; rollback failed: " + rollbackErr.Error()
+			}
+			writeJSONError(w, http.StatusInternalServerError, message)
 			return
 		}
 	}
@@ -2248,6 +3010,7 @@ func (s *Server) handleThemeActivateAPI(w http.ResponseWriter, r *http.Request) 
 		methodNotAllowed(w)
 		return
 	}
+	limitRequestBody(w, r, maxFormSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
@@ -2267,6 +3030,7 @@ func (s *Server) handleItemStatusAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	limitRequestBody(w, r, maxFormSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
@@ -2274,6 +3038,11 @@ func (s *Server) handleItemStatusAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	doc, err := s.loadDocument(r.FormValue("path"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	original, err := s.loadSourceDocument(doc.Path)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -2308,7 +3077,12 @@ func (s *Server) handleItemStatusAPI(w http.ResponseWriter, r *http.Request) {
 	var build BuildResult
 	build, err = s.Build()
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "status saved but build failed: "+err.Error())
+		rollbackErr := s.writeContentSource(doc.Path, original.Source)
+		message := "status change rolled back because build failed: " + err.Error()
+		if rollbackErr != nil {
+			message += "; rollback failed: " + rollbackErr.Error()
+		}
+		writeJSONError(w, http.StatusInternalServerError, message)
 		return
 	}
 	if err := s.gitChangeIfConfigured("Change status for " + updated.Path); err != nil {
@@ -2335,20 +3109,32 @@ func (s *Server) handleRevisionRestoreAPI(w http.ResponseWriter, r *http.Request
 		methodNotAllowed(w)
 		return
 	}
+	limitRequestBody(w, r, maxFormSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	doc, err := s.restoreRevision(r.FormValue("path"), r.FormValue("id"))
+	targetPath := r.FormValue("path")
+	original, err := s.loadSourceDocument(targetPath)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	doc, err := s.restoreRevision(targetPath, r.FormValue("id"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	build, err := s.Build()
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "revision restored but build failed: "+err.Error())
+		rollbackErr := s.writeContentSource(doc.Path, original.Source)
+		message := "revision restore rolled back because build failed: " + err.Error()
+		if rollbackErr != nil {
+			message += "; rollback failed: " + rollbackErr.Error()
+		}
+		writeJSONError(w, http.StatusInternalServerError, message)
 		return
 	}
 	if err := s.gitChangeIfConfigured("Restore " + doc.Path); err != nil {
@@ -2362,6 +3148,10 @@ func (s *Server) handleBuildAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	if !rejectOversizedDeclaredBody(w, r, maxFormSize) {
+		return
+	}
+	limitRequestBody(w, r, maxFormSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	result, err := s.Build()
@@ -2377,7 +3167,7 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxEditorSize)
+	limitRequestBody(w, r, maxEditorSize)
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -2392,6 +3182,11 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	original, err := s.loadSourceDocument(path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	updated, err := s.patchDocumentSource(path, extractBodyHTML(r.FormValue("html")), true, nil, r.FormValue("base_sha256"), "Edit "+path)
 	if err != nil {
 		var conflict *sourceConflictError
@@ -2406,7 +3201,12 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 	if documentIsPublishable(updated, time.Now().UTC()) {
 		build, err = s.Build()
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "saved but build failed: "+err.Error())
+			rollbackErr := s.writeContentSource(updated.Path, original.Source)
+			message := "edit rolled back because build failed: " + err.Error()
+			if rollbackErr != nil {
+				message += "; rollback failed: " + rollbackErr.Error()
+			}
+			writeJSONError(w, http.StatusInternalServerError, message)
 			return
 		}
 	}
@@ -2459,10 +3259,30 @@ func (s *Server) handleThemeSaveAPI(w http.ResponseWriter, r *http.Request, them
 		return
 	}
 	contents := stripThemePreview(r.FormValue("html"))
-	path := filepath.Join(s.SiteDir, filepath.FromSlash(file))
+	path, err := safeWorkspacePath(s.SiteDir, file)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	previous, _ := os.ReadFile(path)
+	var previous []byte
+	hadPrevious := false
+	if info, statErr := os.Lstat(path); statErr == nil {
+		if !info.Mode().IsRegular() {
+			writeJSONError(w, http.StatusBadRequest, "theme layout must be a regular file")
+			return
+		}
+		previous, err = os.ReadFile(path)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		hadPrevious = true
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		writeJSONError(w, http.StatusInternalServerError, statErr.Error())
+		return
+	}
 	if baseSHA := strings.TrimSpace(r.FormValue("base_sha256")); baseSHA != "" && baseSHA != sourceSHA256(previous) {
 		writeJSONError(w, http.StatusConflict, "theme layout changed since it was opened; reload before saving")
 		return
@@ -2483,7 +3303,20 @@ func (s *Server) handleThemeSaveAPI(w http.ResponseWriter, r *http.Request, them
 	}
 	build, err := s.Build()
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "theme saved but build failed: "+err.Error())
+		var rollbackErr error
+		if hadPrevious {
+			rollbackErr = writeAtomicFile(path, previous)
+		} else {
+			rollbackErr = os.Remove(path)
+			if errors.Is(rollbackErr, os.ErrNotExist) {
+				rollbackErr = nil
+			}
+		}
+		message := "theme edit rolled back because build failed: " + err.Error()
+		if rollbackErr != nil {
+			message += "; rollback failed: " + rollbackErr.Error()
+		}
+		writeJSONError(w, http.StatusInternalServerError, message)
 		return
 	}
 	if err := s.gitChangeIfConfigured("Edit " + file); err != nil {
@@ -2535,8 +3368,8 @@ func themeStylesPath(siteDir, theme string) (string, string, error) {
 		return "", "", err
 	}
 	rel := filepath.ToSlash(filepath.Join("themes", name, "assets", "style.css"))
-	filePath := filepath.Join(siteDir, filepath.FromSlash(rel))
-	if !fileExists(filePath) {
+	filePath, info, err := safeResolvedPath(siteDir, rel)
+	if err != nil || !info.Mode().IsRegular() {
 		return "", "", errors.New("theme stylesheet not found")
 	}
 	return rel, filePath, nil
@@ -2551,6 +3384,9 @@ func validateCSSValue(value string) error {
 }
 
 func (s *Server) handleThemeTokensAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		limitRequestBody(w, r, maxEditorSize)
+	}
 	theme := r.URL.Query().Get("theme")
 	if r.Method == http.MethodPost {
 		theme = r.FormValue("theme")
@@ -2582,7 +3418,7 @@ func (s *Server) handleThemeTokensAPI(w http.ResponseWriter, r *http.Request) {
 			Tokens map[string]string `json:"tokens"`
 		}
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-			if err := json.NewDecoder(io.LimitReader(r.Body, maxEditorSize)).Decode(&input); err != nil {
+			if err := decodeJSONBody(r, &input); err != nil {
 				writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 				return
 			}
@@ -2648,7 +3484,12 @@ func (s *Server) handleThemeTokensAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		build, err := s.Build()
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "theme tokens saved but build failed: "+err.Error())
+			rollbackErr := writeAtomicFile(filePath, data)
+			message := "theme token edit rolled back because build failed: " + err.Error()
+			if rollbackErr != nil {
+				message += "; rollback failed: " + rollbackErr.Error()
+			}
+			writeJSONError(w, http.StatusInternalServerError, message)
 			return
 		}
 		if err := s.gitChangeIfConfigured("Edit theme tokens " + theme); err != nil {
@@ -2660,11 +3501,6 @@ func (s *Server) handleThemeTokensAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 	}
 }
-
-const (
-	maxExportFiles = 10000
-	maxExportBytes = 64 << 20
-)
 
 type limitedBuffer struct {
 	buffer bytes.Buffer
@@ -2679,10 +3515,14 @@ func (w *limitedBuffer) Write(data []byte) (int, error) {
 }
 
 func (s *Server) handleExportAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		methodNotAllowed(w)
+	if r.Method != http.MethodPost {
+		methodNotAllowedAllow(w, http.MethodPost)
 		return
 	}
+	if !rejectOversizedDeclaredBody(w, r, maxFormSize) {
+		return
+	}
+	limitRequestBody(w, r, maxFormSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if _, err := s.Build(); err != nil {
@@ -2693,6 +3533,8 @@ func (s *Server) handleExportAPI(w http.ResponseWriter, r *http.Request) {
 	buffer := &limitedBuffer{limit: maxExportBytes}
 	archive := zip.NewWriter(buffer)
 	files := 0
+	var uncompressedBytes int64
+	s.publicMu.RLock()
 	err := filepath.WalkDir(publicDir, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -2703,18 +3545,28 @@ func (s *Server) handleExportAPI(w http.ResponseWriter, r *http.Request) {
 		if entry.IsDir() {
 			return nil
 		}
-		if files >= maxExportFiles {
-			return errors.New("export contains too many files")
-		}
 		rel, err := filepath.Rel(publicDir, filePath)
 		if err != nil {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		if privateGeneratedPath(rel) {
+			return nil
+		}
+		if files >= maxExportFiles {
+			return errors.New("export contains too many files")
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing non-regular file in export: %s", filePath)
+		}
+		if info.Size() > maxExportFileBytes || uncompressedBytes > maxExportUncompressedBytes-info.Size() {
+			return errors.New("export exceeds the uncompressed size limit")
+		}
+		uncompressedBytes += info.Size()
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
 			return err
@@ -2729,7 +3581,7 @@ func (s *Server) handleExportAPI(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		_, copyErr := io.Copy(writer, input)
+		_, copyErr := io.Copy(writer, io.LimitReader(input, maxExportFileBytes+1))
 		closeErr := input.Close()
 		if copyErr != nil {
 			return copyErr
@@ -2740,6 +3592,7 @@ func (s *Server) handleExportAPI(w http.ResponseWriter, r *http.Request) {
 		files++
 		return nil
 	})
+	s.publicMu.RUnlock()
 	if err == nil {
 		err = archive.Close()
 	} else {
@@ -2787,7 +3640,12 @@ func (s *Server) handleEditor(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Content item not found", http.StatusNotFound)
 		return
 	}
-	source, err := os.ReadFile(filepath.Join(s.WebDir, "vvvebjs", "editor.html"))
+	sourcePath, _, err := safeResolvedPath(s.WebDir, filepath.ToSlash(filepath.Join("vvvebjs", "editor.html")))
+	if err != nil {
+		http.Error(w, "VvvebJs editor is not installed", http.StatusNotFound)
+		return
+	}
+	source, err := os.ReadFile(sourcePath)
 	if err != nil {
 		http.Error(w, "VvvebJs editor is not installed", http.StatusNotFound)
 		return
@@ -2813,12 +3671,17 @@ func (s *Server) handleThemeEditor(w http.ResponseWriter, r *http.Request, theme
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	layoutPath := filepath.Join(s.SiteDir, "themes", name, "layout.html")
-	if !fileExists(layoutPath) {
+	layoutPath, _, err := safeResolvedPath(s.SiteDir, filepath.ToSlash(filepath.Join("themes", name, "layout.html")))
+	if err != nil || !fileExists(layoutPath) {
 		http.Error(w, "Theme layout not found", http.StatusNotFound)
 		return
 	}
-	source, err := os.ReadFile(filepath.Join(s.WebDir, "vvvebjs", "editor.html"))
+	sourcePath, _, err := safeResolvedPath(s.WebDir, filepath.ToSlash(filepath.Join("vvvebjs", "editor.html")))
+	if err != nil {
+		http.Error(w, "VvvebJs editor is not installed", http.StatusNotFound)
+		return
+	}
+	source, err := os.ReadFile(sourcePath)
 	if err != nil {
 		http.Error(w, "VvvebJs editor is not installed", http.StatusNotFound)
 		return
@@ -2919,7 +3782,12 @@ func (s *Server) handleEditorFrame(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	css, _ := os.ReadFile(filepath.Join(s.SiteDir, "themes", config.Theme, "assets", "style.css"))
+	_, cssPath, err := themeStylesPath(s.SiteDir, config.Theme)
+	if err != nil {
+		http.Error(w, "Theme stylesheet not found", http.StatusNotFound)
+		return
+	}
+	css, _ := os.ReadFile(cssPath)
 	cssText := strings.ReplaceAll(string(css), "</style>", "<\\/style>")
 	body := doc.HTML
 	frame := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>` + html.EscapeString(doc.Title) + `</title><style>` + cssText + `</style><style>body{min-height:100vh}body:before{content:"Fileloom content canvas";display:block;margin:20px auto 0;max-width:790px;color:#8c97a6;font:600 11px/1.2 system-ui;letter-spacing:.12em;text-transform:uppercase}</style></head><body>` + body + `</body></html>`
@@ -2933,12 +3801,24 @@ func (s *Server) handleThemeFrame(w http.ResponseWriter, r *http.Request, themeN
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	layout, err := os.ReadFile(filepath.Join(s.SiteDir, "themes", name, "layout.html"))
+	layoutPath, layoutInfo, err := safeResolvedPath(s.SiteDir, filepath.ToSlash(filepath.Join("themes", name, "layout.html")))
+	if err != nil || !layoutInfo.Mode().IsRegular() {
+		http.Error(w, "Theme layout not found", http.StatusNotFound)
+		return
+	}
+	cssPath, cssInfo, cssErr := safeResolvedPath(s.SiteDir, filepath.ToSlash(filepath.Join("themes", name, "assets", "style.css")))
+	if cssErr != nil || !cssInfo.Mode().IsRegular() {
+		cssPath = ""
+	}
+	layout, err := os.ReadFile(layoutPath)
 	if err != nil {
 		http.Error(w, "Theme layout not found", http.StatusNotFound)
 		return
 	}
-	css, _ := os.ReadFile(filepath.Join(s.SiteDir, "themes", name, "assets", "style.css"))
+	var css []byte
+	if cssPath != "" {
+		css, _ = os.ReadFile(cssPath)
+	}
 	cssText := strings.ReplaceAll(string(css), "</style>", "<\\/style>")
 	frame := strings.Replace(string(layout), "</head>", `<style data-fileloom-preview>`+cssText+`</style></head>`, 1)
 	if !strings.Contains(strings.ToLower(frame), "<html") {
@@ -2966,10 +3846,10 @@ func (s *Server) handleMediaAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
+	limitRequestBody(w, r, maxUploadSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	r.Body = http.MaxBytesReader(w, r.Body, 16<<20)
-	if err := r.ParseMultipartForm(16 << 20); err != nil {
+	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid upload: "+err.Error())
 		return
 	}
@@ -2984,25 +3864,72 @@ func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "unsupported media filename")
 		return
 	}
-	name = uniqueMediaName(filepath.Join(s.SiteDir, "media"), name)
-	path := filepath.Join(s.SiteDir, "media", name)
-	out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	root := filepath.Join(s.SiteDir, "media")
+	if err := rejectSymlinkPath(root, ""); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "media root is not safe: "+err.Error())
+		return
+	}
+	name = uniqueMediaName(root, name)
+	path := filepath.Join(root, name)
+	uploadTempDir := filepath.Join(s.SiteDir, ".fileloom", "uploads")
+	if err := rejectExistingSymlinkComponents(s.SiteDir, ".fileloom/uploads"); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "upload staging path is not safe: "+err.Error())
+		return
+	}
+	if err := os.MkdirAll(uploadTempDir, 0o755); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	temp, err := os.CreateTemp(uploadTempDir, ".fileloom-upload-*.tmp")
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_, copyErr := io.Copy(out, file)
-	closeErr := out.Close()
-	if copyErr != nil {
-		writeJSONError(w, http.StatusInternalServerError, copyErr.Error())
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if _, err := io.Copy(temp, file); err != nil {
+		_ = temp.Close()
+		writeJSONError(w, http.StatusBadRequest, "upload failed: "+err.Error())
 		return
 	}
-	if closeErr != nil {
-		writeJSONError(w, http.StatusInternalServerError, closeErr.Error())
+	if err := temp.Close(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "upload exceeds the size limit")
+		return
+	}
+	if strings.EqualFold(filepath.Ext(name), ".svg") {
+		data, err := os.ReadFile(tempName)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		sanitized, err := sanitizeSVG(data)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "unsafe SVG: "+err.Error())
+			return
+		}
+		if err := writeAtomicFile(tempName, sanitized); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if _, err := s.Build(); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "media saved but build failed: "+err.Error())
+		rollbackErr := os.Remove(path)
+		if errors.Is(rollbackErr, os.ErrNotExist) {
+			rollbackErr = nil
+		}
+		message := "media upload rolled back because build failed: " + err.Error()
+		if rollbackErr != nil {
+			message += "; rollback failed: " + rollbackErr.Error()
+		}
+		writeJSONError(w, http.StatusInternalServerError, message)
 		return
 	}
 	if err := s.gitChangeIfConfigured("Add media " + name); err != nil {
@@ -3012,6 +3939,234 @@ func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "name": name, "path": name, "url": "/media/" + url.PathEscape(name)})
 }
 
+const svgNamespace = "http://www.w3.org/2000/svg"
+
+var allowedSVGElements = map[string]string{
+	"svg":            "svg",
+	"g":              "g",
+	"defs":           "defs",
+	"path":           "path",
+	"rect":           "rect",
+	"circle":         "circle",
+	"ellipse":        "ellipse",
+	"line":           "line",
+	"polyline":       "polyline",
+	"polygon":        "polygon",
+	"lineargradient": "linearGradient",
+	"radialgradient": "radialGradient",
+	"stop":           "stop",
+	"clippath":       "clipPath",
+	"mask":           "mask",
+	"pattern":        "pattern",
+	"use":            "use",
+	"text":           "text",
+	"tspan":          "tspan",
+	"title":          "title",
+	"desc":           "desc",
+}
+
+var allowedSVGAttributes = map[string]bool{
+	"xmlns": true, "viewbox": true, "width": true, "height": true, "x": true, "y": true,
+	"x1": true, "x2": true, "y1": true, "y2": true, "cx": true, "cy": true, "r": true,
+	"rx": true, "ry": true, "d": true, "points": true, "fill": true, "stroke": true,
+	"stroke-width": true, "stroke-linecap": true, "stroke-linejoin": true, "stroke-miterlimit": true,
+	"fill-rule": true, "clip-rule": true, "fill-opacity": true, "stroke-opacity": true,
+	"opacity": true, "transform": true, "preserveaspectratio": true, "gradientunits": true,
+	"gradienttransform": true, "offset": true, "stop-color": true, "stop-opacity": true,
+	"patternunits": true, "patterncontentunits": true, "patterntransform": true,
+	"clippathunits": true, "maskunits": true, "maskcontentunits": true, "id": true,
+	"class": true, "href": true,
+	"font-family": true, "font-size": true, "font-weight": true, "text-anchor": true, "dominant-baseline": true,
+}
+
+func sanitizeSVG(data []byte) ([]byte, error) {
+	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	decoder.Strict = true
+	var output bytes.Buffer
+	encoder := xml.NewEncoder(&output)
+	stack := []string{}
+	rootSeen := false
+	skipDepth := 0
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, errors.New("SVG is not well-formed XML")
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			name := strings.ToLower(token.Name.Local)
+			if token.Name.Space != "" && token.Name.Space != svgNamespace {
+				if !rootSeen {
+					return nil, errors.New("SVG uses an unsupported namespace")
+				}
+				skipDepth = 1
+				continue
+			}
+			if skipDepth > 0 {
+				skipDepth++
+				continue
+			}
+			if !rootSeen {
+				if name != "svg" {
+					return nil, errors.New("SVG root element is required")
+				}
+				rootSeen = true
+			} else if len(stack) == 0 {
+				return nil, errors.New("SVG contains content after its root element")
+			}
+			canonical, allowed := allowedSVGElements[name]
+			if !allowed || (name == "svg" && len(stack) > 0) {
+				skipDepth = 1
+				continue
+			}
+			attrs := sanitizeSVGAttributes(token.Attr, name)
+			if name == "svg" {
+				attrs = append([]xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: svgNamespace}}, attrs...)
+			}
+			if err := encoder.EncodeToken(xml.StartElement{Name: xml.Name{Local: canonical}, Attr: attrs}); err != nil {
+				return nil, err
+			}
+			stack = append(stack, canonical)
+		case xml.EndElement:
+			if skipDepth > 0 {
+				skipDepth--
+				continue
+			}
+			if len(stack) == 0 {
+				return nil, errors.New("SVG has an unexpected closing element")
+			}
+			last := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if err := encoder.EncodeToken(xml.EndElement{Name: xml.Name{Local: last}}); err != nil {
+				return nil, err
+			}
+		case xml.CharData:
+			if skipDepth > 0 {
+				continue
+			}
+			if len(stack) > 0 {
+				if err := encoder.EncodeToken(token); err != nil {
+					return nil, err
+				}
+			} else if strings.TrimSpace(string(token)) != "" {
+				return nil, errors.New("SVG contains text outside its root element")
+			}
+		case xml.Directive:
+			return nil, errors.New("SVG directives are not allowed")
+		case xml.ProcInst:
+			// Drop XML declarations and processing instructions.
+		case xml.Comment:
+			// Drop comments so hidden markup cannot be carried into the upload.
+		}
+	}
+	if !rootSeen || len(stack) != 0 || skipDepth != 0 {
+		return nil, errors.New("SVG root element is required")
+	}
+	if err := encoder.Flush(); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
+func sanitizeSVGAttributes(attributes []xml.Attr, element string) []xml.Attr {
+	result := make([]xml.Attr, 0, len(attributes))
+	seen := map[string]bool{}
+	for _, attribute := range attributes {
+		name := strings.ToLower(attribute.Name.Local)
+		if attribute.Name.Space != "" && name != "href" {
+			continue
+		}
+		if name == "xlink:href" {
+			name = "href"
+		}
+		if name == "xmlns" {
+			continue
+		}
+		if name == "onload" || strings.HasPrefix(name, "on") || !allowedSVGAttributes[name] || seen[name] {
+			continue
+		}
+		value := strings.TrimSpace(attribute.Value)
+		if !safeSVGAttributeValue(name, value) {
+			continue
+		}
+		seen[name] = true
+		canonical := name
+		switch name {
+		case "viewbox":
+			canonical = "viewBox"
+		case "preserveaspectratio":
+			canonical = "preserveAspectRatio"
+		case "gradientunits":
+			canonical = "gradientUnits"
+		case "gradienttransform":
+			canonical = "gradientTransform"
+		case "patternunits":
+			canonical = "patternUnits"
+		case "patterncontentunits":
+			canonical = "patternContentUnits"
+		case "patterntransform":
+			canonical = "patternTransform"
+		case "clippathunits":
+			canonical = "clipPathUnits"
+		case "maskunits":
+			canonical = "maskUnits"
+		case "maskcontentunits":
+			canonical = "maskContentUnits"
+		case "stop-color":
+			canonical = "stop-color"
+		case "stop-opacity":
+			canonical = "stop-opacity"
+		}
+		result = append(result, xml.Attr{Name: xml.Name{Local: canonical}, Value: value})
+	}
+	return result
+}
+
+func asciiLower(value string) string {
+	data := []byte(value)
+	for index, char := range data {
+		if char >= 'A' && char <= 'Z' {
+			data[index] = char + ('a' - 'A')
+		}
+	}
+	return string(data)
+}
+
+func safeSVGAttributeValue(name, value string) bool {
+	if strings.ContainsAny(value, "\x00\r\n\\") {
+		return false
+	}
+	lower := asciiLower(value)
+	for _, blocked := range []string{"javascript:", "vbscript:", "expression(", "@import", "-moz-binding", "behavior:", "<script", "</script"} {
+		if strings.Contains(lower, blocked) {
+			return false
+		}
+	}
+	if name == "href" && !strings.HasPrefix(value, "#") {
+		return false
+	}
+	for cursor := 0; ; {
+		index := strings.Index(lower[cursor:], "url(")
+		if index < 0 {
+			break
+		}
+		index += cursor
+		end := strings.IndexByte(lower[index+4:], ')')
+		if end < 0 {
+			return false
+		}
+		inside := strings.TrimSpace(value[index+4 : index+4+end])
+		if !strings.HasPrefix(inside, "#") || strings.ContainsAny(inside, "'\"<>\\/") {
+			return false
+		}
+		cursor = index + 5 + end
+	}
+	return true
+}
 func allowedMediaName(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
@@ -3033,19 +4188,32 @@ func uniqueMediaName(root, name string) string {
 }
 
 func mediaTree(root string) ([]map[string]any, error) {
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return nil, err
+	}
+	if !rootInfo.IsDir() {
+		return nil, errors.New("media root must be a directory")
+	}
 	var files []map[string]any
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("symlinks are not allowed in media: %s", path)
 		}
 		if entry.IsDir() || path == root {
 			return nil
 		}
-		rel, err := filepath.Rel(root, path)
+		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
-		info, err := entry.Info()
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("non-regular media file is not allowed: %s", path)
+		}
+		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
@@ -3072,10 +4240,20 @@ func mediaCount(root string) int {
 }
 
 func runGit(repo string, args ...string) (string, error) {
+	return runGitWithTimeout(maxGitCommandDuration, repo, args...)
+}
+
+func runGitWithTimeout(timeout time.Duration, repo string, args ...string) (string, error) {
 	commandArgs := append([]string{"-C", repo}, args...)
-	command := exec.Command("git", commandArgs...)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, "git", commandArgs...)
+	command.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
 	output, err := command.CombinedOutput()
 	text := strings.TrimSpace(string(output))
+	if ctx.Err() != nil {
+		return text, fmt.Errorf("git %s timed out after %s", strings.Join(args, " "), timeout)
+	}
 	if err != nil {
 		if text == "" {
 			text = err.Error()
@@ -3088,21 +4266,28 @@ func runGit(repo string, args ...string) (string, error) {
 func (s *Server) gitRepo() (string, error) {
 	repo := filepath.Clean(s.SiteDir)
 	gitDir := filepath.Join(repo, ".git")
-	if _, err := os.Stat(gitDir); err != nil {
+	gitInfo, err := os.Lstat(gitDir)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", errors.New("no Git repository at site/.git; initialize the site repository first")
 		}
+		return "", err
+	}
+	if gitInfo.Mode()&os.ModeSymlink != 0 || !gitInfo.IsDir() {
+		return "", errors.New("site/.git must be a real directory inside the site workspace")
+	}
+	if err := rejectExistingSymlinkComponents(repo, ".git"); err != nil {
 		return "", err
 	}
 	root, err := runGit(repo, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", err
 	}
-	rootAbs, err := filepath.Abs(filepath.Clean(root))
+	rootAbs, err := filepath.EvalSymlinks(filepath.Clean(root))
 	if err != nil {
 		return "", err
 	}
-	repoAbs, err := filepath.Abs(repo)
+	repoAbs, err := filepath.EvalSymlinks(repo)
 	if err != nil {
 		return "", err
 	}
@@ -3110,6 +4295,62 @@ func (s *Server) gitRepo() (string, error) {
 		return "", errors.New("site Git repository resolves outside the site workspace")
 	}
 	return repo, nil
+}
+
+func validGitRemoteName(value string) bool {
+	return value != "" && value != "." && value != ".." && !strings.HasPrefix(value, "-") && !strings.Contains(value, "..") && regexp.MustCompile(`^[A-Za-z0-9._-]+$`).MatchString(value)
+}
+
+func gitRemoteURLs(repo, remote string, push bool) ([]string, error) {
+	args := []string{"remote", "get-url"}
+	if push {
+		args = append(args, "--push")
+	}
+	args = append(args, "--all", remote)
+	output, err := runGit(repo, args...)
+	if err != nil {
+		return nil, err
+	}
+	var urls []string
+	for _, line := range strings.Split(output, "\n") {
+		if value := strings.TrimSpace(line); value != "" {
+			urls = append(urls, value)
+		}
+	}
+	if len(urls) == 0 {
+		return nil, errors.New("Git remote has no URL")
+	}
+	return urls, nil
+}
+
+func (s *Server) gitRemoteURL(repo, remote string, unattended bool) (string, error) {
+	if remote == "" {
+		remote = "origin"
+	}
+	if !validGitRemoteName(remote) {
+		return "", errors.New("remote name contains invalid characters")
+	}
+	fetchURLs, err := gitRemoteURLs(repo, remote, false)
+	if err != nil {
+		return "", err
+	}
+	for _, remoteURL := range fetchURLs {
+		if err := validateRemoteURLForAutomation(remoteURL, false); err != nil {
+			return "", err
+		}
+	}
+	if unattended {
+		pushURLs, err := gitRemoteURLs(repo, remote, true)
+		if err != nil {
+			return "", err
+		}
+		for _, remoteURL := range pushURLs {
+			if err := validateRemoteURLForAutomation(remoteURL, true); err != nil {
+				return "", err
+			}
+		}
+	}
+	return fetchURLs[0], nil
 }
 
 func (s *Server) gitScope(repo string) ([]string, error) {
@@ -3137,7 +4378,11 @@ func (s *Server) gitStatus(config GitConfig) GitStatus {
 	if remote == "" {
 		remote = "origin"
 	}
-	remoteURL, remoteErr := runGit(repo, "remote", "get-url", remote)
+	remoteURL, remoteErr := s.gitRemoteURL(repo, remote, false)
+	if remoteErr != nil && !strings.Contains(remoteErr.Error(), "No such remote") {
+		status.Error = remoteErr.Error()
+		return status
+	}
 	if remoteErr != nil {
 		remoteURL = ""
 	}
@@ -3169,6 +4414,11 @@ func (s *Server) gitCommitAndPush(config GitConfig, message string, push bool) (
 	if err != nil {
 		return false, err
 	}
+	if push || config.AutoPush {
+		if _, err := s.gitRemoteURL(repo, config.Remote, config.AutoPush); err != nil {
+			return false, err
+		}
+	}
 	porcelain, err := runGit(repo, append([]string{"status", "--porcelain"}, append([]string{"--"}, scope...)...)...)
 	if err != nil {
 		return false, err
@@ -3191,7 +4441,7 @@ func (s *Server) gitCommitAndPush(config GitConfig, message string, push bool) (
 		committed = true
 	}
 	if push || config.AutoPush {
-		if err := s.gitPush(config); err != nil {
+		if err := s.gitPushWithPolicy(config, config.AutoPush); err != nil {
 			return committed, err
 		}
 	}
@@ -3199,6 +4449,10 @@ func (s *Server) gitCommitAndPush(config GitConfig, message string, push bool) (
 }
 
 func (s *Server) gitPush(config GitConfig) error {
+	return s.gitPushWithPolicy(config, config.AutoPush)
+}
+
+func (s *Server) gitPushWithPolicy(config GitConfig, unattended bool) error {
 	repo, err := s.gitRepo()
 	if err != nil {
 		return err
@@ -3207,6 +4461,12 @@ func (s *Server) gitPush(config GitConfig) error {
 	if remote == "" {
 		remote = "origin"
 	}
+	if !validGitRemoteName(remote) {
+		return errors.New("remote name contains invalid characters")
+	}
+	if _, err := s.gitRemoteURL(repo, remote, unattended); err != nil {
+		return err
+	}
 	branch := strings.TrimSpace(config.Branch)
 	if branch == "" {
 		branch, _ = runGit(repo, "branch", "--show-current")
@@ -3214,7 +4474,10 @@ func (s *Server) gitPush(config GitConfig) error {
 	if branch == "" {
 		return errors.New("git branch is not configured")
 	}
-	_, err = runGit(repo, "push", remote, branch)
+	if err := validateGitBranch(branch); err != nil {
+		return err
+	}
+	_, err = runGitWithTimeout(maxGitPushDuration, repo, "push", remote, branch)
 	return err
 }
 
@@ -3248,13 +4511,22 @@ func (s *Server) handleGitInitAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	if !rejectOversizedDeclaredBody(w, r, maxFormSize) {
+		return
+	}
+	limitRequestBody(w, r, maxFormSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if _, err := os.Stat(filepath.Join(s.SiteDir, ".git")); err == nil {
+	gitInfo, statErr := os.Lstat(filepath.Join(s.SiteDir, ".git"))
+	if statErr == nil {
+		if gitInfo.Mode()&os.ModeSymlink != 0 || !gitInfo.IsDir() {
+			writeJSONError(w, http.StatusBadRequest, "site/.git must be a real directory")
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": s.gitStatus(GitConfig{Remote: "origin"})})
 		return
-	} else if !errors.Is(err, os.ErrNotExist) {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		writeJSONError(w, http.StatusInternalServerError, statErr.Error())
 		return
 	}
 	if _, err := runGit(s.SiteDir, "init", "-b", "main"); err != nil {
@@ -3273,6 +4545,7 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	limitRequestBody(w, r, maxFormSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
@@ -3308,7 +4581,7 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 	if gitConfig.Remote == "" {
 		gitConfig.Remote = "origin"
 	}
-	if !regexp.MustCompile(`^[A-Za-z0-9._-]+$`).MatchString(gitConfig.Remote) {
+	if !validGitRemoteName(gitConfig.Remote) {
 		writeJSONError(w, http.StatusBadRequest, "remote name contains invalid characters")
 		return
 	}
@@ -3316,7 +4589,7 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateRemoteURL(gitConfig.RemoteURL); err != nil {
+	if err := validateRemoteURLForAutomation(gitConfig.RemoteURL, gitConfig.AutoPush); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -3333,6 +4606,17 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 			}
 		} else if _, setErr := runGit(repo, "remote", "set-url", gitConfig.Remote, gitConfig.RemoteURL); setErr != nil {
 			writeJSONError(w, http.StatusBadRequest, setErr.Error())
+			return
+		}
+	}
+	if gitConfig.AutoPush {
+		repo, err := s.gitRepo()
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "cannot enable auto-push: "+err.Error())
+			return
+		}
+		if _, err := s.gitRemoteURL(repo, gitConfig.Remote, true); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "cannot enable auto-push: "+err.Error())
 			return
 		}
 	}
@@ -3367,35 +4651,53 @@ func formBool(r *http.Request, key string) bool {
 	return value == "1" || value == "true" || value == "on" || value == "yes"
 }
 
+var gitSCPRemotePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^\s?#]+$`)
+
 func validateRemoteURL(value string) error {
+	return validateRemoteURLForAutomation(value, false)
+}
+
+func validateRemoteURLForAutomation(value string, unattended bool) error {
+	value = strings.TrimSpace(value)
 	if value == "" {
 		return nil
 	}
-	if strings.ContainsAny(value, "\r\n") {
-		return errors.New("remote URL cannot contain newlines")
+	if strings.ContainsAny(value, "\x00\r\n\t ") {
+		return errors.New("remote URL contains forbidden whitespace or control characters")
 	}
-	if strings.HasPrefix(value, "git@") && strings.Contains(value, ":") {
+	if gitSCPRemotePattern.MatchString(value) {
 		return nil
 	}
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme == "" || (parsed.Host == "" && !(parsed.Scheme == "file" && parsed.Path != "")) {
+	if err != nil || parsed.Scheme == "" || (parsed.Host == "" && !(strings.EqualFold(parsed.Scheme, "file") && parsed.Path != "")) {
 		return errors.New("remote URL must be https://, ssh://, git://, file://, or git@host:path format")
 	}
+	scheme := strings.ToLower(parsed.Scheme)
 	if parsed.User != nil {
-		return errors.New("remote URL must not contain embedded credentials")
+		_, hasPassword := parsed.User.Password()
+		if scheme != "ssh" || hasPassword {
+			return errors.New("remote URL must not contain embedded credentials")
+		}
 	}
-	switch parsed.Scheme {
+	if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
+		return errors.New("remote URL must not contain credentials, queries, or fragments")
+	}
+	switch scheme {
 	case "http", "https", "ssh", "git", "file":
-		return nil
 	default:
 		return errors.New("unsupported remote URL scheme")
 	}
+	if unattended && (scheme == "http" || scheme == "git" || scheme == "file") {
+		return errors.New("automatic pushes require an HTTPS or SSH remote")
+	}
+	return nil
 }
 func (s *Server) handleGitCommitAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
 		return
 	}
+	limitRequestBody(w, r, maxFormSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
@@ -3421,6 +4723,10 @@ func (s *Server) handleGitPushAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	if !rejectOversizedDeclaredBody(w, r, maxFormSize) {
+		return
+	}
+	limitRequestBody(w, r, maxFormSize)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	config, err := s.loadSiteConfig()
@@ -3434,18 +4740,48 @@ func (s *Server) handleGitPushAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": s.gitStatus(config.Git)})
 }
+func decodeJSONBody(r *http.Request, destination any) error {
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("request contains trailing JSON")
+		}
+		return err
+	}
+	return nil
+}
+
+func rejectOversizedDeclaredBody(w http.ResponseWriter, r *http.Request, limit int64) bool {
+	if r.ContentLength > limit {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "request body exceeds the size limit")
+		return false
+	}
+	return true
+}
+func limitRequestBody(w http.ResponseWriter, r *http.Request, limit int64) {
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+	}
+}
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
-
 func writeJSONError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": message})
 }
 
 func methodNotAllowed(w http.ResponseWriter) {
-	w.Header().Set("Allow", "GET, HEAD, POST")
+	methodNotAllowedAllow(w, "GET, HEAD, POST")
+}
+
+func methodNotAllowedAllow(w http.ResponseWriter, allow string) {
+	w.Header().Set("Allow", allow)
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }

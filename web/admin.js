@@ -214,7 +214,7 @@ $("#build-button")?.addEventListener("click", async () => {
 $("#export-button")?.addEventListener("click", async () => {
   const button = $("#export-button"); button.disabled = true;
   try {
-    const response = await fetch("/_cms/api/export", { cache: "no-store" });
+    const response = await fetch("/_cms/api/export", { method: "POST", cache: "no-store" });
     if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error || response.statusText); }
     const blob = await response.blob();
     const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "fileloom-site.zip"; link.click(); URL.revokeObjectURL(link.href);

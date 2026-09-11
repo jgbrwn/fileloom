@@ -7,7 +7,7 @@ Type=simple
 User=exedev
 Group=exedev
 WorkingDirectory=/home/exedev/playground/fileloom
-ExecStart=/home/exedev/playground/fileloom/fileloom -listen :8000 -site site -web web
+ExecStart=/home/exedev/playground/fileloom/fileloom -listen 127.0.0.1:8000 -site site -web web
 Restart=always
 RestartSec=5
 Environment=HOME=/home/exedev

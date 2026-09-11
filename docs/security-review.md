@@ -4,47 +4,59 @@ Review date: September 11, 2026
 
 ## Current protections
 
-- `/_cms` requires an exact configured `X-ExeDev-Email`; missing or mismatched requests receive 404.
-- CMS mutation requests reject cross-site `Sec-Fetch-Site`/`Origin` requests when those browser signals are present.
-- CMS and public responses receive `nosniff`, strict referrer, and restrictive permissions headers.
-- Content paths are normalized and cannot escape `site/content`.
-- Builds use a staging directory and atomic public-directory replacement, so a failed build does not erase the last good site.
-- ZIP export is limited by file count and compressed output size and excludes source, revisions, Git metadata, and symlinks.
-- Editor saves use source hashes and return a conflict instead of overwriting a changed file.
-- Revisions and theme-token writes are atomic and checksum-backed.
-- Site Git is constrained to `site/.git`; credentials remain outside Fileloom configuration.
+- `/_cms` fails closed unless the request carries exactly one configured `X-ExeDev-Email` value matching the owner; duplicate or comma-joined identity values are rejected.
+- CMS mutation requests reject cross-site `Sec-Fetch-Site`/`Origin` requests. Same-origin checks accept the configured site origin and the request's normalized origin; missing `Origin` remains supported for local/API clients.
+- CMS responses emit `Cache-Control: no-store`, `Vary: X-ExeDev-Email`, and optional CMS CSP headers. Public responses retain owner-toolbar cache separation.
+- The supplied systemd unit binds Fileloom to `127.0.0.1:8000`; the CLI `:8000` default remains for local development.
+- HTTP server read-header/read/write/idle timeouts, bounded CMS mutation admission, and request-body limits prevent unbounded request accumulation.
+- Content, theme, media, revision, Git, and generated-asset paths reject symlinked components and non-regular files. Configured theme names are validated before use.
+- Builds use a staging directory and a publication lock, so readers do not observe an incomplete directory swap. Mutations that require a build roll back source/config/media changes when the build fails. Scheduled publishing restores scheduled sources when the resulting build fails.
+- SVG uploads are XML-sanitized with an allowlist, temporary-file staging, and a restrictive SVG/media response policy. Other allowed media formats remain byte-preserving.
+- ZIP export is POST-only and bounded by file count, compressed size, uncompressed size, and per-file size; source, revisions, Git metadata, secrets, symlinks, and private metadata paths are excluded.
+- Revisions are filesystem snapshots with atomic writes, checksums, per-path retention of 100 snapshots, and a 128 MiB workspace budget.
+- CMS mutations emit structured `slog` audit events with actor, action, route, status, and result without request bodies or credentials.
+- Git is constrained to a real `site/.git` repository, uses non-interactive time-bounded commands, rejects unsafe configured URLs, and validates effective push URLs including configured `pushurl`/rewrite results before automatic pushes.
+- CSP is deliberately opt-in through `FILELOOM_CMS_CSP` and `FILELOOM_PUBLIC_CSP` so existing VvvebJs and user themes are not broken by default.
 
-## Remaining hardening plan
+## Remaining verification and hardening
 
 ### 1. Verify the proxy boundary before public release
 
-The identity header is an authorization boundary only when requests can reach Fileloom through the trusted exe.dev proxy. Confirm that the VM cannot be reached through an alternate public port/path and that the proxy overwrites or strips client-supplied identity headers. If the deployment supports it, bind Fileloom to loopback and let the proxy/reverse proxy be the only network listener.
+The identity header is an authorization boundary only when requests can reach Fileloom through the trusted exe.dev proxy. The repository and service now make the conservative deployment choice by binding the supplied unit to loopback, but the actual public proxy behavior still needs verification. Confirm that:
 
-### 2. Harden uploads
+- the proxy strips all client-supplied `X-ExeDev-Email` values and injects exactly one canonical value;
+- the proxy does not append a second value;
+- `/_cms/*` is not cached by an intermediary; and
+- no alternate public port or path reaches the Go process directly.
 
-SVG is currently accepted as media. Before accepting untrusted uploads, either remove SVG from the default allowlist or sanitize it and serve it with a restrictive content policy. Add MIME sniffing and image dimension/file-type limits if public uploads are enabled.
+Run forged-header and direct-listener checks after deployment from an external client. Local handler tests cannot prove the proxy boundary.
 
-### 3. Harden Git operations
+### 2. Complete upload validation if uploads become internet-facing
 
-Keep auto-push disabled by default. Consider rejecting `file://` remotes for unattended deployments, running Git with a sanitized environment, and documenting that site Git hooks and repository configuration are user-controlled code.
+SVG sanitization is implemented. Non-SVG media still uses the existing extension allowlist and size limit without full content-signature or image-dimension validation. Add format sniffing and dimension/pixel budgets only if public uploads need that stronger boundary; keep the current owner-only CMS access otherwise.
 
-### 4. Add operational limits
+### 3. Keep Git automation conservative
 
-Add request concurrency limits, scheduler/build timeouts, structured audit logs for mutations, and retention limits for revision snapshots. These are useful on a shared or internet-exposed VM but should be introduced without changing the filesystem source model.
+Automatic push remains opt-in. Effective fetch and push URLs are validated, but site Git configuration and hooks remain owner-controlled code. Keep credentials outside Fileloom configuration, keep prompts disabled, and review hooks before enabling unattended commits or pushes.
 
-### 5. Add a deliberate CSP profile
+### 4. Operational follow-up
 
-The CMS editor needs inline scripts, iframe communication, and vendored assets, while user themes may need their own resources. Define separate, opt-in CSP policies for the CMS and generated public site rather than applying a restrictive global policy that breaks VvvebJs or existing themes.
+Build and Git operations are bounded where they invoke external Git commands and HTTP requests have server timeouts. A future pass can add explicit context cancellation through filesystem builds and move optional Git synchronization fully outside mutation/build locks; these changes should be tested carefully because Git automation is existing functionality.
 
-### 6. Test the deployment, not only the handler
+### 5. CSP compatibility testing
 
-Before making the repository public, test:
+CSP profiles are opt-in. Test the CMS/editor profile with VvvebJs, media upload, editor frames, and mobile controls. Test the public profile against each supported theme and document any external resources that require a custom policy. Do not enable a restrictive global CSP by default.
 
-- unauthenticated, wrong-account, and correct-account proxy requests;
-- forged identity headers sent through the public URL;
+### 6. Deployment test matrix
+
+Before making the repository/site public, test:
+
+- unauthenticated, wrong-account, correct-account, duplicate-header, and forged-header proxy requests;
 - direct listener access and alternate exe.dev ports;
-- CSRF requests from another origin;
-- malicious paths, symlinks, uploads, theme CSS values, Git remotes, and ZIP contents; and
-- restart/catch-up behavior for scheduled publishing.
+- missing, same-origin, malformed, and cross-origin mutation requests;
+- malicious paths, symlinked roots/components, FIFOs/special files, SVGs, oversized uploads, and nested private metadata;
+- theme names, CSS token values, Git remotes, `pushurl`, hooks, and timeout behavior;
+- export archive contents and size limits; and
+- scheduled publishing after restart, including build failure and retry behavior.
 
-The conservative release rule is to keep the CMS behind the proxy, keep automatic push off, and treat site HTML/theme code as trusted owner code until a sandboxed rendering model exists.
+The conservative release rule remains: keep CMS access behind the trusted proxy, keep automatic push off until verified, and treat site HTML/theme code as trusted owner code until a sandboxed rendering model exists.

@@ -4,6 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -160,6 +163,30 @@ func TestSourceAwareSaveRevisionAndRestore(t *testing.T) {
 	}
 }
 
+func TestStatusMetadataPreservesFrontMatterNewKeys(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if _, err := server.patchDocumentSource("pages/about.html", "", false, map[string]string{"status": "scheduled", "publish_at": "2026-09-12T12:00:00Z"}, "", "schedule test"); err != nil {
+		t.Fatalf("patch status: %v", err)
+	}
+	doc, err := server.loadDocument("pages/about.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Status != "scheduled" || doc.PublishAt != "2026-09-12T12:00:00Z" {
+		t.Fatalf("metadata = status %q publish_at %q", doc.Status, doc.PublishAt)
+	}
+	source, err := os.ReadFile(filepath.Join(server.SiteDir, "content", "pages", "about.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(source), "status: scheduled\n") || !strings.Contains(string(source), "\npublish_at: 2026-09-12T12:00:00Z\n") {
+		t.Fatalf("front matter keys were not separated: %s", source)
+	}
+}
+
 func TestScheduledPublishingAndPublicOwnerToolbar(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")
@@ -227,7 +254,7 @@ func TestThemeTokensAndExport(t *testing.T) {
 	if !strings.Contains(string(css), "--accent: #123456") {
 		t.Fatalf("token was not patched: %s", css)
 	}
-	exportReq := httptest.NewRequest(http.MethodGet, "/_cms/api/export", nil)
+	exportReq := httptest.NewRequest(http.MethodPost, "/_cms/api/export", nil)
 	exportReq.Header.Set("X-ExeDev-Email", "owner@example.com")
 	exportRes := httptest.NewRecorder()
 	server.Handler().ServeHTTP(exportRes, exportReq)
@@ -318,6 +345,234 @@ func TestGitIntegrationDoesNotWalkParentRepo(t *testing.T) {
 	}
 	if !strings.Contains(status.Error, "site/.git") {
 		t.Fatalf("unexpected Git status error: %q", status.Error)
+	}
+}
+
+func TestCMSRejectsMultipleIdentityHeaderValues(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/_cms/api/site", nil)
+	req.Header.Add("X-ExeDev-Email", "owner@example.com")
+	req.Header.Add("X-ExeDev-Email", "attacker@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("multiple identity headers status = %d, want 404", res.Code)
+	}
+}
+
+func TestCMSOriginChecksAndCacheHeaders(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	request := func(origin string) *httptest.ResponseRecorder {
+		form := "file=pages%2Fabout.html&html=%3Cbody%3E%3Cp%3EOrigin%3C%2Fp%3E%3C%2Fbody%3E"
+		req := httptest.NewRequest(http.MethodPost, "http://example.test/_cms/api/editor-save", strings.NewReader(form))
+		req.Host = "example.test"
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-ExeDev-Email", "owner@example.com")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		res := httptest.NewRecorder()
+		server.Handler().ServeHTTP(res, req)
+		return res
+	}
+	if res := request("https://evil.example"); res.Code != http.StatusNotFound {
+		t.Fatalf("cross-origin mutation status = %d, want 404", res.Code)
+	}
+	if res := request("http://example.test"); res.Code != http.StatusOK {
+		t.Fatalf("same-origin mutation status = %d, want 200", res.Code)
+	}
+	get := httptest.NewRequest(http.MethodGet, "/_cms/api/site", nil)
+	get.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, get)
+	if res.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("CMS cache control = %q, want no-store", res.Header().Get("Cache-Control"))
+	}
+}
+
+func TestSanitizeSVGUpload(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "unsafe.svg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(part, `<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)" viewBox="0 0 10 10"><script>alert(1)</script><foreignObject><body>bad</body></foreignObject><path d="M0 0h10v10z" fill="url(#paint)" href="https://evil.example/x"/><defs><linearGradient id="paint"><stop offset="0" stop-color="#fff"/></linearGradient></defs></svg>`)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/media", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusCreated {
+		t.Fatalf("SVG upload status = %d: %s", res.Code, res.Body)
+	}
+	data, err := os.ReadFile(filepath.Join(server.SiteDir, "media", "unsafe.svg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := string(data)
+	for _, forbidden := range []string{"script", "foreignObject", "onload", "javascript:", "https://evil.example"} {
+		if strings.Contains(strings.ToLower(output), strings.ToLower(forbidden)) {
+			t.Fatalf("sanitized SVG still contains %q: %s", forbidden, output)
+		}
+	}
+	if !strings.Contains(output, "<path") || !strings.Contains(output, "viewBox") {
+		t.Fatalf("sanitized SVG lost safe content: %s", output)
+	}
+}
+
+func TestSVGSanitizerRejectsDirectives(t *testing.T) {
+	if _, err := sanitizeSVG([]byte(`<!DOCTYPE svg><svg></svg>`)); err == nil {
+		t.Fatal("DOCTYPE SVG was accepted")
+	}
+	if _, err := sanitizeSVG([]byte(`<svg><path d="M0 0"/></svg>`)); err != nil {
+		t.Fatalf("safe SVG rejected: %v", err)
+	}
+	bom := append([]byte{0xef, 0xbb, 0xbf}, []byte(`<svg><use href="#icon"/></svg>`)...)
+	sanitized, err := sanitizeSVG(bom)
+	if err != nil || !strings.Contains(string(sanitized), "<use") {
+		t.Fatalf("BOM/use SVG was not preserved: %v %s", err, sanitized)
+	}
+	unicodeSVG := `<svg><path fill="éurl(https://evil.example/x)"/></svg>`
+	if _, err := sanitizeSVG([]byte(unicodeSVG)); err != nil {
+		t.Fatalf("unicode SVG unexpectedly rejected: %v", err)
+	}
+}
+
+func TestSymlinkedContentFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	siteDir := filepath.Join(root, "site")
+	server, err := New(siteDir, filepath.Join(root, "web"), "")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	outside := filepath.Join(root, "secret.html")
+	if err := os.WriteFile(outside, []byte("<p>secret</p>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(siteDir, "content", "pages", "leak.html")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := server.Build(); err == nil {
+		t.Fatal("build accepted a symlinked content file")
+	}
+}
+
+func TestRevisionRetention(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	for i := 0; i < maxRevisionsPerPath+5; i++ {
+		if err := server.recordWorkspaceRevision("pages/about.html", []byte(fmt.Sprintf("revision-%d", i)), "retention test"); err != nil {
+			t.Fatalf("record revision %d: %v", i, err)
+		}
+	}
+	revisions, err := server.listRevisions("pages/about.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(revisions) > maxRevisionsPerPath {
+		t.Fatalf("revision count = %d, want <= %d", len(revisions), maxRevisionsPerPath)
+	}
+}
+
+func TestScheduledPublishingRestoresSourceWhenBuildFails(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	doc := Document{Path: "pages/retry.html", Type: "page", Title: "Retry", Slug: "retry", Date: "2026-09-11", Status: "scheduled", PublishAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), HTML: "<p>Retry</p>"}
+	if err := server.writeDocument(doc); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(server.SiteDir, "themes", "default", "assets", "unsafe-link.css")
+	outside := filepath.Join(t.TempDir(), "outside.css")
+	if err := os.WriteFile(outside, []byte("body{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, target); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	server.publishDue()
+	updated, err := server.loadDocument(doc.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != "scheduled" {
+		t.Fatalf("scheduled document status = %q after failed build, want scheduled", updated.Status)
+	}
+}
+
+func TestGitRemoteHardening(t *testing.T) {
+	if err := validateRemoteURL("git@github.com:owner/repo.git"); err != nil {
+		t.Fatalf("SCP remote rejected: %v", err)
+	}
+	for _, value := range []string{"https://user:secret@example.com/repo.git", "https://example.com/repo.git?token=secret", "file:///tmp/repo"} {
+		if err := validateRemoteURLForAutomation(value, true); err == nil {
+			t.Fatalf("unsafe unattended remote accepted: %s", value)
+		}
+	}
+	if err := validateRemoteURL("file:///tmp/repo"); err != nil {
+		t.Fatalf("manual file remote rejected: %v", err)
+	}
+}
+func TestOptionalCSPProfiles(t *testing.T) {
+	t.Setenv("FILELOOM_CMS_CSP", "default")
+	t.Setenv("FILELOOM_PUBLIC_CSP", "default")
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	cms := httptest.NewRequest(http.MethodGet, "/_cms/api/site", nil)
+	cms.Header.Set("X-ExeDev-Email", "owner@example.com")
+	cmsRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(cmsRes, cms)
+	if cmsRes.Header().Get("Content-Security-Policy") != defaultCMSCSP {
+		t.Fatalf("CMS CSP was not applied")
+	}
+	public := httptest.NewRequest(http.MethodGet, "/", nil)
+	publicRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(publicRes, public)
+	if publicRes.Header().Get("Content-Security-Policy") != defaultPublicCSP {
+		t.Fatalf("public CSP was not applied")
+	}
+}
+
+func TestGitPushURLIsValidated(t *testing.T) {
+	root := t.TempDir()
+	server, err := New(filepath.Join(root, "site"), filepath.Join(root, "web"), "")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if _, err := runGit(server.SiteDir, "init", "-q"); err != nil {
+		t.Fatalf("init site repo: %v", err)
+	}
+	if _, err := runGit(server.SiteDir, "remote", "add", "origin", "https://github.com/example/site.git"); err != nil {
+		t.Fatalf("add remote: %v", err)
+	}
+	if _, err := runGit(server.SiteDir, "config", "remote.origin.pushurl", "file:///tmp/local-site.git"); err != nil {
+		t.Fatalf("set push URL: %v", err)
+	}
+	if err := server.gitPush(GitConfig{Remote: "origin", Branch: "main", AutoPush: true}); err == nil {
+		t.Fatal("unsafe effective push URL was accepted")
+	}
+	if err := validateRemoteURL("ssh://git@github.com/example/site.git"); err != nil {
+		t.Fatalf("SSH remote with username rejected: %v", err)
 	}
 }
 func TestPathValidation(t *testing.T) {

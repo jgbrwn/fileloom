@@ -24,18 +24,21 @@ Fileloom is designed for a small exe.dev VM deployment, but the Go server can ru
 ```bash
 cp .env.example .env
 # Edit .env and set FILELOOM_OWNER_EMAIL for your exe.dev account.
+set -a
+. ./.env
+set +a
 make test
 make build
 ./fileloom -listen :8000 -site site -web web
 ```
 
-The public site is available at `http://localhost:8000/`. CMS routes require an exact `X-ExeDev-Email` match, so local API testing can use a request such as:
+The public site is available at `http://localhost:8000/`. CMS routes require one canonical `X-ExeDev-Email` value matching the configured owner, so local API testing can use a request such as:
 
 ```bash
 curl -H 'X-ExeDev-Email: you@example.com' http://localhost:8000/_cms/api/site
 ```
 
-For a browser-facing deployment, put Fileloom behind the exe.dev proxy or another trusted identity-aware proxy. Do not expose a second direct route to the Go process that bypasses the proxy/header boundary.
+For a browser-facing deployment, put Fileloom behind the exe.dev proxy or another trusted identity-aware proxy. The supplied `fileloom.service` binds Fileloom to `127.0.0.1:8000`; keep the Go listener loopback-only when the proxy is the authorization boundary. The CLI's `:8000` default remains convenient for local development, not public exposure. Do not expose a second direct route to the Go process, and configure the proxy to strip all client-supplied `X-ExeDev-Email` values before injecting exactly one authenticated value.
 
 ## Deploy on an exe.dev VM
 
@@ -111,11 +114,12 @@ publish_at: 2026-09-15T14:00:00Z
 
 The VvvebJs editor sends the edited body HTML to Fileloom. Fileloom patches only the body range of the source file instead of serializing the entire document. A SHA-256 precondition prevents an older editor tab from overwriting newer source changes.
 
-Before accepted content or theme-token changes, Fileloom stores a snapshot under `site/.fileloom/revisions/`. The dashboard’s **History** action lists snapshots and restores them by creating another safety snapshot first. These filesystem revisions are independent of optional site Git commits; Git remains a separate user-controlled history mechanism.
+Before accepted content or theme-token changes, Fileloom stores a snapshot under `site/.fileloom/revisions/`. The dashboard's **History** action lists snapshots and restores them by creating another safety snapshot first. Revisions are bounded to 100 snapshots per path and 128 MiB across the workspace; the newest snapshots are retained. These filesystem revisions are independent of optional site Git commits; Git remains a separate user-controlled history mechanism.
 
-## Build checks and export
+Uploads retain the existing 16 MiB request limit and filename allowlist. SVG uploads are sanitized through an XML allowlist: scripts, event handlers, foreign content, external references, directives, and unsafe attributes are removed or rejected. Other media formats are copied unchanged. Uploads are written to a temporary file and renamed only after the copy and SVG sanitization succeed.
 
-Each build stages output in a temporary directory, runs checks, and atomically swaps it into `site/public` only after generation succeeds. Checks report:
+
+Each build stages output in a temporary directory, runs checks, and atomically swaps it into `site/public` only after generation succeeds. Builds reject symlinked content, themes, media, and generated assets; private metadata paths such as nested `.git`, `.fileloom`, and `.env` entries are not copied into generated output. Checks report:
 
 - missing `html lang` attributes;
 - empty/missing document titles;
@@ -123,7 +127,7 @@ Each build stages output in a temporary directory, runs checks, and atomically s
 - likely unlabeled form controls; and
 - missing internal links or media targets.
 
-External URLs are not fetched. Use **Export ZIP** in the dashboard to download a bounded archive of generated `site/public` files only; source, Git metadata, revisions, and secrets are excluded.
+External URLs are not fetched. Use **Export ZIP** in the dashboard to download a bounded archive of generated `site/public` files only; source, Git metadata, revisions, and secrets are excluded. The export mutation endpoint is POST-only and enforces file-count, compressed-size, uncompressed-size, and per-file limits.
 
 ## Git workflow
 
@@ -142,9 +146,12 @@ Git automation is opt-in in `site/site.json`:
 }
 ```
 
-Remote credentials are never stored by Fileloom. Use SSH keys or a Git credential helper. Keep `auto_push` off until the remote and credentials are verified.
+Remote credentials are never stored by Fileloom. Use SSH keys or a Git credential helper. Keep `auto_push` off until the remote and credentials are verified. Automatic pushes accept only HTTPS/SSH effective push URLs; fetch URLs, configured `pushurl` values, and Git rewrite results are validated before unattended pushes. Git commands have bounded timeouts and non-interactive prompts.
 
-## Themes
+## Optional CSP profiles
+
+No CSP is enabled by default, preserving existing editor and theme behavior. To opt in, set `FILELOOM_CMS_CSP=default` for the CMS/editor profile and/or `FILELOOM_PUBLIC_CSP=default` for the generated-site profile. You can provide a complete policy value instead of `default`; public themes may require a customized policy for external assets or scripts. Direct SVG responses always receive a restrictive media policy.
+
 
 Themes are plain folders containing `theme.json`, HTML templates, and `assets/style.css`. The dashboard can activate themes, edit layout HTML visually, and edit CSS custom properties through the **Style tokens** editor. The built-in themes are intentionally inspectable and dependency-light.
 
