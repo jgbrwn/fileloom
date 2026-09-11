@@ -1,13 +1,18 @@
 package srv
 
 import (
+	"archive/zip"
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFileloomBuildsFilesystemSite(t *testing.T) {
@@ -109,6 +114,141 @@ func TestCMSRequiresConfiguredExeDevEmail(t *testing.T) {
 	unconfigured.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusNotFound {
 		t.Fatalf("unconfigured CMS status = %d, want 404", res.Code)
+	}
+}
+func TestSourceAwareSaveRevisionAndRestore(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	source := "---\n# preserve this comment\ntitle: About\nslug: about\ndate: 2026-09-11\nstatus: published\ncustom: keep-me\n---\n\n<section>Old body</section>\n"
+	filePath := filepath.Join(siteDir, "content", "pages", "about.html")
+	if err := os.WriteFile(filePath, []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseSHA := sourceSHA256([]byte(source))
+	form := url.Values{"file": {"pages/about.html"}, "base_sha256": {baseSHA}, "html": {"<!doctype html><html><body><section>New body</section></body></html>"}}
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("save status = %d: %s", res.Code, res.Body)
+	}
+	updated, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updated), "# preserve this comment") || !strings.Contains(string(updated), "custom: keep-me") || !strings.Contains(string(updated), "<section>New body</section>") {
+		t.Fatalf("source-aware save did not preserve source: %s", updated)
+	}
+	revisions, err := server.listRevisions("pages/about.html")
+	if err != nil || len(revisions) != 1 {
+		t.Fatalf("revisions = %d, err=%v", len(revisions), err)
+	}
+	if _, err := server.restoreRevision("pages/about.html", revisions[0].ID); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	restored, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != source {
+		t.Fatalf("restore did not recover original source:\n%s", restored)
+	}
+}
+
+func TestScheduledPublishingAndPublicOwnerToolbar(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	doc := Document{Path: "pages/scheduled.html", Type: "page", Title: "Scheduled", Slug: "scheduled", Date: "2026-09-11", Status: "scheduled", PublishAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), HTML: "<p>Scheduled body</p>"}
+	if err := server.writeDocument(doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Build(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(siteDir, "public", "scheduled", "index.html")); err != nil {
+		t.Fatalf("due scheduled page not built: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/about/", nil)
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if strings.Contains(res.Body.String(), "Edit this page") {
+		t.Fatalf("owner toolbar leaked to unauthenticated visitor")
+	}
+	ownerReq := httptest.NewRequest(http.MethodGet, "/about/", nil)
+	ownerReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	ownerRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(ownerRes, ownerReq)
+	if !strings.Contains(ownerRes.Body.String(), "Edit this page") {
+		t.Fatalf("owner toolbar missing")
+	}
+	if strings.Contains(res.Body.String(), "Edit this page") {
+		t.Fatalf("owner toolbar leaked to unauthenticated visitor")
+	}
+}
+
+func TestThemeTokensAndExport(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	getReq := httptest.NewRequest(http.MethodGet, "/_cms/api/theme-tokens?theme=default", nil)
+	getReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	getRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(getRes, getReq)
+	if getRes.Code != http.StatusOK || !strings.Contains(getRes.Body.String(), "--accent") {
+		t.Fatalf("theme tokens response = %d: %s", getRes.Code, getRes.Body)
+	}
+	var tokenData struct {
+		SHA256 string `json:"sha256"`
+	}
+	if err := json.Unmarshal(getRes.Body.Bytes(), &tokenData); err != nil {
+		t.Fatal(err)
+	}
+	payload := map[string]any{"theme": "default", "sha256": tokenData.SHA256, "tokens": map[string]string{"--accent": "#123456"}}
+	body, _ := json.Marshal(payload)
+	postReq := httptest.NewRequest(http.MethodPost, "/_cms/api/theme-tokens?theme=default", bytes.NewReader(body))
+	postReq.Header.Set("Content-Type", "application/json")
+	postReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	postRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(postRes, postReq)
+	if postRes.Code != http.StatusOK {
+		t.Fatalf("theme token save = %d: %s", postRes.Code, postRes.Body)
+	}
+	css, _ := os.ReadFile(filepath.Join(siteDir, "themes", "default", "assets", "style.css"))
+	if !strings.Contains(string(css), "--accent: #123456") {
+		t.Fatalf("token was not patched: %s", css)
+	}
+	exportReq := httptest.NewRequest(http.MethodGet, "/_cms/api/export", nil)
+	exportReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	exportRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(exportRes, exportReq)
+	if exportRes.Code != http.StatusOK || exportRes.Header().Get("Content-Type") != "application/zip" {
+		t.Fatalf("export = %d %s", exportRes.Code, exportRes.Body)
+	}
+	archive, err := zip.NewReader(bytes.NewReader(exportRes.Body.Bytes()), int64(exportRes.Body.Len()))
+	if err != nil {
+		t.Fatalf("read export zip: %v", err)
+	}
+	foundIndex := false
+	for _, file := range archive.File {
+		if file.Name == "index.html" {
+			foundIndex = true
+		}
+		if strings.Contains(file.Name, ".fileloom") || strings.HasPrefix(file.Name, ".git") {
+			t.Fatalf("private file included in export: %s", file.Name)
+		}
+	}
+	if !foundIndex {
+		t.Fatal("export did not contain index.html")
 	}
 }
 func TestBaseURLOverrideAndGeneratedArchives(t *testing.T) {

@@ -16,7 +16,8 @@
           <div class="form-field full"><label for="title">Title</label><input id="title" name="title" required autofocus placeholder="A title worth clicking"></div>
           <div class="form-field"><label for="slug">Slug</label><input id="slug" name="slug" placeholder="generated-from-title"></div>
           <div class="form-field"><label for="date">Date</label><input id="date" name="date" type="date"></div>
-          <div class="form-field"><label for="status">Status</label><select id="status" name="status"><option value="draft">Draft</option><option value="published">Published</option></select></div>
+          <div class="form-field"><label for="status">Status</label><select id="status" name="status"><option value="draft">Draft</option><option value="published">Published</option><option value="scheduled">Scheduled</option></select></div>
+          <div class="form-field" id="publish-at-field" hidden><label for="publish_at">Publish at</label><input id="publish_at" name="publish_at" type="datetime-local"><small class="field-help">Uses this server's local time and stores UTC.</small></div>
           <div class="form-field"><label for="tags">Tags</label><input id="tags" name="tags" placeholder="design, notes"></div>
           <div class="form-field"><label for="category">Category</label><input id="category" name="category" placeholder="Notes"></div>
           <div class="form-field full"><label for="excerpt">Excerpt</label><input id="excerpt" name="excerpt" placeholder="A short description for cards and feeds"></div>
@@ -38,7 +39,10 @@
     date.value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
     if (type === "page") { title.textContent = "Make a new page."; kicker.textContent = "New page"; }
     else { title.textContent = "Make a new post."; kicker.textContent = "New post"; }
-    const slug = document.querySelector("#slug");
+    const status = document.querySelector("#status");
+    const publishAtField = document.querySelector("#publish-at-field");
+    status.addEventListener("change", () => { publishAtField.hidden = status.value !== "scheduled"; });
+
     document.querySelector("#title").addEventListener("input", (event) => { if (!slug.dataset.touched) slug.value = event.target.value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); });
     slug.addEventListener("input", () => { slug.dataset.touched = "1"; });
     function escapeHTML(value) { return String(value ?? "").replace(/[&<>\"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c])); }
@@ -48,6 +52,7 @@
       button.disabled = true;
       const payload = Object.fromEntries(new FormData(event.target));
       payload.type = type;
+      if (payload.status === "scheduled" && payload.publish_at) payload.publish_at = new Date(payload.publish_at).toISOString();
       try {
         const response = await fetch("/_cms/api/items", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
         const data = await response.json();

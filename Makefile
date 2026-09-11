@@ -1,4 +1,4 @@
-.PHONY: build clean test run
+.PHONY: build clean test run fmt
 
 build:
 	go build -o fileloom ./cmd/fileloom
@@ -6,8 +6,8 @@ build:
 run:
 	go run ./cmd/fileloom
 
-clean:
-	rm -f fileloom
+fmt:
+	gofmt -w ./cmd ./srv
 
 test:
 	go test ./...

@@ -1,7 +1,10 @@
 package srv
 
 import (
+	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,13 +17,17 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+
+	htmlnode "golang.org/x/net/html"
 )
 
 const (
@@ -36,7 +43,9 @@ type Server struct {
 	BaseURLOverride string
 
 	mu        sync.RWMutex
+	writeMu   sync.Mutex
 	lastBuild BuildResult
+	scheduler sync.Once
 }
 
 type SiteConfig struct {
@@ -56,6 +65,11 @@ type GitConfig struct {
 	Remote     string `json:"remote"`
 	RemoteURL  string `json:"remote_url,omitempty"`
 	Branch     string `json:"branch"`
+}
+
+type ThemeToken struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 type ThemeInfo struct {
@@ -81,23 +95,50 @@ type GitStatus struct {
 }
 
 type Document struct {
-	Path     string   `json:"path"`
-	Type     string   `json:"type"`
-	Title    string   `json:"title"`
-	Slug     string   `json:"slug"`
-	Date     string   `json:"date"`
-	Status   string   `json:"status"`
-	Tags     []string `json:"tags"`
-	Excerpt  string   `json:"excerpt"`
-	Category string   `json:"category,omitempty"`
-	HTML     string   `json:"html,omitempty"`
-	URL      string   `json:"url"`
+	Path      string   `json:"path"`
+	Type      string   `json:"type"`
+	Title     string   `json:"title"`
+	Slug      string   `json:"slug"`
+	Date      string   `json:"date"`
+	Status    string   `json:"status"`
+	Tags      []string `json:"tags"`
+	Excerpt   string   `json:"excerpt"`
+	Category  string   `json:"category,omitempty"`
+	PublishAt string   `json:"publish_at,omitempty"`
+	HTML      string   `json:"html,omitempty"`
+	URL       string   `json:"url"`
 }
 
 type BuildResult struct {
-	GeneratedAt string `json:"generated_at"`
-	Files       int    `json:"files"`
-	Published   int    `json:"published"`
+	GeneratedAt string       `json:"generated_at"`
+	Files       int          `json:"files"`
+	Published   int          `json:"published"`
+	Checks      []CheckIssue `json:"checks,omitempty"`
+}
+
+type CheckIssue struct {
+	Severity string `json:"severity"`
+	Code     string `json:"code"`
+	Path     string `json:"path"`
+	Message  string `json:"message"`
+	Line     int    `json:"line,omitempty"`
+}
+
+type Revision struct {
+	ID        string `json:"id"`
+	Path      string `json:"path"`
+	CreatedAt string `json:"created_at"`
+	Reason    string `json:"reason"`
+	SHA256    string `json:"sha256"`
+	Size      int64  `json:"size"`
+}
+
+type sourceDocument struct {
+	Document
+	Source       []byte
+	BodyStart    int
+	FrontMatter  bool
+	MetaValuePos map[string][2]int
 }
 
 type documentMeta struct {
@@ -140,7 +181,7 @@ const defaultLayoutTemplate = `<!doctype html>
     </div>
   </header>
   <main class="shell">{{content}}</main>
-  <footer class="site-footer"><div class="shell">{{site.footer}}</div></footer>
+  <footer class="site-footer"><div class="shell">{{site.footer}} <span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a> and <a href="https://github.com/givanz/VvvebJs" rel="noreferrer">VvvebJs</a>.</span></div></footer>
 </body>
 </html>
 `
@@ -280,7 +321,7 @@ func (s *Server) ensureSite() error {
 		}
 	}
 
-	if err := writeIfMissing(filepath.Join(s.SiteDir, ".gitignore"), []byte("/public/\n*.tmp\n")); err != nil {
+	if err := writeIfMissing(filepath.Join(s.SiteDir, ".gitignore"), []byte("/public/\n/.fileloom/\n*.tmp\n")); err != nil {
 		return err
 	}
 	if err := writeIfMissing(filepath.Join(s.SiteDir, "site.json"), []byte(defaultSiteJSON)); err != nil {
@@ -443,18 +484,27 @@ func (s *Server) listDocuments() ([]Document, error) {
 }
 
 func parseDocument(rel string, data []byte, modified time.Time) (Document, error) {
-	meta, body := parseFrontMatter(string(data))
+	source, err := parseSourceDocument(rel, data, modified)
+	if err != nil {
+		return Document{}, err
+	}
+	return source.Document, nil
+}
+
+func parseSourceDocument(rel string, data []byte, modified time.Time) (sourceDocument, error) {
+	meta, body, bodyStart, positions, hasFrontMatter := parseFrontMatterSource(string(data))
 	doc := Document{
-		Path:     filepath.ToSlash(rel),
-		Type:     documentType(rel),
-		Title:    strings.TrimSpace(meta["title"]),
-		Slug:     strings.TrimSpace(meta["slug"]),
-		Date:     strings.TrimSpace(meta["date"]),
-		Status:   strings.ToLower(strings.TrimSpace(meta["status"])),
-		Tags:     parseTags(meta["tags"]),
-		Category: strings.TrimSpace(meta["category"]),
-		Excerpt:  strings.TrimSpace(meta["excerpt"]),
-		HTML:     strings.TrimSpace(body),
+		Path:      filepath.ToSlash(rel),
+		Type:      documentType(rel),
+		Title:     strings.TrimSpace(meta["title"]),
+		Slug:      strings.TrimSpace(meta["slug"]),
+		Date:      strings.TrimSpace(meta["date"]),
+		Status:    strings.ToLower(strings.TrimSpace(meta["status"])),
+		Tags:      parseTags(meta["tags"]),
+		Category:  strings.TrimSpace(meta["category"]),
+		PublishAt: strings.TrimSpace(meta["publish_at"]),
+		Excerpt:   strings.TrimSpace(meta["excerpt"]),
+		HTML:      strings.TrimSpace(body),
 	}
 	if doc.Title == "" {
 		doc.Title = friendlyTitle(strings.TrimSuffix(filepath.Base(rel), filepath.Ext(rel)))
@@ -472,32 +522,56 @@ func parseDocument(rel string, data []byte, modified time.Time) (Document, error
 		doc.Excerpt = excerptFromHTML(doc.HTML)
 	}
 	doc.URL = documentURL(doc)
-	return doc, nil
+	return sourceDocument{Document: doc, Source: append([]byte(nil), data...), BodyStart: bodyStart, FrontMatter: hasFrontMatter, MetaValuePos: positions}, nil
 }
 
 func parseFrontMatter(source string) (map[string]string, string) {
+	meta, body, _, _, _ := parseFrontMatterSource(source)
+	return meta, body
+}
+
+func parseFrontMatterSource(source string) (map[string]string, string, int, map[string][2]int, bool) {
 	meta := map[string]string{}
+	positions := map[string][2]int{}
 	if !strings.HasPrefix(source, "---\n") {
-		return meta, source
+		return meta, source, 0, positions, false
 	}
-	end := strings.Index(source[4:], "\n---")
-	if end < 0 {
-		return meta, source
+	closingOffset := strings.Index(source[4:], "\n---")
+	if closingOffset < 0 {
+		return meta, source, 0, positions, false
 	}
-	end += 4
-	front := source[4:end]
-	bodyStart := end + len("\n---")
+	closingOffset += 4
+	bodyStart := closingOffset + len("\n---")
 	if bodyStart < len(source) && source[bodyStart] == '\n' {
 		bodyStart++
 	}
-	for _, line := range strings.Split(front, "\n") {
-		key, value, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
+	for lineStart := 4; lineStart < closingOffset; {
+		lineEnd := strings.IndexByte(source[lineStart:closingOffset], '\n')
+		if lineEnd < 0 {
+			lineEnd = closingOffset
+		} else {
+			lineEnd += lineStart
 		}
-		meta[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+		line := source[lineStart:lineEnd]
+		if key, value, ok := strings.Cut(line, ":"); ok {
+			key = strings.ToLower(strings.TrimSpace(key))
+			trimmed := strings.TrimSpace(value)
+			meta[key] = trimmed
+			if trimmed != "" {
+				leading := len(value) - len(strings.TrimLeft(value, " \t"))
+				valueStart := lineStart + strings.IndexByte(line, ':') + 1 + leading
+				positions[key] = [2]int{valueStart, valueStart + len(trimmed)}
+			} else {
+				valueStart := lineStart + strings.IndexByte(line, ':') + 1
+				positions[key] = [2]int{valueStart, valueStart}
+			}
+		}
+		if lineEnd >= closingOffset {
+			break
+		}
+		lineStart = lineEnd + 1
 	}
-	return meta, source[bodyStart:]
+	return meta, source[bodyStart:], bodyStart, positions, true
 }
 
 func parseTags(value string) []string {
@@ -546,24 +620,8 @@ func (s *Server) writeDocument(doc Document) error {
 		return fmt.Errorf("create content directory: %w", err)
 	}
 	contents := serializeDocument(doc)
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".fileloom-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create content temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.WriteString(contents); err != nil {
-		_ = tmp.Close()
+	if err := writeAtomicFile(path, []byte(contents)); err != nil {
 		return fmt.Errorf("write content: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close content: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("replace content: %w", err)
 	}
 	return nil
 }
@@ -575,6 +633,9 @@ func serializeDocument(doc Document) string {
 	fmt.Fprintf(&b, "slug: %s\n", strings.TrimSpace(doc.Slug))
 	fmt.Fprintf(&b, "date: %s\n", strings.TrimSpace(doc.Date))
 	fmt.Fprintf(&b, "status: %s\n", strings.TrimSpace(doc.Status))
+	if strings.TrimSpace(doc.PublishAt) != "" {
+		fmt.Fprintf(&b, "publish_at: %s\n", strings.TrimSpace(doc.PublishAt))
+	}
 	if len(doc.Tags) > 0 {
 		fmt.Fprintf(&b, "tags: [%s]\n", strings.Join(doc.Tags, ", "))
 	}
@@ -696,6 +757,281 @@ func (s *Server) loadDocument(value string) (Document, error) {
 	return parseDocument(rel, data, info.ModTime())
 }
 
+func (s *Server) loadSourceDocument(value string) (sourceDocument, error) {
+	rel, err := normalizeContentPath(value)
+	if err != nil {
+		return sourceDocument{}, err
+	}
+	path := filepath.Join(s.SiteDir, "content", filepath.FromSlash(rel))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return sourceDocument{}, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return sourceDocument{}, err
+	}
+	return parseSourceDocument(rel, data, info.ModTime())
+}
+
+func sourceSHA256(source []byte) string {
+	digest := sha256.Sum256(source)
+	return hex.EncodeToString(digest[:])
+}
+
+func fileSHA256(filePath string) string {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return ""
+	}
+	return sourceSHA256(data)
+}
+
+type sourceConflictError struct {
+	Path string
+}
+
+func (e *sourceConflictError) Error() string {
+	return fmt.Sprintf("%s changed since it was opened; reload before saving", e.Path)
+}
+
+func writeAtomicFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".fileloom-write-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func patchSourceBody(source []byte, bodyStart int, body string) []byte {
+	if bodyStart < 0 || bodyStart > len(source) {
+		return append([]byte(nil), source...)
+	}
+	body = strings.TrimSpace(body)
+	if body != "" {
+		body += "\n"
+	}
+	patched := make([]byte, 0, bodyStart+len(body))
+	patched = append(patched, source[:bodyStart]...)
+	patched = append(patched, body...)
+	return patched
+}
+
+func patchFrontMatter(source []byte, updates map[string]string) []byte {
+	text := string(source)
+	_, _, _, positions, hasFrontMatter := parseFrontMatterSource(text)
+	if !hasFrontMatter {
+		keys := make([]string, 0, len(updates))
+		for key := range updates {
+			keys = append(keys, strings.ToLower(strings.TrimSpace(key)))
+		}
+		sort.Strings(keys)
+		var front strings.Builder
+		front.WriteString("---\n")
+		for _, key := range keys {
+			value := strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(updates[key]), "\r", " "), "\n", " ")
+			fmt.Fprintf(&front, "%s: %s\n", key, value)
+		}
+		front.WriteString("---\n\n")
+		front.WriteString(text)
+		return []byte(front.String())
+	}
+	var replacements [][3]string
+	for key, value := range updates {
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(value), "\r", " "), "\n", " ")
+		if pos, ok := positions[key]; ok {
+			replacements = append(replacements, [3]string{strconv.Itoa(pos[0]), strconv.Itoa(pos[1]), value})
+			continue
+		}
+	}
+	// Apply existing values from the end so byte offsets remain valid.
+	for i := len(replacements) - 1; i >= 0; i-- {
+		start, _ := strconv.Atoi(replacements[i][0])
+		end, _ := strconv.Atoi(replacements[i][1])
+		text = text[:start] + replacements[i][2] + text[end:]
+	}
+	missing := make([]string, 0)
+	_, _, closingOffset, _, _ := parseFrontMatterSourceOffsets(text)
+	for key, value := range updates {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if _, ok := positions[key]; ok {
+			continue
+		}
+		value = strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(value), "\r", " "), "\n", " ")
+		missing = append(missing, fmt.Sprintf("%s: %s\n", key, value))
+	}
+	if len(missing) > 0 && closingOffset >= 0 {
+		sort.Strings(missing)
+		addition := strings.Join(missing, "")
+		text = text[:closingOffset] + addition + text[closingOffset:]
+	}
+	return []byte(text)
+}
+
+func parseFrontMatterSourceOffsets(source string) (int, int, int, map[string][2]int, bool) {
+	if !strings.HasPrefix(source, "---\n") {
+		return 0, 0, -1, nil, false
+	}
+	closingOffset := strings.Index(source[4:], "\n---")
+	if closingOffset < 0 {
+		return 0, 0, -1, nil, false
+	}
+	closingOffset += 4
+	bodyStart := closingOffset + len("\n---")
+	if bodyStart < len(source) && source[bodyStart] == '\n' {
+		bodyStart++
+	}
+	return 4, bodyStart, closingOffset, nil, true
+}
+
+func (s *Server) patchDocumentSource(pathValue string, body string, patchBody bool, metadata map[string]string, baseSHA, reason string) (Document, error) {
+	source, err := s.loadSourceDocument(pathValue)
+	if err != nil {
+		return Document{}, err
+	}
+	if baseSHA != "" && !strings.EqualFold(strings.TrimSpace(baseSHA), sourceSHA256(source.Source)) {
+		return Document{}, &sourceConflictError{Path: source.Document.Path}
+	}
+	if err := s.recordRevision(source.Document.Path, reason); err != nil {
+		return Document{}, err
+	}
+	patched := source.Source
+	if patchBody {
+		patched = patchSourceBody(patched, source.BodyStart, body)
+	}
+	if len(metadata) > 0 {
+		patched = patchFrontMatter(patched, metadata)
+	}
+	path, err := normalizeContentPath(source.Document.Path)
+	if err != nil {
+		return Document{}, err
+	}
+	filePath := filepath.Join(s.SiteDir, "content", filepath.FromSlash(path))
+	if err := writeAtomicFile(filePath, patched); err != nil {
+		return Document{}, fmt.Errorf("write %s: %w", path, err)
+	}
+	return s.loadDocument(path)
+}
+
+func revisionDirectory(siteDir, rel string) string {
+	return filepath.Join(siteDir, ".fileloom", "revisions", filepath.FromSlash(rel))
+}
+
+func (s *Server) recordRevision(rel, reason string) error {
+	rel, err := normalizeContentPath(rel)
+	if err != nil {
+		return err
+	}
+	filePath := filepath.Join(s.SiteDir, "content", filepath.FromSlash(rel))
+	source, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+	return s.recordWorkspaceRevision(rel, source, reason)
+}
+
+func (s *Server) recordWorkspaceRevision(rel string, source []byte, reason string) error {
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	if rel == "." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
+		return errors.New("invalid revision path")
+	}
+	created := time.Now().UTC()
+	id := created.Format("20060102T150405.000000000Z") + "-" + sourceSHA256(source)[:12]
+	dir := filepath.Join(s.SiteDir, ".fileloom", "revisions", filepath.FromSlash(rel))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	revision := Revision{ID: id, Path: rel, CreatedAt: created.Format(time.RFC3339Nano), Reason: strings.TrimSpace(reason), SHA256: sourceSHA256(source), Size: int64(len(source))}
+	if err := writeAtomicFile(filepath.Join(dir, id+".html"), source); err != nil {
+		return err
+	}
+	metadata, err := json.MarshalIndent(revision, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeAtomicFile(filepath.Join(dir, id+".json"), append(metadata, '\n'))
+}
+
+func (s *Server) listRevisions(rel string) ([]Revision, error) {
+	rel, err := normalizeContentPath(rel)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(revisionDirectory(s.SiteDir, rel))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []Revision{}, nil
+		}
+		return nil, err
+	}
+	var revisions []Revision
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(revisionDirectory(s.SiteDir, rel), entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		var revision Revision
+		if err := json.Unmarshal(data, &revision); err != nil {
+			continue
+		}
+		revisions = append(revisions, revision)
+	}
+	sort.Slice(revisions, func(i, j int) bool { return revisions[i].CreatedAt > revisions[j].CreatedAt })
+	return revisions, nil
+}
+
+func (s *Server) restoreRevision(rel, id string) (Document, error) {
+	rel, err := normalizeContentPath(rel)
+	if err != nil {
+		return Document{}, err
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9_.-]+$`).MatchString(id) {
+		return Document{}, errors.New("invalid revision id")
+	}
+	dir := revisionDirectory(s.SiteDir, rel)
+	metadata, err := os.ReadFile(filepath.Join(dir, id+".json"))
+	if err != nil {
+		return Document{}, err
+	}
+	var revision Revision
+	if err := json.Unmarshal(metadata, &revision); err != nil {
+		return Document{}, err
+	}
+	source, err := os.ReadFile(filepath.Join(dir, id+".html"))
+	if err != nil {
+		return Document{}, err
+	}
+	if sourceSHA256(source) != revision.SHA256 {
+		return Document{}, errors.New("revision checksum mismatch")
+	}
+	if err := s.recordRevision(rel, "Before restore "+id); err != nil {
+		return Document{}, err
+	}
+	if err := writeAtomicFile(filepath.Join(s.SiteDir, "content", filepath.FromSlash(rel)), source); err != nil {
+		return Document{}, err
+	}
+	return s.loadDocument(rel)
+}
 func (s *Server) Build() (BuildResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -711,10 +1047,11 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
+	now := time.Now().UTC()
 	published := make([]Document, 0, len(docs))
 	var pages, posts []Document
 	for _, doc := range docs {
-		if strings.EqualFold(doc.Status, "draft") || strings.EqualFold(doc.Status, "private") {
+		if !documentIsPublishable(doc, now) {
 			continue
 		}
 		published = append(published, doc)
@@ -728,18 +1065,17 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	sort.SliceStable(pages, func(i, j int) bool { return pages[i].Path < pages[j].Path })
 
 	publicDir := filepath.Join(s.SiteDir, "public")
-	if err := os.RemoveAll(publicDir); err != nil {
-		return BuildResult{}, fmt.Errorf("clear public directory: %w", err)
+	outputDir, err := os.MkdirTemp(s.SiteDir, ".fileloom-build-*")
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("create build directory: %w", err)
 	}
-	if err := os.MkdirAll(publicDir, 0o755); err != nil {
-		return BuildResult{}, err
-	}
+	defer os.RemoveAll(outputDir)
 	themeDir := filepath.Join(s.SiteDir, "themes", config.Theme)
 	themeStylesheetURL := fmt.Sprintf("/theme/style.css?v=%d", time.Now().UnixNano())
-	if err := copyDir(filepath.Join(themeDir, "assets"), filepath.Join(publicDir, "theme")); err != nil {
+	if err := copyDir(filepath.Join(themeDir, "assets"), filepath.Join(outputDir, "theme")); err != nil {
 		return BuildResult{}, fmt.Errorf("copy theme assets: %w", err)
 	}
-	if err := copyDir(filepath.Join(s.SiteDir, "media"), filepath.Join(publicDir, "media")); err != nil {
+	if err := copyDir(filepath.Join(s.SiteDir, "media"), filepath.Join(outputDir, "media")); err != nil {
 		return BuildResult{}, fmt.Errorf("copy media: %w", err)
 	}
 
@@ -758,7 +1094,7 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	indexValues["theme.css"] = themeStylesheetURL
 	indexValues["content"] = applyTokens(indexTemplate, indexValues)
 	indexOutput := applyTokens(layout, indexValues)
-	if err := writePublic(filepath.Join(publicDir, "index.html"), indexOutput); err != nil {
+	if err := writePublic(filepath.Join(outputDir, "index.html"), indexOutput); err != nil {
 		return BuildResult{}, err
 	}
 
@@ -774,9 +1110,9 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		body := applyTokens(bodyTemplate, values)
 		values["content"] = body
 		output := applyTokens(layout, values)
-		outputPath := filepath.Join(publicDir, filepath.FromSlash(strings.TrimPrefix(doc.URL, "/")), "index.html")
+		outputPath := filepath.Join(outputDir, filepath.FromSlash(strings.TrimPrefix(doc.URL, "/")), "index.html")
 		if doc.URL == "/" {
-			outputPath = filepath.Join(publicDir, "index.html")
+			outputPath = filepath.Join(outputDir, "index.html")
 		}
 		if err := writePublic(outputPath, output); err != nil {
 			return BuildResult{}, err
@@ -821,7 +1157,7 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		values["tag"] = html.EscapeString(tagName)
 		values["content"] = applyTokens(tagTemplate, values)
 		output := applyTokens(layout, values)
-		if err := writePublic(filepath.Join(publicDir, "tag", slugify(tagName), "index.html"), output); err != nil {
+		if err := writePublic(filepath.Join(outputDir, "tag", slugify(tagName), "index.html"), output); err != nil {
 			return BuildResult{}, err
 		}
 		files++
@@ -838,7 +1174,7 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		values["category"] = html.EscapeString(categoryName)
 		values["content"] = applyTokens(categoryTemplate, values)
 		output := applyTokens(layout, values)
-		if err := writePublic(filepath.Join(publicDir, "category", slugify(categoryName), "index.html"), output); err != nil {
+		if err := writePublic(filepath.Join(outputDir, "category", slugify(categoryName), "index.html"), output); err != nil {
 			return BuildResult{}, err
 		}
 		files++
@@ -851,22 +1187,30 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		values["year"] = html.EscapeString(year)
 		values["content"] = applyTokens(archiveTemplate, values)
 		output := applyTokens(layout, values)
-		if err := writePublic(filepath.Join(publicDir, "archive", year, "index.html"), output); err != nil {
+		if err := writePublic(filepath.Join(outputDir, "archive", year, "index.html"), output); err != nil {
 			return BuildResult{}, err
 		}
 		files++
 	}
 
-	if err := writePublic(filepath.Join(publicDir, "rss.xml"), renderRSS(config, posts)); err != nil {
+	if err := writePublic(filepath.Join(outputDir, "rss.xml"), renderRSS(config, posts)); err != nil {
 		return BuildResult{}, err
 	}
 	files++
-	if err := writePublic(filepath.Join(publicDir, "sitemap.xml"), renderSitemap(config, published, tagMap, categoryMap, yearMap)); err != nil {
+	if err := writePublic(filepath.Join(outputDir, "sitemap.xml"), renderSitemap(config, published, tagMap, categoryMap, yearMap)); err != nil {
 		return BuildResult{}, err
 	}
 	files++
 
-	result := BuildResult{GeneratedAt: time.Now().Format(time.RFC3339), Files: files, Published: len(published)}
+	checks, err := checkBuildOutput(outputDir)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("run build checks: %w", err)
+	}
+	if err := swapPublicDirectory(outputDir, publicDir); err != nil {
+		return BuildResult{}, err
+	}
+
+	result := BuildResult{GeneratedAt: time.Now().UTC().Format(time.RFC3339), Files: files, Published: len(published), Checks: checks}
 	s.lastBuild = result
 	if config.Git.Enabled && config.Git.AutoCommit && strings.ToLower(config.Git.CommitOn) == "build" {
 		if _, gitErr := s.gitCommitAndPush(config.Git, "Build Fileloom site", false); gitErr != nil {
@@ -876,6 +1220,209 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	return result, nil
 }
 
+func documentIsPublishable(doc Document, now time.Time) bool {
+	status := strings.ToLower(strings.TrimSpace(doc.Status))
+	if status == "draft" || status == "private" {
+		return false
+	}
+	if status != "scheduled" {
+		return true
+	}
+	publishAt, err := time.Parse(time.RFC3339, strings.TrimSpace(doc.PublishAt))
+	return err == nil && !publishAt.After(now)
+}
+
+func normalizePublishAt(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed.UTC().Format(time.RFC3339), nil
+	}
+	parsed, err := time.ParseInLocation("2006-01-02T15:04", value, time.Local)
+	if err != nil {
+		return "", errors.New("publish time must be an RFC3339 or local datetime value")
+	}
+	return parsed.UTC().Format(time.RFC3339), nil
+}
+
+func swapPublicDirectory(staged, publicDir string) error {
+	backup := publicDir + ".backup-" + fmt.Sprint(time.Now().UnixNano())
+	hadPublic := false
+	if _, err := os.Stat(publicDir); err == nil {
+		if err := os.Rename(publicDir, backup); err != nil {
+			return fmt.Errorf("stage existing public directory: %w", err)
+		}
+		hadPublic = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(staged, publicDir); err != nil {
+		if hadPublic {
+			_ = os.Rename(backup, publicDir)
+		}
+		return fmt.Errorf("activate built site: %w", err)
+	}
+	if hadPublic {
+		_ = os.RemoveAll(backup)
+	}
+	return nil
+}
+
+func checkBuildOutput(root string) ([]CheckIssue, error) {
+	var issues []CheckIssue
+	err := filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".html") {
+			return nil
+		}
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
+		document, err := htmlnode.Parse(bytes.NewReader(data))
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", filePath, err)
+		}
+		rel, err := filepath.Rel(root, filePath)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		checkHTMLAccessibility(document, rel, &issues)
+		checkHTMLLinks(root, rel, document, &issues)
+		return nil
+	})
+	return issues, err
+}
+
+func checkHTMLAccessibility(document *htmlnode.Node, rel string, issues *[]CheckIssue) {
+	var htmlElement, titleElement *htmlnode.Node
+	labels := map[string]bool{}
+	var walk func(*htmlnode.Node)
+	walk = func(node *htmlnode.Node) {
+		if node.Type == htmlnode.ElementNode {
+			switch strings.ToLower(node.Data) {
+			case "html":
+				htmlElement = node
+			case "title":
+				titleElement = node
+			case "label":
+				for _, attr := range node.Attr {
+					if attr.Key == "for" && strings.TrimSpace(attr.Val) != "" {
+						labels[attr.Val] = true
+					}
+				}
+			case "img":
+				if attrValue(node, "alt") == "" {
+					*issues = append(*issues, CheckIssue{Severity: "warning", Code: "image-alt", Path: rel, Message: "image is missing an alt attribute"})
+				}
+			case "input", "select", "textarea":
+				typeValue := strings.ToLower(attrValue(node, "type"))
+				if node.Data == "input" && (typeValue == "hidden" || typeValue == "submit" || typeValue == "button" || typeValue == "reset") {
+					break
+				}
+				id := attrValue(node, "id")
+				name := attrValue(node, "name")
+				if (id == "" || !labels[id]) && name == "" {
+					*issues = append(*issues, CheckIssue{Severity: "warning", Code: "form-label", Path: rel, Message: "form control may be missing an associated label"})
+				}
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(document)
+	if htmlElement == nil || attrValue(htmlElement, "lang") == "" {
+		*issues = append(*issues, CheckIssue{Severity: "warning", Code: "html-lang", Path: rel, Message: "document is missing an html lang attribute"})
+	}
+	if titleElement == nil || strings.TrimSpace(nodeText(titleElement)) == "" {
+		*issues = append(*issues, CheckIssue{Severity: "warning", Code: "document-title", Path: rel, Message: "document is missing a non-empty title"})
+	}
+}
+
+func checkHTMLLinks(root, rel string, document *htmlnode.Node, issues *[]CheckIssue) {
+	var walk func(*htmlnode.Node)
+	walk = func(node *htmlnode.Node) {
+		if node.Type == htmlnode.ElementNode {
+			var target string
+			switch strings.ToLower(node.Data) {
+			case "a", "area", "link":
+				target = attrValue(node, "href")
+			case "img", "script", "source", "video", "audio":
+				target = attrValue(node, "src")
+			}
+			if target != "" && isInternalTarget(target) {
+				parsed, err := url.Parse(target)
+				if err == nil && parsed.Path != "" && !publicTargetExists(root, rel, parsed.Path) {
+					*issues = append(*issues, CheckIssue{Severity: "warning", Code: "broken-link", Path: rel, Message: "internal link target does not exist: " + parsed.Path})
+				}
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(document)
+}
+
+func attrValue(node *htmlnode.Node, key string) string {
+	for _, attr := range node.Attr {
+		if strings.EqualFold(attr.Key, key) {
+			return strings.TrimSpace(attr.Val)
+		}
+	}
+	return ""
+}
+
+func nodeText(node *htmlnode.Node) string {
+	if node == nil {
+		return ""
+	}
+	if node.Type == htmlnode.TextNode {
+		return node.Data
+	}
+	var b strings.Builder
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		b.WriteString(nodeText(child))
+	}
+	return b.String()
+}
+
+func isInternalTarget(target string) bool {
+	lower := strings.ToLower(strings.TrimSpace(target))
+	return lower != "" && !strings.HasPrefix(lower, "#") && !strings.HasPrefix(lower, "http:") && !strings.HasPrefix(lower, "https:") && !strings.HasPrefix(lower, "mailto:") && !strings.HasPrefix(lower, "tel:") && !strings.HasPrefix(lower, "javascript:") && !strings.HasPrefix(lower, "data:")
+}
+
+func publicTargetExists(root, currentRel, target string) bool {
+	parsed, err := url.Parse(target)
+	if err != nil || parsed.Host != "" {
+		return true
+	}
+	requestPath := parsed.Path
+	if requestPath == "" {
+		return true
+	}
+	var base string
+	if strings.HasPrefix(requestPath, "/") {
+		base = path.Clean(requestPath)
+	} else {
+		currentDir := path.Dir("/" + currentRel)
+		base = path.Clean(path.Join(currentDir, requestPath))
+	}
+	base = strings.TrimPrefix(base, "/")
+	candidates := []string{base, path.Join(base, "index.html"), base + ".html"}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(filepath.Join(root, filepath.FromSlash(candidate))); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
 func (s *Server) listThemes() ([]ThemeInfo, error) {
 	config, err := s.loadSiteConfig()
 	if err != nil {
@@ -1016,6 +1563,7 @@ func templateValues(doc Document, config SiteConfig, navigation, posts string) m
 		"site.footer":      html.EscapeString(config.Footer),
 		"site.base_url":    html.EscapeString(config.BaseURL),
 		"site.theme":       html.EscapeString(config.Theme),
+		"site.attribution": `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a> and <a href="https://github.com/givanz/VvvebJs" rel="noreferrer">VvvebJs</a>.</span>`,
 		"theme.css":        "/theme/style.css",
 		"navigation":       navigation,
 		"posts":            posts,
@@ -1104,6 +1652,9 @@ func copyDir(source, destination string) error {
 			return err
 		}
 		target := filepath.Join(destination, rel)
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("symlinks are not allowed in generated assets: %s", path)
+		}
 		if entry.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}
@@ -1129,6 +1680,9 @@ func copyDir(source, destination string) error {
 }
 
 func writePublic(path, contents string) error {
+	if strings.EqualFold(filepath.Ext(path), ".html") {
+		contents = ensureAttribution(contents)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -1138,19 +1692,84 @@ func writePublic(path, contents string) error {
 	return nil
 }
 
+func ensureAttribution(source string) string {
+	if strings.Contains(source, "class=\"fileloom-attribution\"") || strings.Contains(source, "class='fileloom-attribution'") {
+		return source
+	}
+	attribution := `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a> and <a href="https://github.com/givanz/VvvebJs" rel="noreferrer">VvvebJs</a>.</span>`
+	if index := strings.LastIndex(strings.ToLower(source), "</body>"); index >= 0 {
+		return source[:index] + `<footer class="fileloom-generated-attribution" style="display:block;margin-top:8px;font-size:.8em">` + attribution + `</footer>` + source[index:]
+	}
+	return source + `<footer class="fileloom-generated-attribution" style="display:block;margin-top:8px;font-size:.8em">` + attribution + `</footer>`
+}
 func (s *Server) Serve(addr string) error {
+	s.startScheduler()
 	mux := s.Handler()
 	slog.Info("starting Fileloom", "addr", addr, "site", s.SiteDir)
 	return http.ListenAndServe(addr, mux)
+}
+
+func (s *Server) startScheduler() {
+	s.scheduler.Do(func() {
+		go func() {
+			s.publishDue()
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				s.publishDue()
+			}
+		}()
+	})
+}
+
+func (s *Server) publishDue() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	docs, err := s.listDocuments()
+	if err != nil {
+		slog.Warn("scheduled publishing scan failed", "error", err)
+		return
+	}
+	now := time.Now().UTC()
+	changed := false
+	for _, doc := range docs {
+		if strings.ToLower(strings.TrimSpace(doc.Status)) != "scheduled" || strings.TrimSpace(doc.PublishAt) == "" {
+			continue
+		}
+		publishAt, err := time.Parse(time.RFC3339, strings.TrimSpace(doc.PublishAt))
+		if err != nil || publishAt.After(now) {
+			continue
+		}
+		if _, err := s.patchDocumentSource(doc.Path, "", false, map[string]string{"status": "published", "publish_at": ""}, "", "Publish scheduled "+doc.Path); err != nil {
+			slog.Warn("scheduled publish failed", "path", doc.Path, "error", err)
+			continue
+		}
+		changed = true
+	}
+	if changed {
+		if _, err := s.Build(); err != nil {
+			slog.Warn("scheduled build failed", "error", err)
+		}
+	}
 }
 
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(s.route)
 }
 
+func setSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+}
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
 	if r.URL.Path == "/_cms" || r.URL.Path == "/_cms/" || strings.HasPrefix(r.URL.Path, "/_cms/") {
 		if !s.cmsAllowed(r) {
+			http.NotFound(w, r)
+			return
+		}
+		if isMutationMethod(r.Method) && !sameOriginRequest(r) {
 			http.NotFound(w, r)
 			return
 		}
@@ -1208,8 +1827,8 @@ func (s *Server) routeCMS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveWebFile(w http.ResponseWriter, r *http.Request, name string) {
-	path := filepath.Join(s.WebDir, name)
-	if _, err := os.Stat(path); err != nil {
+	path, _, err := safeResolvedPath(s.WebDir, name)
+	if err != nil {
 		http.Error(w, "Fileloom web asset not found", http.StatusNotFound)
 		return
 	}
@@ -1228,8 +1847,7 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, root, prefix 
 		http.NotFound(w, r)
 		return
 	}
-	path := filepath.Join(root, filepath.FromSlash(rel))
-	info, err := os.Stat(path)
+	path, info, err := safeResolvedPath(root, rel)
 	if err != nil || info.IsDir() {
 		http.NotFound(w, r)
 		return
@@ -1255,6 +1873,30 @@ func safeRelativePath(value string) (string, error) {
 	return clean, nil
 }
 
+func safeResolvedPath(root, rel string) (string, fs.FileInfo, error) {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", nil, err
+	}
+	rootReal, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return "", nil, err
+	}
+	candidate := filepath.Join(rootAbs, filepath.FromSlash(rel))
+	resolved, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", nil, err
+	}
+	relative, err := filepath.Rel(rootReal, resolved)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", nil, errors.New("resolved path escapes root")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", nil, err
+	}
+	return resolved, info, nil
+}
 func setContentType(w http.ResponseWriter, path string) {
 	if contentType := mime.TypeByExtension(filepath.Ext(path)); contentType != "" {
 		w.Header().Set("Content-Type", contentType)
@@ -1266,6 +1908,7 @@ func (s *Server) servePublic(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	w.Header().Add("Vary", "X-ExeDev-Email")
 	requested := strings.TrimPrefix(r.URL.Path, "/")
 	candidates := []string{}
 	if requested == "" {
@@ -1283,10 +1926,21 @@ func (s *Server) servePublic(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		path := filepath.Join(publicDir, filepath.FromSlash(rel))
-		info, err := os.Stat(path)
+		path, info, err := safeResolvedPath(publicDir, rel)
 		if err == nil && !info.IsDir() {
 			setContentType(w, path)
+			if doc, ok := s.publicDocument(r.URL.Path); ok && s.cmsAllowed(r) {
+				data, readErr := os.ReadFile(path)
+				if readErr != nil {
+					http.NotFound(w, r)
+					return
+				}
+				data = injectOwnerEditToolbar(data, doc)
+				w.Header().Set("Cache-Control", "private, no-store")
+				w.Header().Add("Vary", "X-ExeDev-Email")
+				http.ServeContent(w, r, filepath.Base(path), info.ModTime(), bytes.NewReader(data))
+				return
+			}
 			http.ServeFile(w, r, path)
 			return
 		}
@@ -1294,6 +1948,57 @@ func (s *Server) servePublic(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+func (s *Server) publicDocument(requestPath string) (Document, bool) {
+	requested := requestPath
+	if requested == "" {
+		requested = "/"
+	}
+	if !strings.HasPrefix(requested, "/") {
+		requested = "/" + requested
+	}
+	if !strings.HasSuffix(requested, "/") && !strings.HasSuffix(requested, ".html") {
+		requested += "/"
+	}
+	docs, err := s.listDocuments()
+	if err != nil {
+		return Document{}, false
+	}
+	for _, doc := range docs {
+		if doc.URL == requested && (doc.Type == "page" || doc.Type == "post") {
+			return doc, true
+		}
+	}
+	return Document{}, false
+}
+
+func injectOwnerEditToolbar(data []byte, doc Document) []byte {
+	toolbar := `<aside data-fileloom-owner-toolbar style="position:fixed;right:16px;bottom:16px;z-index:2147483647;display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #d9dce5;border-radius:999px;background:#fff;color:#202633;box-shadow:0 8px 24px #0002;font:700 12px/1 system-ui,sans-serif"><span>Fileloom owner view</span><a href="/_cms/editor?path=` + url.QueryEscape(doc.Path) + `" style="color:#5038c8;text-decoration:none">Edit this page ↗</a><a href="/_cms/" style="color:#667384;text-decoration:none">CMS</a></aside>`
+	lower := strings.ToLower(string(data))
+	if index := strings.LastIndex(lower, "</body>"); index >= 0 {
+		result := make([]byte, 0, len(data)+len(toolbar))
+		result = append(result, data[:index]...)
+		result = append(result, toolbar...)
+		result = append(result, data[index:]...)
+		return result
+	}
+	return append(data, []byte(toolbar)...)
+}
+func isMutationMethod(method string) bool {
+	return method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
+}
+
+func sameOriginRequest(r *http.Request) bool {
+	fetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+	if fetchSite == "cross-site" {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host)
+}
 func (s *Server) cmsAllowed(r *http.Request) bool {
 	owner := strings.TrimSpace(s.OwnerEmail)
 	if owner == "" {
@@ -1321,6 +2026,14 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleThemeActivateAPI(w, r)
 	case "/_cms/api/items/status":
 		s.handleItemStatusAPI(w, r)
+	case "/_cms/api/revisions":
+		s.handleRevisionsAPI(w, r)
+	case "/_cms/api/revisions/restore":
+		s.handleRevisionRestoreAPI(w, r)
+	case "/_cms/api/theme-tokens":
+		s.handleThemeTokensAPI(w, r)
+	case "/_cms/api/export":
+		s.handleExportAPI(w, r)
 	case "/_cms/api/git":
 		s.handleGitAPI(w, r)
 	case "/_cms/api/git/config":
@@ -1395,6 +2108,7 @@ func (s *Server) handleItemsAPI(w http.ResponseWriter, r *http.Request) {
 				"title":      doc.Title,
 				"date":       doc.Date,
 				"status":     doc.Status,
+				"publish_at": doc.PublishAt,
 				"tags":       doc.Tags,
 				"category":   doc.Category,
 				"excerpt":    doc.Excerpt,
@@ -1411,18 +2125,21 @@ func (s *Server) handleItemsAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 type createItemInput struct {
-	Type     string `json:"type"`
-	Title    string `json:"title"`
-	Slug     string `json:"slug"`
-	Date     string `json:"date"`
-	Status   string `json:"status"`
-	Tags     string `json:"tags"`
-	Excerpt  string `json:"excerpt"`
-	Category string `json:"category"`
-	HTML     string `json:"html"`
+	Type      string `json:"type"`
+	Title     string `json:"title"`
+	Slug      string `json:"slug"`
+	Date      string `json:"date"`
+	Status    string `json:"status"`
+	PublishAt string `json:"publish_at"`
+	Tags      string `json:"tags"`
+	Excerpt   string `json:"excerpt"`
+	Category  string `json:"category"`
+	HTML      string `json:"html"`
 }
 
 func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	var input createItemInput
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		if err := json.NewDecoder(io.LimitReader(r.Body, maxEditorSize)).Decode(&input); err != nil {
@@ -1436,7 +2153,7 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 		}
 		input = createItemInput{
 			Type: r.FormValue("type"), Title: r.FormValue("title"), Slug: r.FormValue("slug"),
-			Date: r.FormValue("date"), Status: r.FormValue("status"), Tags: r.FormValue("tags"),
+			Date: r.FormValue("date"), Status: r.FormValue("status"), PublishAt: r.FormValue("publish_at"), Tags: r.FormValue("tags"),
 			Category: r.FormValue("category"), Excerpt: r.FormValue("excerpt"), HTML: r.FormValue("html"),
 		}
 	}
@@ -1456,8 +2173,21 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	if input.Date == "" {
 		input.Date = time.Now().Format(dateFormat)
 	}
-	if input.Status != "published" {
+	if input.Status != "draft" && input.Status != "published" && input.Status != "scheduled" {
 		input.Status = "draft"
+	}
+	publishAt, err := normalizePublishAt(input.PublishAt)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	input.PublishAt = publishAt
+	if input.Status == "scheduled" && input.PublishAt == "" {
+		writeJSONError(w, http.StatusBadRequest, "publish_at is required for scheduled content")
+		return
+	}
+	if input.Status != "scheduled" {
+		input.PublishAt = ""
 	}
 	if input.HTML == "" {
 		input.HTML = "<h1>" + html.EscapeString(input.Title) + "</h1><p>Start writing here.</p>"
@@ -1476,14 +2206,14 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	}
 	doc := Document{
 		Path: path, Type: input.Type, Title: input.Title, Slug: input.Slug,
-		Date: input.Date, Status: input.Status, Tags: parseTags(input.Tags),
+		Date: input.Date, Status: input.Status, PublishAt: input.PublishAt, Tags: parseTags(input.Tags),
 		Category: strings.TrimSpace(input.Category), Excerpt: input.Excerpt, HTML: input.HTML,
 	}
 	if err := s.writeDocument(doc); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if input.Status == "published" {
+	if input.Status == "published" || input.Status == "scheduled" {
 		if _, err := s.Build(); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "item saved but build failed: "+err.Error())
 			return
@@ -1518,6 +2248,8 @@ func (s *Server) handleThemeActivateAPI(w http.ResponseWriter, r *http.Request) 
 		methodNotAllowed(w)
 		return
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1535,6 +2267,8 @@ func (s *Server) handleItemStatusAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1545,34 +2279,91 @@ func (s *Server) handleItemStatusAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := strings.ToLower(strings.TrimSpace(r.FormValue("status")))
-	if status != "draft" && status != "published" && status != "private" {
-		writeJSONError(w, http.StatusBadRequest, "status must be draft, published, or private")
+	if status != "draft" && status != "published" && status != "private" && status != "scheduled" {
+		writeJSONError(w, http.StatusBadRequest, "status must be draft, published, private, or scheduled")
 		return
 	}
-	doc.Status = status
-	if err := s.writeDocument(doc); err != nil {
+	publishAt, err := normalizePublishAt(r.FormValue("publish_at"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if status == "scheduled" && publishAt == "" {
+		writeJSONError(w, http.StatusBadRequest, "publish_at is required for scheduled content")
+		return
+	}
+	if status != "scheduled" {
+		publishAt = ""
+	}
+	updated, err := s.patchDocumentSource(doc.Path, "", false, map[string]string{"status": status, "publish_at": publishAt}, r.FormValue("base_sha256"), "Change status for "+doc.Path)
+	if err != nil {
+		var conflict *sourceConflictError
+		if errors.As(err, &conflict) {
+			writeJSONError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	var build BuildResult
-	if status == "published" {
-		build, err = s.Build()
-		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "status saved but build failed: "+err.Error())
-			return
-		}
+	build, err = s.Build()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "status saved but build failed: "+err.Error())
+		return
 	}
-	if err := s.gitChangeIfConfigured("Change status for " + doc.Path); err != nil {
+	if err := s.gitChangeIfConfigured("Change status for " + updated.Path); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": doc.Path, "status": status, "build": build})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": updated.Path, "status": updated.Status, "publish_at": updated.PublishAt, "build": build})
+}
+func (s *Server) handleRevisionsAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	revisions, err := s.listRevisions(r.URL.Query().Get("path"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"path": r.URL.Query().Get("path"), "revisions": revisions})
+}
+
+func (s *Server) handleRevisionRestoreAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	doc, err := s.restoreRevision(r.FormValue("path"), r.FormValue("id"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	build, err := s.Build()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "revision restored but build failed: "+err.Error())
+		return
+	}
+	if err := s.gitChangeIfConfigured("Restore " + doc.Path); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": doc.Path, "build": build, "source_sha256": fileSHA256(filepath.Join(s.SiteDir, "content", filepath.FromSlash(doc.Path)))})
 }
 func (s *Server) handleBuildAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
 		return
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	result, err := s.Build()
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -1599,29 +2390,31 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = r.FormValue("path")
 	}
-	doc, err := s.loadDocument(path)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	updated, err := s.patchDocumentSource(path, extractBodyHTML(r.FormValue("html")), true, nil, r.FormValue("base_sha256"), "Edit "+path)
 	if err != nil {
+		var conflict *sourceConflictError
+		if errors.As(err, &conflict) {
+			writeJSONError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	doc.HTML = strings.TrimSpace(extractBodyHTML(r.FormValue("html")))
-	if err := s.writeDocument(doc); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	var build BuildResult
-	if !strings.EqualFold(doc.Status, "draft") && !strings.EqualFold(doc.Status, "private") {
+	if documentIsPublishable(updated, time.Now().UTC()) {
 		build, err = s.Build()
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "saved but build failed: "+err.Error())
 			return
 		}
 	}
-	if err := s.gitChangeIfConfigured("Edit " + doc.Path); err != nil {
+	if err := s.gitChangeIfConfigured("Edit " + updated.Path); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": doc.Path, "build": build})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": updated.Path, "source_sha256": fileSHA256(filepath.Join(s.SiteDir, "content", filepath.FromSlash(updated.Path))), "build": build})
 }
 
 func normalizeThemeLayoutPath(value string) (string, string, error) {
@@ -1667,11 +2460,24 @@ func (s *Server) handleThemeSaveAPI(w http.ResponseWriter, r *http.Request, them
 	}
 	contents := stripThemePreview(r.FormValue("html"))
 	path := filepath.Join(s.SiteDir, filepath.FromSlash(file))
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	previous, _ := os.ReadFile(path)
+	if baseSHA := strings.TrimSpace(r.FormValue("base_sha256")); baseSHA != "" && baseSHA != sourceSHA256(previous) {
+		writeJSONError(w, http.StatusConflict, "theme layout changed since it was opened; reload before saving")
+		return
+	}
+	if len(previous) > 0 {
+		if err := s.recordWorkspaceRevision(file, previous, "Edit theme layout"); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := os.WriteFile(path, []byte(contents+"\n"), 0o644); err != nil {
+	if err := writeAtomicFile(path, []byte(contents+"\n")); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1684,8 +2490,271 @@ func (s *Server) handleThemeSaveAPI(w http.ResponseWriter, r *http.Request, them
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "theme": name, "file": file, "build": build})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "theme": name, "file": file, "source_sha256": sourceSHA256([]byte(contents + "\n")), "build": build})
 }
+
+var cssTokenPattern = regexp.MustCompile(`(?m)(--[A-Za-z0-9_-]+)\s*:\s*([^;}\r\n]+)`)
+
+type cssTokenSpan struct {
+	Name       string
+	Value      string
+	ValueStart int
+	ValueEnd   int
+}
+
+func extractCSSTokens(source string) []cssTokenSpan {
+	matches := cssTokenPattern.FindAllStringSubmatchIndex(source, -1)
+	seen := map[string]bool{}
+	var tokens []cssTokenSpan
+	for _, match := range matches {
+		if len(match) < 6 {
+			continue
+		}
+		name := source[match[2]:match[3]]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		valueStart := match[4]
+		valueEnd := match[5]
+		for valueStart < valueEnd && (source[valueStart] == ' ' || source[valueStart] == '\t') {
+			valueStart++
+		}
+		for valueEnd > valueStart && (source[valueEnd-1] == ' ' || source[valueEnd-1] == '\t') {
+			valueEnd--
+		}
+		tokens = append(tokens, cssTokenSpan{Name: name, Value: source[valueStart:valueEnd], ValueStart: valueStart, ValueEnd: valueEnd})
+	}
+	sort.Slice(tokens, func(i, j int) bool { return tokens[i].Name < tokens[j].Name })
+	return tokens
+}
+
+func themeStylesPath(siteDir, theme string) (string, string, error) {
+	name, err := normalizeThemeName(theme)
+	if err != nil {
+		return "", "", err
+	}
+	rel := filepath.ToSlash(filepath.Join("themes", name, "assets", "style.css"))
+	filePath := filepath.Join(siteDir, filepath.FromSlash(rel))
+	if !fileExists(filePath) {
+		return "", "", errors.New("theme stylesheet not found")
+	}
+	return rel, filePath, nil
+}
+
+func validateCSSValue(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 512 || strings.ContainsAny(value, "{};\r\n") || strings.Contains(strings.ToLower(value), "</style") {
+		return errors.New("CSS token value is empty or contains forbidden characters")
+	}
+	return nil
+}
+
+func (s *Server) handleThemeTokensAPI(w http.ResponseWriter, r *http.Request) {
+	theme := r.URL.Query().Get("theme")
+	if r.Method == http.MethodPost {
+		theme = r.FormValue("theme")
+	}
+	rel, filePath, err := themeStylesPath(s.SiteDir, theme)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		tokens := extractCSSTokens(string(data))
+		result := make([]ThemeToken, 0, len(tokens))
+		for _, token := range tokens {
+			result = append(result, ThemeToken{Name: token.Name, Value: token.Value})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"theme": theme, "file": rel, "sha256": sourceSHA256(data), "tokens": result})
+	case http.MethodPost:
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		var input struct {
+			Theme  string            `json:"theme"`
+			SHA256 string            `json:"sha256"`
+			Tokens map[string]string `json:"tokens"`
+		}
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			if err := json.NewDecoder(io.LimitReader(r.Body, maxEditorSize)).Decode(&input); err != nil {
+				writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+				return
+			}
+		} else {
+			if err := r.ParseForm(); err != nil {
+				writeJSONError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			input.Theme = r.FormValue("theme")
+			input.SHA256 = r.FormValue("sha256")
+			if err := json.Unmarshal([]byte(r.FormValue("tokens")), &input.Tokens); err != nil {
+				writeJSONError(w, http.StatusBadRequest, "tokens must be a JSON object")
+				return
+			}
+		}
+		if input.Theme != "" && input.Theme != theme {
+			writeJSONError(w, http.StatusBadRequest, "theme mismatch")
+			return
+		}
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if input.SHA256 != "" && !strings.EqualFold(input.SHA256, sourceSHA256(data)) {
+			writeJSONError(w, http.StatusConflict, "theme stylesheet changed since it was opened; reload before saving")
+			return
+		}
+		spans := extractCSSTokens(string(data))
+		spanByName := make(map[string]cssTokenSpan, len(spans))
+		for _, span := range spans {
+			spanByName[span.Name] = span
+		}
+		type replacement struct {
+			start, end int
+			value      string
+		}
+		var replacements []replacement
+		for name, value := range input.Tokens {
+			span, ok := spanByName[name]
+			if !ok {
+				writeJSONError(w, http.StatusBadRequest, "unknown CSS token: "+name)
+				return
+			}
+			if err := validateCSSValue(value); err != nil {
+				writeJSONError(w, http.StatusBadRequest, name+": "+err.Error())
+				return
+			}
+			replacements = append(replacements, replacement{start: span.ValueStart, end: span.ValueEnd, value: strings.TrimSpace(value)})
+		}
+		if err := s.recordWorkspaceRevision(rel, data, "Edit theme tokens"); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		updated := string(data)
+		sort.Slice(replacements, func(i, j int) bool { return replacements[i].start > replacements[j].start })
+		for _, replacement := range replacements {
+			updated = updated[:replacement.start] + replacement.value + updated[replacement.end:]
+		}
+		if err := writeAtomicFile(filePath, []byte(updated)); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		build, err := s.Build()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "theme tokens saved but build failed: "+err.Error())
+			return
+		}
+		if err := s.gitChangeIfConfigured("Edit theme tokens " + theme); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "theme": theme, "file": rel, "sha256": sourceSHA256([]byte(updated)), "build": build})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+const (
+	maxExportFiles = 10000
+	maxExportBytes = 64 << 20
+)
+
+type limitedBuffer struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (w *limitedBuffer) Write(data []byte) (int, error) {
+	if w.buffer.Len()+len(data) > w.limit {
+		return 0, errors.New("export exceeds the size limit")
+	}
+	return w.buffer.Write(data)
+}
+
+func (s *Server) handleExportAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.Build(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "build failed: "+err.Error())
+		return
+	}
+	publicDir := filepath.Join(s.SiteDir, "public")
+	buffer := &limitedBuffer{limit: maxExportBytes}
+	archive := zip.NewWriter(buffer)
+	files := 0
+	err := filepath.WalkDir(publicDir, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlink in export: %s", filePath)
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if files >= maxExportFiles {
+			return errors.New("export contains too many files")
+		}
+		rel, err := filepath.Rel(publicDir, filePath)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = rel
+		header.Method = zip.Deflate
+		writer, err := archive.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		input, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(writer, input)
+		closeErr := input.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		files++
+		return nil
+	})
+	if err == nil {
+		err = archive.Close()
+	} else {
+		_ = archive.Close()
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "export failed: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="fileloom-site-%s.zip"`, time.Now().UTC().Format("20060102-150405")))
+	w.Header().Set("Content-Length", strconv.Itoa(buffer.buffer.Len()))
+	_, _ = w.Write(buffer.buffer.Bytes())
+}
+
 func extractBodyHTML(source string) string {
 	lower := strings.ToLower(source)
 	start := strings.Index(lower, "<body")
@@ -1728,6 +2797,7 @@ func (s *Server) handleEditor(w http.ResponseWriter, r *http.Request) {
 		"current": {
 			"name": "current", "file": doc.Path, "url": pageURL,
 			"title": doc.Title, "description": doc.Excerpt,
+			"base_sha256": fileSHA256(filepath.Join(s.SiteDir, "content", filepath.FromSlash(doc.Path))),
 		},
 	}
 	pagesJSON, _ := json.Marshal(pages)
@@ -1758,6 +2828,7 @@ func (s *Server) handleThemeEditor(w http.ResponseWriter, r *http.Request, theme
 		"current": {
 			"name": "current", "file": filepath.ToSlash(filepath.Join("themes", name, "layout.html")),
 			"url": pageURL, "title": friendlyTitle(name) + " theme", "theme": name,
+			"base_sha256": fileSHA256(layoutPath),
 		},
 	}
 	pagesJSON, _ := json.Marshal(pages)
@@ -1781,7 +2852,19 @@ func (s *Server) prepareVvvebEditor(source string, pagesJSON []byte, label strin
 	htmlSource = strings.ReplaceAll(htmlSource, "save.php", "/_cms/api/editor-save")
 	badge := `<style>#fileloom-editor-badge{position:fixed;left:16px;bottom:16px;z-index:9999;background:#7557ff;color:#fff;border-radius:999px;padding:7px 12px;font:700 11px/1 system-ui;letter-spacing:.1em;box-shadow:0 8px 20px #0002}#fileloom-editor-badge span{opacity:.7;font-weight:500;letter-spacing:0}</style><div id="fileloom-editor-badge">FILELOOM <span>` + html.EscapeString(label) + `</span></div>`
 	htmlSource = strings.Replace(htmlSource, "</head>", badge+"</head>", 1)
-	boot := `window.fileloomPages = ` + string(pagesJSON) + `;` + "\n\t" + "let pages = window.fileloomPages || defaultPages;"
+	boot := `window.fileloomPages = ` + string(pagesJSON) + `;` + `
+	window.fileloomBaseSHA = window.fileloomPages.current?.base_sha256 || "";
+	const fileloomFetch = window.fetch.bind(window);
+	window.fetch = function(input, init) {
+		const url = typeof input === "string" ? input : input?.url || "";
+		if (url.includes("/_cms/api/editor-save") && init?.body) {
+			const body = new URLSearchParams(typeof init.body === "string" ? init.body : init.body.toString());
+			if (window.fileloomBaseSHA) body.set("base_sha256", window.fileloomBaseSHA);
+			init = {...init, body: body.toString()};
+		}
+		return fileloomFetch(input, init);
+	};` + `
+	let pages = window.fileloomPages || defaultPages;`
 	htmlSource = strings.Replace(htmlSource, "let pages = defaultPages;", boot, 1)
 	htmlSource = addMobileEditorShell(htmlSource)
 	return htmlSource
@@ -1883,6 +2966,8 @@ func (s *Server) handleMediaAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<20)
 	if err := r.ParseMultipartForm(16 << 20); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid upload: "+err.Error())
@@ -2163,6 +3248,8 @@ func (s *Server) handleGitInitAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if _, err := os.Stat(filepath.Join(s.SiteDir, ".git")); err == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": s.gitStatus(GitConfig{Remote: "origin"})})
 		return
@@ -2186,6 +3273,8 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -2208,6 +3297,14 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "commit trigger must be build or change")
 		return
 	}
+	if gitConfig.AutoCommit && !gitConfig.Enabled {
+		writeJSONError(w, http.StatusBadRequest, "auto-commit requires Git automation")
+		return
+	}
+	if gitConfig.AutoPush && (!gitConfig.Enabled || !gitConfig.AutoCommit) {
+		writeJSONError(w, http.StatusBadRequest, "auto-push requires Git automation and auto-commit")
+		return
+	}
 	if gitConfig.Remote == "" {
 		gitConfig.Remote = "origin"
 	}
@@ -2215,8 +3312,8 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "remote name contains invalid characters")
 		return
 	}
-	if gitConfig.Branch != "" && !regexp.MustCompile(`^[A-Za-z0-9._/-]+$`).MatchString(gitConfig.Branch) {
-		writeJSONError(w, http.StatusBadRequest, "branch name contains invalid characters")
+	if err := validateGitBranch(gitConfig.Branch); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := validateRemoteURL(gitConfig.RemoteURL); err != nil {
@@ -2247,6 +3344,24 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": config.Git, "status": s.gitStatus(config.Git)})
 }
 
+func validateGitBranch(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if strings.ContainsAny(value, "\r\n\t ") {
+		return errors.New("branch name cannot contain whitespace")
+	}
+	command := exec.Command("git", "check-ref-format", "--branch", value)
+	if output, err := command.CombinedOutput(); err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = "invalid Git branch name"
+		}
+		return errors.New(message)
+	}
+	return nil
+}
 func formBool(r *http.Request, key string) bool {
 	value := strings.ToLower(strings.TrimSpace(r.FormValue(key)))
 	return value == "1" || value == "true" || value == "on" || value == "yes"
@@ -2281,6 +3396,8 @@ func (s *Server) handleGitCommitAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -2304,6 +3421,8 @@ func (s *Server) handleGitPushAPI(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	config, err := s.loadSiteConfig()
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())

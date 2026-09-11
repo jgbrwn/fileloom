@@ -1,0 +1,20 @@
+Fileloom Notices
+================
+
+Fileloom is distributed under the MIT License. See LICENSE.
+
+VvvebJs
+-------
+
+Fileloom includes a vendored copy of VvvebJs under web/vvvebjs. VvvebJs is
+licensed under the Apache License, Version 2.0. Its license and credits are
+included at:
+
+  web/vvvebjs/LICENSE
+  web/vvvebjs/Credits.md
+
+Built-in themes
+---------------
+
+The built-in Fileloom themes are original project assets and are distributed
+under the MIT License with the project.

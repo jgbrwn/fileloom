@@ -27,7 +27,7 @@
         <p class="intro-copy" id="site-description">Loading your workspace…</p>
       </div>
       <div class="intro-actions">
-        <button id="build-button" class="button button-dark"><span class="button-icon">↻</span> Build site</button>
+        <button id="export-button" class="button button-quiet"><span class="button-icon">⇩</span> Export ZIP</button><button id="build-button" class="button button-dark"><span class="button-icon">↻</span> Build site</button>
         <a class="button button-quiet" href="/_cms/new?type=post">Write something <span>→</span></a>
       </div>
     </section>
@@ -36,7 +36,7 @@
       <article class="stat-card"><span class="stat-label">Posts</span><strong id="posts-count">—</strong><span class="stat-hint">HTML files</span></article>
       <article class="stat-card"><span class="stat-label">Pages</span><strong id="pages-count">—</strong><span class="stat-hint">Always yours</span></article>
       <article class="stat-card"><span class="stat-label">Media</span><strong id="media-count">—</strong><span class="stat-hint">Files in /media</span></article>
-      <article class="stat-card accent-card"><span class="stat-label">Published files</span><strong id="published-count">—</strong><span class="stat-hint" id="last-built">Not built yet</span></article>
+      <article class="stat-card accent-card"><span class="stat-label">Published files</span><strong id="published-count">—</strong><span class="stat-hint" id="last-built">Not built yet</span><button type="button" class="stat-hint check-link" id="check-count">No check issues</button></article>
     </section>
 
     <section class="workspace-grid">
@@ -91,17 +91,27 @@
     </section>
     <dialog id="git-dialog" class="git-dialog">
       <form method="dialog" id="git-config-form" class="git-config-form">
-        <div class="dialog-heading"><div><p class="kicker">Git setup</p><h2>Configure version control</h2></div><button class="dialog-close" value="cancel" aria-label="Close">×</button></div>
+        <div class="dialog-heading"><div><p class="kicker">Git setup</p><h2>Configure version control</h2></div><button type="button" id="git-close" class="dialog-close" aria-label="Close">×</button></div>
         <p class="dialog-help">Fileloom stores these settings in <code>site/site.json</code>. Remote credentials are never stored here; use SSH keys or your Git credential helper.</p>
         <label class="check-row"><input id="git-enabled" name="enabled" type="checkbox"><span><strong>Enable Git automation</strong><small>Allow automatic commits after changes or builds.</small></span></label>
         <label class="check-row"><input id="git-auto-commit" name="auto_commit" type="checkbox"><span><strong>Auto-commit</strong><small>Commit the Fileloom source scope automatically.</small></span></label>
-        <div class="dialog-grid"><label>Commit trigger<select id="git-commit-on" name="commit_on"><option value="build">After successful build</option><option value="change">After each source change</option></select></label><label>Remote name<input id="git-remote-name" name="remote" value="origin" autocomplete="off"></label><label>Branch<input id="git-branch-name" name="branch" placeholder="current branch" autocomplete="off"></label><label>Remote URL<input id="git-remote-url" name="remote_url" placeholder="git@github.com:you/site.git" autocomplete="off"></label></div>
+        <div class="dialog-grid"><label>Commit trigger<select id="git-commit-on" name="commit_on"><option value="build">After successful build</option><option value="change">After each source change</option></select></label><label>Remote name<input id="git-remote-name" name="remote" value="origin" autocomplete="off" required pattern="[A-Za-z0-9._-]+" title="Use letters, numbers, dots, underscores, or hyphens."></label><label>Branch<input id="git-branch-name" name="branch" placeholder="current branch" autocomplete="off" pattern="[A-Za-z0-9._/@-]+" title="Use a valid Git branch name."></label><label>Remote URL<input id="git-remote-url" name="remote_url" placeholder="git@github.com:you/site.git" autocomplete="off" inputmode="url"><small class="field-help">Optional when the remote is already configured.</small></label></div>
         <label class="check-row"><input id="git-auto-push" name="auto_push" type="checkbox"><span><strong>Auto-push</strong><small>Push after an automatic commit. Configure credentials outside Fileloom.</small></span></label>
         <div class="dialog-actions"><button type="button" id="git-cancel" class="button button-quiet">Cancel</button><button type="submit" id="git-save" class="button button-primary">Save Git settings</button></div>
       </form>
     </dialog>
+    <dialog id="discard-dialog" class="confirm-dialog">
+      <form method="dialog"><p class="kicker">Unsaved changes</p><h2>Discard Git settings?</h2><p>Any changes in this form will be lost. Only <strong>Save Git settings</strong> writes them to <code>site/site.json</code>.</p><div class="dialog-actions"><button value="cancel" class="button button-quiet">Keep editing</button><button value="discard" class="button button-dark">Discard changes</button></div></form>
+    </dialog>
+    <dialog id="check-dialog" class="revision-dialog"><div class="dialog-heading"><div><p class="kicker">Build report</p><h2>Link and accessibility checks</h2></div><button type="button" id="check-close" class="dialog-close" aria-label="Close">×</button></div><div id="check-list" class="revision-list"><p class="empty-cell">No issues found.</p></div></dialog>
+    <dialog id="revision-dialog" class="revision-dialog">
+      <div class="dialog-heading"><div><p class="kicker">Source history</p><h2 id="revision-title">Revisions</h2></div><button type="button" id="revision-close" class="dialog-close" aria-label="Close">×</button></div><div id="revision-list" class="revision-list"><p class="empty-cell">Loading history…</p></div>
+    </dialog>
+    <dialog id="theme-token-dialog" class="theme-token-dialog">
+      <form id="theme-token-form"><div class="dialog-heading"><div><p class="kicker">Theme tokens</p><h2 id="theme-token-title">Style tokens</h2></div><button type="button" id="theme-token-close" class="dialog-close" aria-label="Close">×</button></div><p class="dialog-help">Edit declared CSS custom properties without reformatting the stylesheet.</p><div id="theme-token-fields" class="token-fields"></div><div class="dialog-actions"><button type="button" id="theme-token-cancel" class="button button-quiet">Cancel</button><button type="submit" class="button button-primary">Save tokens</button></div></form>
+    </dialog>
     <p class="toast" id="toast" role="status" aria-live="polite"></p>
   </main>
-  <script src="/_cms/assets/admin.js?v=7"></script>
+  <script src="/_cms/assets/admin.js?v=8"></script>
 </body>
 </html>

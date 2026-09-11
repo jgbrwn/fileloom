@@ -146,3 +146,25 @@ code { padding: 2px 5px; border-radius: 5px; background: rgba(0,0,0,.06); font-s
 
 @media (max-width: 720px) { .topbar-inner, .app-shell { width: min(100% - 28px, 1240px); } .topnav a:not(.button) { display: none; } .intro-row { display: block; } .intro-actions { justify-content: start; margin-top: 24px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } .workspace-grid { grid-template-columns: 1fr; } .content-panel, .side-stack, .lower-grid { min-width: 0; width: 100%; } .panel-heading { display: block; } .filter-pills { justify-content: start; margin-top: 18px; } .side-stack { grid-template-columns: 1fr; } .form-grid, .dialog-grid { grid-template-columns: 1fr; } .form-field.full { grid-column: auto; } }
 @media (max-width: 460px) { .stats-grid { gap: 8px; } .stat-card { min-height: 120px; padding: 14px; } .stat-card strong { font-size: 2.1rem; } .app-shell { padding-top: 48px; } }
+
+.field-help { color: var(--muted); font-size: .68rem; font-weight: 500; letter-spacing: normal; text-transform: none; }
+.check-link { display: block; width: fit-content; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; }
+.check-link:hover { text-decoration: underline; }
+.confirm-dialog, .revision-dialog, .theme-token-dialog { width: min(560px, calc(100% - 28px)); padding: 0; border: 0; border-radius: 16px; color: var(--ink); background: var(--card); box-shadow: 0 24px 80px rgba(0,0,0,.28); }
+.confirm-dialog::backdrop, .revision-dialog::backdrop, .theme-token-dialog::backdrop { background: rgba(12,18,28,.52); backdrop-filter: blur(3px); }
+.confirm-dialog form, .revision-dialog, .theme-token-dialog form { padding: 28px; }
+.confirm-dialog h2 { margin: 0 0 10px; }
+.confirm-dialog p:not(.kicker) { color: var(--muted); font-size: .84rem; }
+.revision-list { display: grid; gap: 8px; max-height: min(52vh, 480px); overflow-y: auto; }
+.revision-row { display: flex; justify-content: space-between; align-items: center; gap: 15px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+.revision-row strong, .revision-row small { display: block; }
+.revision-row strong { font-size: .82rem; }
+.revision-row small { margin-top: 3px; color: var(--muted); font-size: .7rem; }
+.token-fields { display: grid; gap: 10px; max-height: min(58vh, 540px); overflow-y: auto; }
+.token-field { display: grid; grid-template-columns: minmax(130px, .8fr) 1.2fr; align-items: center; gap: 12px; }
+.token-field span { color: var(--muted); font: 700 .75rem/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.token-field input { min-width: 0; padding: 9px 10px; border: 1px solid #dfe3e9; border-radius: 8px; outline: 0; font: .82rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+.token-field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+button:disabled { cursor: not-allowed; opacity: .52; transform: none !important; }
+.git-actions { flex-wrap: wrap; }
+@media (max-width: 720px) { .token-field { grid-template-columns: 1fr; gap: 5px; } .git-actions .button { flex: 1 1 auto; } }

@@ -4,55 +4,84 @@ Fileloom is an HTML-first, filesystem-backed static CMS inspired by ShellCMS.
 
 > **The filesystem is the database. HTML is the content format. `public/` is the published site.**
 
-## Run it
+Fileloom is designed for a small exe.dev VM deployment, but the Go server can run anywhere with a filesystem and a reverse proxy.
+
+## What it does
+
+- Creates and visually edits ordinary HTML pages and posts with VvvebJs.
+- Preserves source front matter, comments, unknown metadata, and untouched HTML when visual content is saved.
+- Keeps filesystem revision snapshots with restore support.
+- Builds static pages, archives, tags, categories, RSS, sitemap, and media assets.
+- Supports drafts, private content, scheduled publishing, and a best-effort scheduler.
+- Runs link and accessibility checks during every build without checking external URLs.
+- Offers a CSS custom-property/theme-token editor that patches `style.css` in place.
+- Shows owner-only “Edit this page” controls on the public site.
+- Exports the generated site as a bounded ZIP containing only `site/public`.
+- Provides optional, separate Git integration for the website repository under `site/`.
+
+## Quick start
 
 ```bash
+cp .env.example .env
+# Edit .env and set FILELOOM_OWNER_EMAIL for your exe.dev account.
 make test
 make build
-./fileloom
+./fileloom -listen :8000 -site site -web web
 ```
 
-Open:
-
-- CMS: `http://localhost:8000/_cms/` (requires the configured `X-ExeDev-Email`)
-- public site: `http://localhost:8000/`
-- exe.dev: `https://YOUR_VM.exe.xyz/`
-
-The app creates a starter workspace on first run. Use another workspace with:
+The public site is available at `http://localhost:8000/`. CMS routes require an exact `X-ExeDev-Email` match, so local API testing can use a request such as:
 
 ```bash
-./fileloom -site ./my-site -web ./web -listen :8000
+curl -H 'X-ExeDev-Email: you@example.com' http://localhost:8000/_cms/api/site
 ```
 
-## Configuration
+For a browser-facing deployment, put Fileloom behind the exe.dev proxy or another trusted identity-aware proxy. Do not expose a second direct route to the Go process that bypasses the proxy/header boundary.
 
-The canonical URL used by RSS, sitemap, and feed links is resolved in this order:
+## Deploy on an exe.dev VM
 
-1. `-base-url`
-2. `FILELOOM_BASE_URL`
-3. `site.json` → `base_url`
-4. `http://localhost:8000`
+1. Clone the repository into the VM.
+2. Copy `.env.example` to `.env` and set:
 
-There is no `.env` loader in the Go binary. For the systemd deployment, copy `.env.example` to `.env`; `fileloom.service` loads that file with `EnvironmentFile`. Set `FILELOOM_OWNER_EMAIL` (or pass `-owner-email`) to the exe.dev account email allowed to access `/_cms`. Fileloom requires that value and an exact `X-ExeDev-Email` match; missing or mismatched requests receive a normal 404. Keep `.env` private and untracked.
+   ```dotenv
+   FILELOOM_OWNER_EMAIL=you@example.com
+   FILELOOM_BASE_URL=https://your-vm.exe.xyz
+   ```
 
-To authenticate through exe.dev before opening the CMS, visit `https://YOUR_VM.exe.xyz/__exe.dev/login?redirect=/_cms/`. The exe.dev proxy then supplies `X-ExeDev-Email` to Fileloom. Direct requests to the Go process must not be exposed as an alternate public path, because the header is trusted only when traffic arrives through the exe.dev proxy.
+3. Build and test:
+
+   ```bash
+   make test
+   make build
+   ```
+
+4. Edit `fileloom.service` so `WorkingDirectory`, `ExecStart`, and `EnvironmentFile` point at the clone.
+5. Install and enable the service:
+
+   ```bash
+   sudo cp fileloom.service /etc/systemd/system/fileloom.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now fileloom
+   ```
+
+6. Authenticate through exe.dev at:
+
+   ```text
+   https://YOUR_VM.exe.xyz/__exe.dev/login?redirect=/_cms/
+   ```
+
+The service loads `.env` through systemd. The Go binary itself intentionally does not parse dotenv files. If `FILELOOM_OWNER_EMAIL` is missing, CMS access fails closed with a 404.
 
 ## Workspace layout
 
 ```text
 site/
-├── content/
+├── content/                 # canonical HTML source
 │   ├── pages/about.html
 │   └── posts/2026/welcome-to-fileloom.html
-├── media/
-├── themes/
-│   ├── default/
-│   ├── midnight/
-│   ├── terminal/
-│   ├── editorial/
-│   ├── bento/
-│   └── brutalist/
-└── public/              # generated; safe to delete and rebuild
+├── media/                   # uploaded media
+├── themes/                  # plain HTML/CSS themes
+├── .fileloom/               # local revisions and build metadata; ignored
+└── public/                  # generated output; safe to delete and rebuild
 ```
 
 A source document looks like:
@@ -61,7 +90,7 @@ A source document looks like:
 ---
 title: Welcome to Fileloom
 slug: welcome-to-fileloom
-date: 2026-09-09
+date: 2026-09-11
 status: published
 tags: [fileloom, static-sites]
 category: Notes
@@ -71,9 +100,36 @@ excerpt: A short card description.
 <p>Ordinary HTML goes here.</p>
 ```
 
+Scheduled content adds an RFC3339 `publish_at` value:
+
+```yaml
+status: scheduled
+publish_at: 2026-09-15T14:00:00Z
+```
+
+## Editing and revisions
+
+The VvvebJs editor sends the edited body HTML to Fileloom. Fileloom patches only the body range of the source file instead of serializing the entire document. A SHA-256 precondition prevents an older editor tab from overwriting newer source changes.
+
+Before accepted content or theme-token changes, Fileloom stores a snapshot under `site/.fileloom/revisions/`. The dashboard’s **History** action lists snapshots and restores them by creating another safety snapshot first. These filesystem revisions are independent of optional site Git commits; Git remains a separate user-controlled history mechanism.
+
+## Build checks and export
+
+Each build stages output in a temporary directory, runs checks, and atomically swaps it into `site/public` only after generation succeeds. Checks report:
+
+- missing `html lang` attributes;
+- empty/missing document titles;
+- images without `alt` attributes;
+- likely unlabeled form controls; and
+- missing internal links or media targets.
+
+External URLs are not fetched. Use **Export ZIP** in the dashboard to download a bounded archive of generated `site/public` files only; source, Git metadata, revisions, and secrets are excluded.
+
 ## Git workflow
 
-Git integration is deliberately opt-in in `site/site.json`:
+Site Git is deliberately independent from Fileloom’s own development repository. The dashboard only uses a repository initialized at `site/.git`; it never discovers a parent repository.
+
+Git automation is opt-in in `site/site.json`:
 
 ```json
 "git": {
@@ -86,22 +142,29 @@ Git integration is deliberately opt-in in `site/site.json`:
 }
 ```
 
-The dashboard exposes repository status and manual commit/push controls. Keep `auto_push` off until the remote and credentials are configured.
+Remote credentials are never stored by Fileloom. Use SSH keys or a Git credential helper. Keep `auto_push` off until the remote and credentials are verified.
 
-## Theme workflow
+## Themes
 
-Themes are plain folders containing `theme.json`, HTML templates, and `assets/style.css`. The dashboard can activate themes and open a visual layout editor. The built-in themes are intentionally dependency-free; external HTML themes can be adapted by moving their layout into `layout.html`, replacing the page body with `{{content}}`, and preserving the Fileloom tokens.
+Themes are plain folders containing `theme.json`, HTML templates, and `assets/style.css`. The dashboard can activate themes, edit layout HTML visually, and edit CSS custom properties through the **Style tokens** editor. The built-in themes are intentionally inspectable and dependency-light.
 
-Good upstream sources to investigate include MIT-licensed Start Bootstrap templates and HTML5 UP themes. Check each theme's license and attribution requirements before bundling it.
+Generated pages include attribution links for [Fileloom](https://github.com/jgbrwn/fileloom) and [VvvebJs](https://github.com/givanz/VvvebJs). VvvebJs is vendored under `web/vvvebjs`; see [NOTICE](NOTICE) and its bundled Apache 2.0 license.
 
-## Run as a service
+Project development is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+
+- [Mobile dashboard](docs/screenshots/dashboard-mobile-clean.png)
+- [Theme-token editor](docs/screenshots/theme-tokens-mobile.png)
+
 
 ```bash
-sudo cp fileloom.service /etc/systemd/system/fileloom.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now fileloom
+make test       # go test ./...
+make build      # build ./fileloom
+make fmt        # gofmt the Go sources, when available
 ```
 
-## Current slice
+The project intentionally keeps the server standard-library-first. The HTML build checker uses `golang.org/x/net/html` for safe read-only parsing.
 
-The current vertical workflow is: create content → edit HTML visually → save source → build static pages, tag/category archives, yearly archives, RSS, sitemap, and media. Mobile editor controls, theme switching/editing, media uploads, draft publishing, and optional Git automation are included. Source-aware patch preservation, revision history, scheduling, and richer theme importing remain good next layers.
+## License
+
+Fileloom is licensed under the MIT License. See [LICENSE](LICENSE). Third-party notices are in [NOTICE](NOTICE). Deployment security guidance is in [SECURITY.md](SECURITY.md), with the detailed review in [docs/security-review.md](docs/security-review.md).

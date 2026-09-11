@@ -1,8 +1,8 @@
 {
   "title": "A Fileloom site",
   "description": "An HTML-first static site made with Fileloom.",
-  "base_url": "https://jgbrwn-playground.exe.xyz",
-  "theme": "terminal",
+  "base_url": "http://localhost:8000",
+  "theme": "brutalist",
   "footer": "Made with Fileloom.",
   "git": {
     "enabled": false,
@@ -10,6 +10,6 @@
     "auto_push": false,
     "commit_on": "build",
     "remote": "origin",
-    "branch": ""
+    "branch": "main"
   }
 }
