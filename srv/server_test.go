@@ -38,7 +38,7 @@ func TestFileloomBuildsFilesystemSite(t *testing.T) {
 
 func TestEditorSaveExtractsBodyAndRebuilds(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
-	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "")
+	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
@@ -46,6 +46,7 @@ func TestEditorSaveExtractsBodyAndRebuilds(t *testing.T) {
 	form := "file=pages%2Fabout.html&html=%3C%21doctype+html%3E%3Chtml%3E%3Cbody%3E%3Cp%3EChanged%3C%2Fp%3E%3C%2Fbody%3E%3C%2Fhtml%3E"
 	req := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
 	res := httptest.NewRecorder()
 	server.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
@@ -61,6 +62,55 @@ func TestEditorSaveExtractsBodyAndRebuilds(t *testing.T) {
 	}
 }
 
+func TestCMSRequiresConfiguredExeDevEmail(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	for _, test := range []struct {
+		name  string
+		email string
+		want  int
+	}{
+		{name: "missing header", want: http.StatusNotFound},
+		{name: "wrong account", email: "other@example.com", want: http.StatusNotFound},
+		{name: "accepted account", email: "owner@example.com", want: http.StatusOK},
+		{name: "accepted account case insensitive", email: "OWNER@EXAMPLE.COM", want: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/_cms/api/site", nil)
+			if test.email != "" {
+				req.Header.Set("X-ExeDev-Email", test.email)
+			}
+			res := httptest.NewRecorder()
+			server.Handler().ServeHTTP(res, req)
+			if res.Code != test.want {
+				t.Fatalf("CMS status = %d, want %d; body=%s", res.Code, test.want, res.Body)
+			}
+		})
+	}
+
+	redirectReq := httptest.NewRequest(http.MethodGet, "/_cms", nil)
+	redirectRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(redirectRes, redirectReq)
+	if redirectRes.Code != http.StatusNotFound {
+		t.Fatalf("unauthorized /_cms status = %d, want 404", redirectRes.Code)
+	}
+
+	unconfigured, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "")
+	if err != nil {
+		t.Fatalf("new unconfigured server: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/_cms/api/site", nil)
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	unconfigured.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("unconfigured CMS status = %d, want 404", res.Code)
+	}
+}
 func TestBaseURLOverrideAndGeneratedArchives(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	server, err := NewWithOptions(siteDir, filepath.Join(t.TempDir(), "web"), "", "example.test")

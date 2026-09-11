@@ -14,9 +14,9 @@ make build
 
 Open:
 
-- CMS: `http://localhost:8000/_cms/`
+- CMS: `http://localhost:8000/_cms/` (requires the configured `X-ExeDev-Email`)
 - public site: `http://localhost:8000/`
-- exe.dev: `https://jgbrwn-playground.exe.xyz/_cms/`
+- exe.dev: `https://YOUR_VM.exe.xyz/`
 
 The app creates a starter workspace on first run. Use another workspace with:
 
@@ -33,7 +33,9 @@ The canonical URL used by RSS, sitemap, and feed links is resolved in this order
 3. `site.json` → `base_url`
 4. `http://localhost:8000`
 
-There is no `.env` loader by default; `.env.example` documents the environment variables for systemd, containers, or a deployment wrapper. Set `FILELOOM_OWNER_EMAIL` (or pass `-owner-email`) to restrict CMS routes when the exe.dev proxy sends `X-ExeDev-Email`.
+There is no `.env` loader in the Go binary. For the systemd deployment, copy `.env.example` to `.env`; `fileloom.service` loads that file with `EnvironmentFile`. Set `FILELOOM_OWNER_EMAIL` (or pass `-owner-email`) to the exe.dev account email allowed to access `/_cms`. Fileloom requires that value and an exact `X-ExeDev-Email` match; missing or mismatched requests receive a normal 404. Keep `.env` private and untracked.
+
+To authenticate through exe.dev before opening the CMS, visit `https://YOUR_VM.exe.xyz/__exe.dev/login?redirect=/_cms/`. The exe.dev proxy then supplies `X-ExeDev-Email` to Fileloom. Direct requests to the Go process must not be exposed as an alternate public path, because the header is trusted only when traffic arrives through the exe.dev proxy.
 
 ## Workspace layout
 

@@ -1149,13 +1149,13 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/_cms" {
-		http.Redirect(w, r, "/_cms/", http.StatusFound)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/_cms") {
+	if r.URL.Path == "/_cms" || r.URL.Path == "/_cms/" || strings.HasPrefix(r.URL.Path, "/_cms/") {
 		if !s.cmsAllowed(r) {
-			writeJSONError(w, http.StatusForbidden, "CMS access is restricted to the configured owner")
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == "/_cms" {
+			http.Redirect(w, r, "/_cms/", http.StatusFound)
 			return
 		}
 		s.routeCMS(w, r)
@@ -1295,14 +1295,12 @@ func (s *Server) servePublic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cmsAllowed(r *http.Request) bool {
-	if s.OwnerEmail == "" {
-		return true
+	owner := strings.TrimSpace(s.OwnerEmail)
+	if owner == "" {
+		return false
 	}
 	email := strings.TrimSpace(r.Header.Get("X-ExeDev-Email"))
-	if email == "" {
-		return true
-	}
-	return strings.EqualFold(email, s.OwnerEmail)
+	return email != "" && strings.EqualFold(email, owner)
 }
 
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {

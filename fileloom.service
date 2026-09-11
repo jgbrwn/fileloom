@@ -12,7 +12,7 @@ Restart=always
 RestartSec=5
 Environment=HOME=/home/exedev
 Environment=USER=exedev
-Environment=FILELOOM_BASE_URL=https://jgbrwn-playground.exe.xyz
+EnvironmentFile=-/home/exedev/playground/fileloom/.env
 StandardOutput=journal
 StandardError=journal
 
