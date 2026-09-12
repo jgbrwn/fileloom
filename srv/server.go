@@ -3767,7 +3767,7 @@ func (s *Server) prepareVvvebEditor(source string, pagesJSON []byte, label strin
 	htmlSource = strings.ReplaceAll(htmlSource, `window.mediaPath = '../../media';`, `window.mediaPath = '/media'; window.mediaScanUrl = '/_cms/api/media'; window.uploadUrl = '/_cms/api/media?format=vvveb';`)
 	htmlSource = strings.Replace(htmlSource, "<script>\n\tlet renameUrl", `<script src="/_cms/assets/fileloom-vvveb.js"></script>
   <script>
-\tlet renameUrl`, 1)
+	let renameUrl`, 1)
 	htmlSource = strings.ReplaceAll(htmlSource, `Vvveb.themeBaseUrl = 'demo/landing/';`, `Vvveb.themeBaseUrl = '/_cms/vvveb/';`)
 	htmlSource = strings.ReplaceAll(htmlSource, `<script src="demo/landing/sections/sections.js"></script>`, "")
 	htmlSource = strings.ReplaceAll(htmlSource, `<script src="demo/landing/styles/styles.js"></script>`, "")

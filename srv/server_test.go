@@ -272,6 +272,9 @@ func TestVvvebMediaContractAndEditorIntegration(t *testing.T) {
 			t.Fatalf("editor integration missing %q", expected)
 		}
 	}
+	if strings.Contains(integration, `\tlet renameUrl`) {
+		t.Fatal("editor integration emitted a literal tab escape in JavaScript")
+	}
 }
 
 func TestGeneratedCodeAssets(t *testing.T) {
