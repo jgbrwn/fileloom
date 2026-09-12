@@ -71,12 +71,13 @@ type Server struct {
 }
 
 type SiteConfig struct {
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	BaseURL     string    `json:"base_url"`
-	Theme       string    `json:"theme"`
-	Footer      string    `json:"footer"`
-	Git         GitConfig `json:"git"`
+	Title        string    `json:"title"`
+	Description  string    `json:"description"`
+	BaseURL      string    `json:"base_url"`
+	Theme        string    `json:"theme"`
+	EditorEngine string    `json:"editor_engine,omitempty"`
+	Footer       string    `json:"footer"`
+	Git          GitConfig `json:"git"`
 }
 
 type GitConfig struct {
@@ -894,11 +895,57 @@ func fileSHA256(filePath string) string {
 }
 
 type sourceConflictError struct {
-	Path string
+	Path        string
+	ExpectedSHA string
+	ActualSHA   string
 }
 
 func (e *sourceConflictError) Error() string {
 	return fmt.Sprintf("%s changed since it was opened; reload before saving", e.Path)
+}
+
+type editorSaveRequest struct {
+	Path    string `json:"path"`
+	File    string `json:"file"`
+	HTML    string `json:"html"`
+	BaseSHA string `json:"base_sha256"`
+	Engine  string `json:"engine,omitempty"`
+	Theme   string `json:"theme,omitempty"`
+}
+
+type editorDocumentResponse struct {
+	SchemaVersion int            `json:"schema_version"`
+	Resource      string         `json:"resource"`
+	Path          string         `json:"path"`
+	Document      Document       `json:"document"`
+	HTML          string         `json:"html"`
+	SourceSHA256  string         `json:"source_sha256"`
+	PreviewURL    string         `json:"preview_url"`
+	Theme         string         `json:"theme"`
+	StylesheetCSS string         `json:"stylesheet_css,omitempty"`
+	MediaAPI      string         `json:"media_api"`
+	SaveAPI       string         `json:"save_api"`
+	Editor        map[string]any `json:"editor"`
+}
+
+func setETag(w http.ResponseWriter, sha string) {
+	if sha = strings.TrimSpace(sha); sha != "" {
+		w.Header().Set("ETag", `"`+sha+`"`)
+	}
+}
+
+func requestPreconditionSHA(r *http.Request, field string) string {
+	if value := strings.Trim(strings.TrimSpace(field), `"`); value != "" {
+		return value
+	}
+	value := strings.TrimSpace(r.Header.Get("If-Match"))
+	if strings.HasPrefix(value, "W/") {
+		value = strings.TrimSpace(strings.TrimPrefix(value, "W/"))
+	}
+	if strings.Contains(value, ",") {
+		return ""
+	}
+	return strings.Trim(value, `"`)
 }
 
 func writeAtomicFile(path string, data []byte) error {
@@ -1013,8 +1060,9 @@ func (s *Server) patchDocumentSource(pathValue string, body string, patchBody bo
 	if err != nil {
 		return Document{}, err
 	}
-	if baseSHA != "" && !strings.EqualFold(strings.TrimSpace(baseSHA), sourceSHA256(source.Source)) {
-		return Document{}, &sourceConflictError{Path: source.Document.Path}
+	actualSHA := sourceSHA256(source.Source)
+	if baseSHA != "" && !strings.EqualFold(strings.TrimSpace(baseSHA), actualSHA) {
+		return Document{}, &sourceConflictError{Path: source.Document.Path, ExpectedSHA: strings.TrimSpace(baseSHA), ActualSHA: actualSHA}
 	}
 	if err := s.recordRevision(source.Document.Path, reason); err != nil {
 		return Document{}, err
@@ -2831,6 +2879,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleItemsAPI(w, r)
 	case "/_cms/api/build":
 		s.handleBuildAPI(w, r)
+	case "/_cms/api/editor":
+		s.handleEditorAPI(w, r)
 	case "/_cms/api/editor-save":
 		s.handleEditorSaveAPI(w, r)
 	case "/_cms/api/media":
@@ -2862,6 +2912,88 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func normalizeEditorEngine(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "vvveb", nil
+	}
+	switch value {
+	case "vvveb", "deckflow":
+		return value, nil
+	default:
+		return "", errors.New("unsupported editor engine")
+	}
+}
+
+func (s *Server) editorEngineAvailable(engine string) bool {
+	switch engine {
+	case "vvveb":
+		return fileExists(filepath.Join(s.WebDir, "vvvebjs", "editor.html"))
+	case "deckflow":
+		return fileExists(filepath.Join(s.WebDir, "editor-dist", "index.html"))
+	default:
+		return false
+	}
+}
+
+func (s *Server) resolveEditorEngine(r *http.Request, config SiteConfig) (string, error) {
+	value := strings.TrimSpace(r.URL.Query().Get("engine"))
+	if value == "" {
+		value = config.EditorEngine
+	}
+	return normalizeEditorEngine(value)
+}
+
+func (s *Server) handleEditorAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowedAllow(w, "GET, HEAD")
+		return
+	}
+	pathValue := r.URL.Query().Get("path")
+	source, err := s.loadSourceDocument(pathValue)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	engine, err := s.resolveEditorEngine(r, config)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sha := sourceSHA256(source.Source)
+	setETag(w, sha)
+	response := editorDocumentResponse{
+		SchemaVersion: 1,
+		Resource:      "content",
+		Path:          source.Document.Path,
+		Document:      source.Document,
+		HTML:          source.Document.HTML,
+		SourceSHA256:  sha,
+		PreviewURL:    "/_cms/editor/frame?path=" + url.QueryEscape(source.Document.Path),
+		Theme:         config.Theme,
+		MediaAPI:      "/_cms/api/media",
+		SaveAPI:       "/_cms/api/editor-save",
+		Editor: map[string]any{
+			"selected": engine,
+			"engines": []map[string]any{
+				{"name": "vvveb", "available": s.editorEngineAvailable("vvveb")},
+				{"name": "deckflow", "available": s.editorEngineAvailable("deckflow")},
+			},
+		},
+	}
+	if _, cssPath, cssErr := themeStylesPath(s.SiteDir, config.Theme); cssErr == nil {
+		if css, readErr := os.ReadFile(cssPath); readErr == nil {
+			response.StylesheetCSS = string(css)
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleSiteAPI(w http.ResponseWriter, r *http.Request) {
@@ -3221,36 +3353,73 @@ func (s *Server) handleBuildAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "build": result})
 }
 
+func writeEditorConflict(w http.ResponseWriter, conflict *sourceConflictError) {
+	setETag(w, conflict.ActualSHA)
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"ok":              false,
+		"code":            "source_conflict",
+		"error":           conflict.Error(),
+		"path":            conflict.Path,
+		"expected_sha256": conflict.ExpectedSHA,
+		"current_sha256":  conflict.ActualSHA,
+		"reload_url":      "/_cms/api/editor?path=" + url.QueryEscape(conflict.Path),
+	})
+}
+
 func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
 		return
 	}
+	if !rejectOversizedDeclaredBody(w, r, maxEditorSize) {
+		return
+	}
 	limitRequestBody(w, r, maxEditorSize)
-	if err := r.ParseForm(); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+	isJSON := strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "application/json")
+	var input editorSaveRequest
+	if isJSON {
+		if err := decodeJSONBody(r, &input); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+	} else {
+		if err := r.ParseForm(); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		input = editorSaveRequest{
+			Path: r.FormValue("path"), File: r.FormValue("file"), HTML: r.FormValue("html"),
+			BaseSHA: r.FormValue("base_sha256"), Theme: r.FormValue("theme"), Engine: r.FormValue("engine"),
+		}
+	}
+	if input.Path == "" {
+		input.Path = input.File
+	}
+	if !isJSON && (strings.TrimSpace(input.Theme) != "" || strings.HasPrefix(strings.TrimPrefix(input.File, "/"), "themes/")) {
+		s.handleThemeSaveAPI(w, r, input.Theme, input.File)
 		return
 	}
-	if themeName := strings.TrimSpace(r.FormValue("theme")); themeName != "" || strings.HasPrefix(strings.TrimPrefix(r.FormValue("file"), "/"), "themes/") {
-		s.handleThemeSaveAPI(w, r, themeName, r.FormValue("file"))
+	baseSHA := requestPreconditionSHA(r, input.BaseSHA)
+	if isJSON && baseSHA == "" {
+		writeJSON(w, http.StatusPreconditionRequired, map[string]any{
+			"ok":    false,
+			"code":  "precondition_required",
+			"error": "base_sha256 or If-Match is required for JSON editor saves",
+		})
 		return
-	}
-	path := r.FormValue("file")
-	if path == "" {
-		path = r.FormValue("path")
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	original, err := s.loadSourceDocument(path)
+	original, err := s.loadSourceDocument(input.Path)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	updated, err := s.patchDocumentSource(path, extractBodyHTML(r.FormValue("html")), true, nil, r.FormValue("base_sha256"), "Edit "+path)
+	updated, err := s.patchDocumentSource(input.Path, extractBodyHTML(input.HTML), true, nil, baseSHA, "Edit "+input.Path)
 	if err != nil {
 		var conflict *sourceConflictError
 		if errors.As(err, &conflict) {
-			writeJSONError(w, http.StatusConflict, err.Error())
+			writeEditorConflict(w, conflict)
 			return
 		}
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -3273,7 +3442,9 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": updated.Path, "source_sha256": fileSHA256(filepath.Join(s.SiteDir, "content", filepath.FromSlash(updated.Path))), "build": build})
+	sha := fileSHA256(filepath.Join(s.SiteDir, "content", filepath.FromSlash(updated.Path)))
+	setETag(w, sha)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": updated.Path, "source_sha256": sha, "document": updated, "build": build})
 }
 
 func normalizeThemeLayoutPath(value string) (string, string, error) {
@@ -3697,6 +3868,24 @@ func (s *Server) handleEditor(w http.ResponseWriter, r *http.Request) {
 	doc, err := s.loadDocument(path)
 	if err != nil {
 		http.Error(w, "Content item not found", http.StatusNotFound)
+		return
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	engine, err := s.resolveEditorEngine(r, config)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if engine == "deckflow" {
+		if !s.editorEngineAvailable(engine) {
+			http.Error(w, "Deckflow editor is not installed", http.StatusNotImplemented)
+			return
+		}
+		s.serveWebFile(w, r, filepath.ToSlash(filepath.Join("editor-dist", "index.html")))
 		return
 	}
 	sourcePath, _, err := safeResolvedPath(s.WebDir, filepath.ToSlash(filepath.Join("vvvebjs", "editor.html")))

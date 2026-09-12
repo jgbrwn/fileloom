@@ -3,6 +3,7 @@
   "description": "An HTML-first static site made with Fileloom.",
   "base_url": "http://localhost:8000",
   "theme": "brutalist",
+  "editor_engine": "deckflow",
   "footer": "Made with Fileloom.",
   "git": {
     "enabled": false,

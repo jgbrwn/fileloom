@@ -112,9 +112,12 @@ publish_at: 2026-09-15T14:00:00Z
 
 ## Editing and revisions
 
-The VvvebJs editor sends the edited body HTML to Fileloom. Fileloom patches only the body range of the source file instead of serializing the entire document. A SHA-256 precondition prevents an older editor tab from overwriting newer source changes.
+Fileloom's editor engine is selected by `site.json` with `editor_engine`. The active site uses the new Deckflow-backed editor; VvvebJs remains available during the transition with `?engine=vvveb`. Both editors send edited body HTML to the same source-preserving save boundary. Fileloom patches only the body range of the source file instead of serializing the entire document. A SHA-256 precondition prevents an older editor tab from overwriting newer source changes.
+
+The new editor source is under `web/editor`; rebuild its checked-in static bundle with `make editor-build`. The longer-term editor migration and comments architecture are documented in [docs/editor-migration.md](docs/editor-migration.md) and [docs/comments-plan.md](docs/comments-plan.md).
 
 Before accepted content or theme-token changes, Fileloom stores a snapshot under `site/.fileloom/revisions/`. The dashboard's **History** action lists snapshots and restores them by creating another safety snapshot first. Revisions are bounded to 100 snapshots per path and 128 MiB across the workspace; the newest snapshots are retained. These filesystem revisions are independent of optional site Git commits; Git remains a separate user-controlled history mechanism.
+
 
 Uploads retain the existing 16 MiB request limit and filename allowlist. SVG uploads are sanitized through an XML allowlist: scripts, event handlers, foreign content, external references, directives, and unsafe attributes are removed or rejected. Other media formats are copied unchanged. Uploads are written to a temporary file and renamed only after the copy and SVG sanitization succeed.
 

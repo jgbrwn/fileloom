@@ -1,5 +1,6 @@
 # local build output
 /fileloom
+/web/editor/node_modules/
 
 # generated site output
 /site/public/
