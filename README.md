@@ -153,6 +153,12 @@ Remote credentials are never stored by Fileloom. Use SSH keys or a Git credentia
 No CSP is enabled by default, preserving existing editor and theme behavior. To opt in, set `FILELOOM_CMS_CSP=default` for the CMS/editor profile and/or `FILELOOM_PUBLIC_CSP=default` for the generated-site profile. You can provide a complete policy value instead of `default`; public themes may require a customized policy for external assets or scripts. Direct SVG responses always receive a restrictive media policy.
 
 
+## Code blocks and media
+
+The visual editor includes a **Code block** helper that creates a semantic `<pre><code>` pair with selectable languages. Generated pages include a small dependency-free highlighter and theme-integrated CSS; themes can override `--fileloom-code-*` variables in their stylesheet.
+
+The media panel supports multi-file selection and drag-and-drop uploads. Fileloom accepts AVIF, GIF, JPEG, JPG, PNG, SVG, and WebP images, plus the existing audio/video/PDF formats. SVG uploads are sanitized before storage. Public content uses `/media/...` URLs while uploads and media scanning remain owner-only CMS operations.
+
 Themes are plain folders containing `theme.json`, HTML templates, and `assets/style.css`. The dashboard can activate themes, edit layout HTML visually, and edit CSS custom properties through the **Style tokens** editor. The built-in themes are intentionally inspectable and dependency-light.
 
 Generated pages include attribution links for [Fileloom](https://github.com/jgbrwn/fileloom) and [VvvebJs](https://github.com/givanz/VvvebJs). VvvebJs is vendored under `web/vvvebjs`; see [NOTICE](NOTICE) and its bundled Apache 2.0 license.

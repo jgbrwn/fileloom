@@ -221,6 +221,80 @@ func TestScheduledPublishingAndPublicOwnerToolbar(t *testing.T) {
 	}
 }
 
+func TestVvvebMediaContractAndEditorIntegration(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(siteDir, "media", "sample.png"), []byte("png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	getReq := httptest.NewRequest(http.MethodGet, "/_cms/api/media", nil)
+	getReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	getRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(getRes, getReq)
+	if getRes.Code != http.StatusOK {
+		t.Fatalf("media tree status = %d: %s", getRes.Code, getRes.Body)
+	}
+	var tree map[string]any
+	if err := json.Unmarshal(getRes.Body.Bytes(), &tree); err != nil {
+		t.Fatal(err)
+	}
+	if tree["type"] != "folder" || tree["name"] != "" {
+		t.Fatalf("unexpected Vvveb media root: %#v", tree)
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "contract.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(part, "png")
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	uploadReq := httptest.NewRequest(http.MethodPost, "/_cms/api/media?format=vvveb", &body)
+	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
+	uploadReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	uploadRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(uploadRes, uploadReq)
+	if uploadRes.Code != http.StatusCreated || strings.TrimSpace(uploadRes.Body.String()) != "contract.png" {
+		t.Fatalf("Vvveb upload response = %d %q", uploadRes.Code, uploadRes.Body.String())
+	}
+	source, err := os.ReadFile(filepath.Join(server.WebDir, "vvvebjs", "editor.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	integration := server.prepareVvvebEditor(string(source), []byte(`{"current":{}}`), "test")
+	for _, expected := range []string{"/_cms/assets/fileloom-vvveb.js", "window.mediaPath = '/media'", "format=vvveb"} {
+		if !strings.Contains(integration, expected) {
+			t.Fatalf("editor integration missing %q", expected)
+		}
+	}
+}
+
+func TestGeneratedCodeAssets(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	index, err := os.ReadFile(filepath.Join(siteDir, "public", "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(index), "/theme/fileloom-code.css") || !strings.Contains(string(index), "/theme/fileloom-code.js") {
+		t.Fatalf("generated page missing code assets")
+	}
+	for _, name := range []string{"fileloom-code.css", "fileloom-code.js"} {
+		if _, err := os.Stat(filepath.Join(siteDir, "public", "theme", name)); err != nil {
+			t.Fatalf("generated code asset %s missing: %v", name, err)
+		}
+	}
+	_ = server
+}
+
 func TestThemeTokensAndExport(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")

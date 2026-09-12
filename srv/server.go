@@ -1396,6 +1396,18 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	if err := copyDir(filepath.Join(s.SiteDir, "media"), filepath.Join(outputDir, "media")); err != nil {
 		return BuildResult{}, fmt.Errorf("copy media: %w", err)
 	}
+	for _, asset := range []string{"fileloom-code.css", "fileloom-code.js"} {
+		data, assetErr := readWebAsset(s.WebDir, asset)
+		if errors.Is(assetErr, os.ErrNotExist) {
+			continue
+		}
+		if assetErr != nil {
+			return BuildResult{}, fmt.Errorf("read Fileloom code asset %s: %w", asset, assetErr)
+		}
+		if err := writePublic(filepath.Join(outputDir, "theme", asset), string(data)); err != nil {
+			return BuildResult{}, err
+		}
+	}
 
 	layout, err := readThemeTemplateSafe(themeDir, "layout.html", defaultLayoutTemplate)
 	if err != nil {
@@ -1895,6 +1907,16 @@ func (s *Server) activateTheme(name string) error {
 	}
 	return s.gitChangeIfConfigured("Activate theme " + name)
 }
+func readWebAsset(webDir, name string) ([]byte, error) {
+	path, info, err := safeResolvedPath(webDir, name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("web asset must be a regular file")
+	}
+	return os.ReadFile(path)
+}
 func readThemeTemplate(themeDir, name, fallback string) string {
 	contents, err := readThemeTemplateSafe(themeDir, name, fallback)
 	if err != nil {
@@ -2099,8 +2121,45 @@ func privateGeneratedPath(rel string) bool {
 	return false
 }
 
+func codeAssetsAvailable(path string) bool {
+	directory := filepath.Dir(path)
+	for range 5 {
+		if fileExists(filepath.Join(directory, "theme", "fileloom-code.css")) && fileExists(filepath.Join(directory, "theme", "fileloom-code.js")) {
+			return true
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			break
+		}
+		directory = parent
+	}
+	return false
+}
+func ensureCodeAssets(source string) string {
+	if !strings.Contains(source, "/theme/fileloom-code.css") {
+		link := `<link rel="stylesheet" href="/theme/fileloom-code.css">`
+		if index := strings.Index(strings.ToLower(source), "</head>"); index >= 0 {
+			source = source[:index] + link + source[index:]
+		} else {
+			source = link + source
+		}
+	}
+	if !strings.Contains(source, "/theme/fileloom-code.js") {
+		script := `<script src="/theme/fileloom-code.js" defer></script>`
+		if index := strings.Index(strings.ToLower(source), "</body>"); index >= 0 {
+			source = source[:index] + script + source[index:]
+		} else {
+			source += script
+		}
+	}
+	return source
+}
+
 func writePublic(path, contents string) error {
 	if strings.EqualFold(filepath.Ext(path), ".html") {
+		if codeAssetsAvailable(path) {
+			contents = ensureCodeAssets(contents)
+		}
 		contents = ensureAttribution(contents)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -3705,7 +3764,10 @@ func (s *Server) prepareVvvebEditor(source string, pagesJSON []byte, label strin
 	htmlSource := source
 	htmlSource = strings.ReplaceAll(htmlSource, `<base href="">`, `<base href="/_cms/vvveb/">`)
 	htmlSource = strings.ReplaceAll(htmlSource, `<title>VvvebJs</title>`, `<title>Fileloom · Visual editor</title>`)
-	htmlSource = strings.ReplaceAll(htmlSource, `window.mediaPath = '../../media';`, `window.mediaPath = '/_cms/media/'; window.mediaScanUrl = '/_cms/api/media'; window.uploadUrl = '/_cms/api/media';`)
+	htmlSource = strings.ReplaceAll(htmlSource, `window.mediaPath = '../../media';`, `window.mediaPath = '/media'; window.mediaScanUrl = '/_cms/api/media'; window.uploadUrl = '/_cms/api/media?format=vvveb';`)
+	htmlSource = strings.Replace(htmlSource, "<script>\n\tlet renameUrl", `<script src="/_cms/assets/fileloom-vvveb.js"></script>
+  <script>
+\tlet renameUrl`, 1)
 	htmlSource = strings.ReplaceAll(htmlSource, `Vvveb.themeBaseUrl = 'demo/landing/';`, `Vvveb.themeBaseUrl = '/_cms/vvveb/';`)
 	htmlSource = strings.ReplaceAll(htmlSource, `<script src="demo/landing/sections/sections.js"></script>`, "")
 	htmlSource = strings.ReplaceAll(htmlSource, `<script src="demo/landing/styles/styles.js"></script>`, "")
@@ -3837,7 +3899,16 @@ func (s *Server) handleMediaAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	root := filepath.Join(s.SiteDir, "media")
-	result, err := mediaTree(root)
+	if r.URL.Query().Get("format") == "flat" {
+		result, err := mediaTree(root)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	result, err := mediaVvvebTree(root)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -3869,8 +3940,24 @@ func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "media root is not safe: "+err.Error())
 		return
 	}
-	name = uniqueMediaName(root, name)
-	path := filepath.Join(root, name)
+	mediaRelative, err := normalizeMediaDirectory(r.FormValue("mediaPath"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if mediaRelative != "" {
+		if err := rejectSymlinkPath(root, mediaRelative); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "media directory is not safe: "+err.Error())
+			return
+		}
+	}
+	mediaDir := filepath.Join(root, filepath.FromSlash(mediaRelative))
+	if err := os.MkdirAll(mediaDir, 0o755); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	name = uniqueMediaName(mediaDir, name)
+	path := filepath.Join(mediaDir, name)
 	uploadTempDir := filepath.Join(s.SiteDir, ".fileloom", "uploads")
 	if err := rejectExistingSymlinkComponents(s.SiteDir, ".fileloom/uploads"); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "upload staging path is not safe: "+err.Error())
@@ -3936,7 +4023,14 @@ func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "name": name, "path": name, "url": "/media/" + url.PathEscape(name)})
+	if r.URL.Query().Get("format") == "vvveb" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, name)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "name": name, "path": filepath.ToSlash(filepath.Join(mediaRelative, name)), "url": mediaURLPath(mediaRelative, name)})
 }
 
 const svgNamespace = "http://www.w3.org/2000/svg"
@@ -4167,6 +4261,33 @@ func safeSVGAttributeValue(name, value string) bool {
 	}
 	return true
 }
+func normalizeMediaDirectory(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "/media" || value == "media" || value == "/media/" || value == "media/" {
+		return "", nil
+	}
+	value = strings.TrimPrefix(value, "/")
+	if !strings.HasPrefix(value, "media/") {
+		return "", errors.New("media directory must be under /media")
+	}
+	value = strings.TrimPrefix(value, "media/")
+	clean, err := safeRelativePath(value)
+	if err != nil || privateGeneratedPath(clean) {
+		return "", errors.New("invalid media directory")
+	}
+	return clean, nil
+}
+
+func mediaURLPath(directory, name string) string {
+	parts := []string{"/media"}
+	if directory != "" {
+		for _, part := range strings.Split(filepath.ToSlash(directory), "/") {
+			parts = append(parts, url.PathEscape(part))
+		}
+	}
+	parts = append(parts, url.PathEscape(name))
+	return strings.Join(parts, "/")
+}
 func allowedMediaName(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
@@ -4185,6 +4306,60 @@ func uniqueMediaName(root, name string) string {
 		candidate = fmt.Sprintf("%s-%d%s", base, i, ext)
 	}
 	return candidate
+}
+
+func mediaVvvebTree(root string) (map[string]any, error) {
+	info, err := os.Lstat(root)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, errors.New("media root must be a directory")
+	}
+	return mediaVvvebFolder(root, "")
+}
+
+func mediaVvvebFolder(root, relative string) (map[string]any, error) {
+	directory := filepath.Join(root, filepath.FromSlash(relative))
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return nil, fmt.Errorf("symlinks are not allowed in media: %s", filepath.Join(directory, entry.Name()))
+		}
+		if privateGeneratedPath(entry.Name()) {
+			continue
+		}
+		childRelative := filepath.ToSlash(filepath.Join(strings.TrimPrefix(relative, "/"), entry.Name()))
+		childPath := filepath.Join(directory, entry.Name())
+		childDisplayPath := "/" + childRelative
+		if entry.IsDir() {
+			folder, err := mediaVvvebFolder(root, childRelative)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, folder)
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("non-regular media file is not allowed: %s", childPath)
+		}
+		items = append(items, map[string]any{"name": entry.Name(), "type": "file", "path": childDisplayPath, "size": info.Size()})
+	}
+	name := ""
+	path := ""
+	if relative != "" {
+		name = filepath.Base(filepath.FromSlash(relative))
+		path = "/" + filepath.ToSlash(strings.TrimPrefix(relative, "/"))
+	}
+	return map[string]any{"name": name, "type": "folder", "path": path, "items": items}, nil
 }
 
 func mediaTree(root string) ([]map[string]any, error) {
