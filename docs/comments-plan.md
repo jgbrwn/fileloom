@@ -1,12 +1,14 @@
 # Comments engine plan
 
+> **Status — September 13, 2026:** Design-only. No comments routes, store/schema, widget, stable document ID, moderation workflow, identity system, or comment-specific backup/export integration exists yet. No provider has been selected.
+
 Comments are a later, dynamic subsystem. They should not be written into `site/content`, `site/public`, generated exports, or the static Git scope.
 
 ## Recommended boundary
 
 Add a private comment store under `site/.fileloom/` or a separately configured data directory, with APIs under `/_cms/api/comments/...` and a public same-origin widget/HTML endpoint. The static site should contain only the page's stable comment key and widget configuration; comment data remains dynamic.
 
-Prefer a stable immutable document ID in front matter. URL slugs and paths can change, so they should be stored as current display metadata, not used as the only identity key.
+Prefer a stable immutable document ID in front matter. The current `Document` model has path/slug metadata but no immutable ID; add and backfill this identifier before implementing comments. Paths and slugs are mutable display metadata, not sufficient long-term identity keys.
 
 ## Reusable ideas from `my-upc-v2`
 
@@ -34,4 +36,4 @@ Fileloom should not introduce a second owner password, a moderation key in URLs,
 - **giscus:** easy GitHub-backed experiment, but not Fileloom-owned identity or storage.
 - **Roll our own:** justified only if comments must be filesystem/Git-native or tightly coupled to Fileloom revisions and publishing.
 
-The first comments milestone should be a decision spike, not implementation: define anonymous/authenticated identity, moderation policy, cache behavior, stable document identity, backup/restore, and whether a hosted/self-hosted sidecar is acceptable.
+The first comments milestone remains a decision spike, not implementation. The next gates are: choose in-process versus hosted/sidecar storage; define identity, moderation, spam/rate limits, CSRF, privacy, caching, backup/restore, and export/Git boundaries; specify path/slug migration using immutable IDs; then prototype a read-only widget before accepting public writes.

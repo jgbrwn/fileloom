@@ -921,6 +921,7 @@ type editorDocumentResponse struct {
 	HTML          string         `json:"html"`
 	SourceSHA256  string         `json:"source_sha256"`
 	PreviewURL    string         `json:"preview_url"`
+	PublicURL     string         `json:"public_url"`
 	Theme         string         `json:"theme"`
 	StylesheetCSS string         `json:"stylesheet_css,omitempty"`
 	MediaAPI      string         `json:"media_api"`
@@ -2977,6 +2978,7 @@ func (s *Server) handleEditorAPI(w http.ResponseWriter, r *http.Request) {
 		HTML:          source.Document.HTML,
 		SourceSHA256:  sha,
 		PreviewURL:    "/_cms/editor/frame?path=" + url.QueryEscape(source.Document.Path),
+		PublicURL:     source.Document.URL,
 		Theme:         config.Theme,
 		MediaAPI:      "/_cms/api/media",
 		SaveAPI:       "/_cms/api/editor-save",
@@ -4540,7 +4542,11 @@ func mediaVvvebFolder(root, relative string) (map[string]any, error) {
 		if !info.Mode().IsRegular() {
 			return nil, fmt.Errorf("non-regular media file is not allowed: %s", childPath)
 		}
-		items = append(items, map[string]any{"name": entry.Name(), "type": "file", "path": childDisplayPath, "size": info.Size()})
+		fileDirectory := filepath.ToSlash(filepath.Dir(filepath.FromSlash(childRelative)))
+		if fileDirectory == "." {
+			fileDirectory = ""
+		}
+		items = append(items, map[string]any{"name": entry.Name(), "type": "file", "path": childDisplayPath, "url": mediaURLPath(fileDirectory, entry.Name()), "size": info.Size()})
 	}
 	name := ""
 	path := ""
@@ -4582,9 +4588,13 @@ func mediaTree(root string) ([]map[string]any, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		fileDirectory := filepath.ToSlash(filepath.Dir(filepath.FromSlash(rel)))
+		if fileDirectory == "." {
+			fileDirectory = ""
+		}
 		files = append(files, map[string]any{
 			"name": filepath.Base(rel), "type": "file", "path": rel,
-			"size": info.Size(),
+			"url": mediaURLPath(fileDirectory, filepath.Base(rel)), "size": info.Size(),
 		})
 		return nil
 	})

@@ -86,6 +86,7 @@ func TestEditorAPIGetAndJSONSaveContract(t *testing.T) {
 	var opened struct {
 		HTML         string `json:"html"`
 		SourceSHA256 string `json:"source_sha256"`
+		PublicURL    string `json:"public_url"`
 		Editor       struct {
 			Selected string `json:"selected"`
 		} `json:"editor"`
@@ -95,6 +96,9 @@ func TestEditorAPIGetAndJSONSaveContract(t *testing.T) {
 	}
 	if !strings.Contains(opened.HTML, "ordinary HTML file") || opened.SourceSHA256 == "" || opened.Editor.Selected != "vvveb" {
 		t.Fatalf("unexpected editor document: %#v", opened)
+	}
+	if opened.PublicURL != "/about/" {
+		t.Fatalf("unexpected public URL: %q", opened.PublicURL)
 	}
 	deckflowReq := httptest.NewRequest(http.MethodGet, "/_cms/api/editor?path=pages%2Fabout.html&engine=deckflow", nil)
 	deckflowReq.Header.Set("X-ExeDev-Email", "owner@example.com")
@@ -350,6 +354,30 @@ func TestVvvebMediaContractAndEditorIntegration(t *testing.T) {
 	}
 	if tree["type"] != "folder" || tree["name"] != "" {
 		t.Fatalf("unexpected Vvveb media root: %#v", tree)
+	}
+	items, ok := tree["items"].([]any)
+	if !ok || len(items) == 0 {
+		t.Fatalf("media tree has no items: %#v", tree)
+	}
+	var hasSampleURL func([]any) bool
+	hasSampleURL = func(values []any) bool {
+		for _, value := range values {
+			item, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			if item["url"] == "/media/sample.png" {
+				return true
+			}
+			children, _ := item["items"].([]any)
+			if hasSampleURL(children) {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasSampleURL(items) {
+		t.Fatalf("media item URL missing: %#v", tree)
 	}
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
