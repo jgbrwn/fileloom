@@ -35,16 +35,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-VvvebJs
--------
-
-Fileloom includes a vendored copy of VvvebJs under web/vvvebjs. VvvebJs is
-licensed under the Apache License, Version 2.0. Its license and credits are
-included at:
-
-  web/vvvebjs/LICENSE
-  web/vvvebjs/Credits.md
-
 Built-in themes
 ---------------
 

@@ -834,6 +834,10 @@ async function insertBlock(type) {
 }
 
 function flattenMedia(node, result = []) {
+  if (Array.isArray(node)) {
+    node.forEach((child) => flattenMedia(child, result));
+    return result;
+  }
   if (!node) return result;
   if (node.type === "file") result.push(node);
   for (const child of node.items || []) flattenMedia(child, result);

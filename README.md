@@ -8,7 +8,7 @@ Fileloom is designed for a small exe.dev VM deployment, but the Go server can ru
 
 ## What it does
 
-- Creates and visually edits ordinary HTML pages and posts with Deckflow; VvvebJs remains available as a compatibility fallback during the migration.
+- Creates and visually edits ordinary HTML pages and posts with Deckflow.
 - Preserves source front matter, comments, unknown metadata, and untouched HTML when visual content is saved.
 - Keeps filesystem revision snapshots with restore support.
 - Builds static pages, archives, tags, categories, RSS, sitemap, and media assets.
@@ -112,7 +112,7 @@ publish_at: 2026-09-15T14:00:00Z
 
 ## Editing and revisions
 
-Fileloom's editor engine is selected by `site.json` with `editor_engine`. The active site uses the new Deckflow-backed editor; VvvebJs remains available during the transition with `?engine=vvveb`. Both editors send edited body HTML to the same source-preserving save boundary. Fileloom patches only the body range of the source file instead of serializing the entire document. A SHA-256 precondition prevents an older editor tab from overwriting newer source changes.
+Fileloom's editor engine is Deckflow, selected by `site.json` with `editor_engine`. The editor sends edited body HTML to the source-preserving save boundary, while theme layouts use the separate protected-slot theme-layout mode. Fileloom patches only the relevant source range instead of serializing the entire document. A SHA-256 precondition prevents an older editor tab from overwriting newer source changes.
 
 The new editor source is under `web/editor`; rebuild its checked-in static bundle with `make editor-build`. The first time you run the browser suite, install its Chromium with `npx --prefix web/editor playwright install chromium`. Run the desktop/tablet/Android-sized regression matrix with `FILELOOM_E2E_EMAIL=you@example.com make editor-test`; it starts an isolated temporary Go site/server by default, or set `FILELOOM_E2E_URL` to exercise an existing server. The longer-term editor migration and comments architecture are documented in [docs/editor-migration.md](docs/editor-migration.md) and [docs/comments-plan.md](docs/comments-plan.md). The Deckflow migration is experimental: selection-aware block insertion, duplicate/delete/move actions, and a safe link/image property inspector fall back safely when needed, the media panel supports image selection/upload, drag/drop, contextual placement, and selected-image replacement, the Details sheet handles supported metadata/status/revision actions, code blocks use the legacy semantic language/highlighting contract, theme layouts/tokens remain in the CMS workflow, Preview renders the current page through the active theme template/layout without writing source or generated output, and keyboard editing/undo/redo paths are covered across desktop, tablet, and Android-sized Chromium.
 
@@ -164,7 +164,7 @@ The media panel supports multi-file selection and drag-and-drop uploads. Fileloo
 
 Themes are plain folders containing `theme.json`, HTML templates, and `assets/style.css`. The dashboard can activate themes, edit layout HTML visually, and edit CSS custom properties through the **Style tokens** editor. The built-in themes are intentionally inspectable and dependency-light.
 
-Generated pages include attribution links for [Fileloom](https://github.com/jgbrwn/fileloom) and [VvvebJs](https://github.com/givanz/VvvebJs). VvvebJs is vendored under `web/vvvebjs`; see [NOTICE](NOTICE) and its bundled Apache 2.0 license.
+Generated pages include an attribution link for [Fileloom](https://github.com/jgbrwn/fileloom). The checked-in Deckflow bundle and its MIT license are documented in [NOTICE](NOTICE).
 
 Project development is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 

@@ -519,87 +519,7 @@ func TestScheduledPublishingAndPublicOwnerToolbar(t *testing.T) {
 	}
 }
 
-func TestVvvebMediaContractAndEditorIntegration(t *testing.T) {
-	siteDir := filepath.Join(t.TempDir(), "site")
-	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
-	if err != nil {
-		t.Fatalf("new server: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(siteDir, "media", "sample.png"), []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	getReq := httptest.NewRequest(http.MethodGet, "/_cms/api/media", nil)
-	getReq.Header.Set("X-ExeDev-Email", "owner@example.com")
-	getRes := httptest.NewRecorder()
-	server.Handler().ServeHTTP(getRes, getReq)
-	if getRes.Code != http.StatusOK {
-		t.Fatalf("media tree status = %d: %s", getRes.Code, getRes.Body)
-	}
-	var tree map[string]any
-	if err := json.Unmarshal(getRes.Body.Bytes(), &tree); err != nil {
-		t.Fatal(err)
-	}
-	if tree["type"] != "folder" || tree["name"] != "" {
-		t.Fatalf("unexpected Vvveb media root: %#v", tree)
-	}
-	items, ok := tree["items"].([]any)
-	if !ok || len(items) == 0 {
-		t.Fatalf("media tree has no items: %#v", tree)
-	}
-	var hasSampleURL func([]any) bool
-	hasSampleURL = func(values []any) bool {
-		for _, value := range values {
-			item, ok := value.(map[string]any)
-			if !ok {
-				continue
-			}
-			if item["url"] == "/media/sample.png" {
-				return true
-			}
-			children, _ := item["items"].([]any)
-			if hasSampleURL(children) {
-				return true
-			}
-		}
-		return false
-	}
-	if !hasSampleURL(items) {
-		t.Fatalf("media item URL missing: %#v", tree)
-	}
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("file", "contract.png")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = io.WriteString(part, "png")
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	uploadReq := httptest.NewRequest(http.MethodPost, "/_cms/api/media?format=vvveb", &body)
-	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
-	uploadReq.Header.Set("X-ExeDev-Email", "owner@example.com")
-	uploadRes := httptest.NewRecorder()
-	server.Handler().ServeHTTP(uploadRes, uploadReq)
-	if uploadRes.Code != http.StatusCreated || strings.TrimSpace(uploadRes.Body.String()) != "contract.png" {
-		t.Fatalf("Vvveb upload response = %d %q", uploadRes.Code, uploadRes.Body.String())
-	}
-	source, err := os.ReadFile(filepath.Join(server.WebDir, "vvvebjs", "editor.html"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	integration := server.prepareVvvebEditor(string(source), []byte(`{"current":{}}`), "test")
-	for _, expected := range []string{"/_cms/assets/fileloom-vvveb.js", "window.mediaPath = '/media'", "format=vvveb"} {
-		if !strings.Contains(integration, expected) {
-			t.Fatalf("editor integration missing %q", expected)
-		}
-	}
-	if strings.Contains(integration, `\tlet renameUrl`) {
-		t.Fatal("editor integration emitted a literal tab escape in JavaScript")
-	}
-}
-
-func TestDeckflowEditorRouteAndVvvebFallback(t *testing.T) {
+func TestDeckflowEditorRoute(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
 	if err != nil {
@@ -624,9 +544,9 @@ func TestDeckflowEditorRouteAndVvvebFallback(t *testing.T) {
 	if deckflow.Code != http.StatusOK || !strings.Contains(deckflow.Body.String(), "/_cms/assets/editor-dist/assets/") {
 		t.Fatalf("Deckflow editor route = %d: %s", deckflow.Code, deckflow.Body)
 	}
-	vvveb := request("&engine=vvveb")
-	if vvveb.Code != http.StatusOK || !strings.Contains(vvveb.Body.String(), "fileloom-vvveb.js") {
-		t.Fatalf("Vvveb fallback route = %d: %s", vvveb.Code, vvveb.Body)
+	unsupported := request("&engine=legacy")
+	if unsupported.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported editor route = %d: %s", unsupported.Code, unsupported.Body)
 	}
 }
 
@@ -1459,7 +1379,7 @@ func TestEditorPreviewUsesPostTemplate(t *testing.T) {
 		t.Fatalf("post preview = %d: %s", res.Code, res.Body)
 	}
 }
-func TestDeckflowWorksWithoutVvvebAssets(t *testing.T) {
+func TestDeckflowWorksWithoutLegacyAssets(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	webDir := filepath.Join(t.TempDir(), "web")
 	copyTree := func(sourceRoot, targetRoot string) error {
@@ -1513,15 +1433,8 @@ func TestDeckflowWorksWithoutVvvebAssets(t *testing.T) {
 	pageReq.Header.Set("X-ExeDev-Email", "owner@example.com")
 	pageRes := httptest.NewRecorder()
 	server.Handler().ServeHTTP(pageRes, pageReq)
-	if pageRes.Code != http.StatusOK || strings.Contains(pageRes.Body.String(), "fileloom-vvveb.js") {
+	if pageRes.Code != http.StatusOK {
 		t.Fatalf("Deckflow-only editor route = %d: %s", pageRes.Code, pageRes.Body)
-	}
-	fallbackReq := httptest.NewRequest(http.MethodGet, "/_cms/editor?path=pages%2Fabout.html&engine=vvveb", nil)
-	fallbackReq.Header.Set("X-ExeDev-Email", "owner@example.com")
-	fallbackRes := httptest.NewRecorder()
-	server.Handler().ServeHTTP(fallbackRes, fallbackReq)
-	if fallbackRes.Code != http.StatusNotFound {
-		t.Fatalf("Vvveb route without fallback assets = %d, want 404", fallbackRes.Code)
 	}
 	apiReq := httptest.NewRequest(http.MethodGet, "/_cms/api/editor?path=pages%2Fabout.html", nil)
 	apiReq.Header.Set("X-ExeDev-Email", "owner@example.com")
@@ -1539,13 +1452,7 @@ func TestDeckflowWorksWithoutVvvebAssets(t *testing.T) {
 	if err := json.Unmarshal(apiRes.Body.Bytes(), &apiPayload); err != nil {
 		t.Fatal(err)
 	}
-	vvvebAvailable := true
-	for _, engine := range apiPayload.Editor.Engines {
-		if engine.Name == "vvveb" {
-			vvvebAvailable = engine.Available
-		}
-	}
-	if apiRes.Code != http.StatusOK || apiPayload.Editor.Selected != "deckflow" || vvvebAvailable {
+	if apiRes.Code != http.StatusOK || apiPayload.Editor.Selected != "deckflow" || len(apiPayload.Editor.Engines) != 1 || apiPayload.Editor.Engines[0].Name != "deckflow" || !apiPayload.Editor.Engines[0].Available {
 		t.Fatalf("Deckflow-only API contract = %d: %s", apiRes.Code, apiRes.Body)
 	}
 }

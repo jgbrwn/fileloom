@@ -16,7 +16,7 @@ Review date: September 11, 2026
 - Revisions are filesystem snapshots with atomic writes, checksums, per-path retention of 100 snapshots, and a 128 MiB workspace budget.
 - CMS mutations emit structured `slog` audit events with actor, action, route, status, and result without request bodies or credentials.
 - Git is constrained to a real `site/.git` repository, uses non-interactive time-bounded commands, rejects unsafe configured URLs, and validates effective push URLs including configured `pushurl`/rewrite results before automatic pushes.
-- CSP is deliberately opt-in through `FILELOOM_CMS_CSP` and `FILELOOM_PUBLIC_CSP` so existing VvvebJs and user themes are not broken by default.
+- CSP is deliberately opt-in through `FILELOOM_CMS_CSP` and `FILELOOM_PUBLIC_CSP` so the Deckflow editor and user themes are not broken by default.
 
 ## Remaining verification and hardening
 
@@ -45,7 +45,7 @@ Build and Git operations are bounded where they invoke external Git commands and
 
 ### 5. CSP compatibility testing
 
-CSP profiles are opt-in. Test the CMS/editor profile with VvvebJs, media upload, editor frames, and mobile controls. Test the public profile against each supported theme and document any external resources that require a custom policy. Do not enable a restrictive global CSP by default.
+CSP profiles are opt-in. Test the CMS/editor profile with Deckflow, theme-layout editing, media upload, editor frames, and mobile controls. Test the public profile against each supported theme and document any external resources that require a custom policy. Do not enable a restrictive global CSP by default.
 
 ### 6. Deployment test matrix
 

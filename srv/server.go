@@ -208,7 +208,7 @@ const defaultLayoutTemplate = `<!doctype html>
     </div>
   </header>
   <main class="shell">{{content}}</main>
-  <footer class="site-footer"><div class="shell">{{site.footer}} <span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a> and <a href="https://github.com/givanz/VvvebJs" rel="noreferrer">VvvebJs</a>.</span></div></footer>
+  <footer class="site-footer"><div class="shell">{{site.footer}} <span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a>.</span></div></footer>
 </body>
 </html>
 `
@@ -2192,7 +2192,7 @@ func templateValues(doc Document, config SiteConfig, navigation, posts string) m
 		"site.footer":      html.EscapeString(config.Footer),
 		"site.base_url":    html.EscapeString(config.BaseURL),
 		"site.theme":       html.EscapeString(config.Theme),
-		"site.attribution": `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a> and <a href="https://github.com/givanz/VvvebJs" rel="noreferrer">VvvebJs</a>.</span>`,
+		"site.attribution": `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a>.</span>`,
 		"theme.css":        "/theme/style.css",
 		"navigation":       navigation,
 		"posts":            posts,
@@ -2459,7 +2459,7 @@ func ensureAttribution(source string) string {
 	if strings.Contains(source, "class=\"fileloom-attribution\"") || strings.Contains(source, "class='fileloom-attribution'") {
 		return source
 	}
-	attribution := `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a> and <a href="https://github.com/givanz/VvvebJs" rel="noreferrer">VvvebJs</a>.</span>`
+	attribution := `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a>.</span>`
 	if index := strings.LastIndex(strings.ToLower(source), "</body>"); index >= 0 {
 		return source[:index] + `<footer class="fileloom-generated-attribution" style="display:block;margin-top:8px;font-size:.8em">` + attribution + `</footer>` + source[index:]
 	}
@@ -2726,8 +2726,6 @@ func (s *Server) routeCMS(w http.ResponseWriter, r *http.Request) {
 		s.handleEditorFrame(w, r)
 	case strings.HasPrefix(r.URL.Path, "/_cms/assets/"):
 		s.serveFile(w, r, s.WebDir, "/_cms/assets/")
-	case strings.HasPrefix(r.URL.Path, "/_cms/vvveb/"):
-		s.serveFile(w, r, filepath.Join(s.WebDir, "vvvebjs"), "/_cms/vvveb/")
 	case strings.HasPrefix(r.URL.Path, "/_cms/media/"):
 		s.serveFile(w, r, filepath.Join(s.SiteDir, "media"), "/_cms/media/")
 	case strings.HasPrefix(r.URL.Path, "/_cms/api/"):
@@ -3154,26 +3152,14 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 
 func normalizeEditorEngine(value string) (string, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" {
+	if value == "" || value == "deckflow" {
 		return "deckflow", nil
 	}
-	switch value {
-	case "vvveb", "deckflow":
-		return value, nil
-	default:
-		return "", errors.New("unsupported editor engine")
-	}
+	return "", errors.New("unsupported editor engine")
 }
 
 func (s *Server) editorEngineAvailable(engine string) bool {
-	switch engine {
-	case "vvveb":
-		return fileExists(filepath.Join(s.WebDir, "vvvebjs", "editor.html"))
-	case "deckflow":
-		return fileExists(filepath.Join(s.WebDir, "editor-dist", "index.html"))
-	default:
-		return false
-	}
+	return engine == "deckflow" && fileExists(filepath.Join(s.WebDir, "editor-dist", "index.html"))
 }
 
 func (s *Server) resolveEditorEngine(r *http.Request, config SiteConfig) (string, error) {
@@ -3234,7 +3220,6 @@ func (s *Server) handleEditorAPI(w http.ResponseWriter, r *http.Request) {
 		Editor: map[string]any{
 			"selected": engine,
 			"engines": []map[string]any{
-				{"name": "vvveb", "available": s.editorEngineAvailable("vvveb")},
 				{"name": "deckflow", "available": s.editorEngineAvailable("deckflow")},
 			},
 		},
@@ -4426,36 +4411,9 @@ func extractBodyHTML(source string) string {
 }
 
 func (s *Server) handleEditor(w http.ResponseWriter, r *http.Request) {
-	if themeName := strings.TrimSpace(r.URL.Query().Get("theme")); themeName != "" {
-		config, err := s.loadSiteConfig()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		engine, err := s.resolveThemeEditorEngine(r, config)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if engine == "deckflow" {
-			if !s.editorEngineAvailable(engine) {
-				http.Error(w, "Deckflow editor is not installed", http.StatusNotImplemented)
-				return
-			}
-			s.serveWebFile(w, r, filepath.ToSlash(filepath.Join("editor-dist", "index.html")))
-			return
-		}
-		s.handleThemeEditor(w, r, themeName)
-		return
-	}
-	path := r.URL.Query().Get("path")
-	if path == "" {
+	themeMode := strings.TrimSpace(r.URL.Query().Get("theme")) != ""
+	if !themeMode && strings.TrimSpace(r.URL.Query().Get("path")) == "" {
 		http.Redirect(w, r, "/_cms/", http.StatusFound)
-		return
-	}
-	doc, err := s.loadDocument(path)
-	if err != nil {
-		http.Error(w, "Content item not found", http.StatusNotFound)
 		return
 	}
 	config, err := s.loadSiteConfig()
@@ -4463,148 +4421,23 @@ func (s *Server) handleEditor(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	engine, err := s.resolveEditorEngine(r, config)
+	var engine string
+	if themeMode {
+		engine, err = s.resolveThemeEditorEngine(r, config)
+	} else {
+		engine, err = s.resolveEditorEngine(r, config)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if engine == "deckflow" {
-		if !s.editorEngineAvailable(engine) {
-			http.Error(w, "Deckflow editor is not installed", http.StatusNotImplemented)
-			return
-		}
-		s.serveWebFile(w, r, filepath.ToSlash(filepath.Join("editor-dist", "index.html")))
+	if !s.editorEngineAvailable(engine) {
+		http.Error(w, "Deckflow editor is not installed", http.StatusNotImplemented)
 		return
 	}
-	sourcePath, _, err := safeResolvedPath(s.WebDir, filepath.ToSlash(filepath.Join("vvvebjs", "editor.html")))
-	if err != nil {
-		http.Error(w, "VvvebJs editor is not installed", http.StatusNotFound)
-		return
-	}
-	source, err := os.ReadFile(sourcePath)
-	if err != nil {
-		http.Error(w, "VvvebJs editor is not installed", http.StatusNotFound)
-		return
-	}
-	pageURL := "/_cms/editor/frame?path=" + url.QueryEscape(doc.Path)
-	pages := map[string]map[string]string{
-		"current": {
-			"name": "current", "file": doc.Path, "url": pageURL,
-			"title": doc.Title, "description": doc.Excerpt,
-			"base_sha256": fileSHA256(filepath.Join(s.SiteDir, "content", filepath.FromSlash(doc.Path))),
-		},
-	}
-	pagesJSON, _ := json.Marshal(pages)
-	pagesJSON = bytes.ReplaceAll(pagesJSON, []byte("<"), []byte(`\\u003c`))
-	htmlSource := s.prepareVvvebEditor(string(source), pagesJSON, "visual editor")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, htmlSource)
+	s.serveWebFile(w, r, filepath.ToSlash(filepath.Join("editor-dist", "index.html")))
 }
 
-func (s *Server) handleThemeEditor(w http.ResponseWriter, r *http.Request, themeName string) {
-	name, err := normalizeThemeName(themeName)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	layoutPath, _, err := safeResolvedPath(s.SiteDir, filepath.ToSlash(filepath.Join("themes", name, "layout.html")))
-	if err != nil || !fileExists(layoutPath) {
-		http.Error(w, "Theme layout not found", http.StatusNotFound)
-		return
-	}
-	sourcePath, _, err := safeResolvedPath(s.WebDir, filepath.ToSlash(filepath.Join("vvvebjs", "editor.html")))
-	if err != nil {
-		http.Error(w, "VvvebJs editor is not installed", http.StatusNotFound)
-		return
-	}
-	source, err := os.ReadFile(sourcePath)
-	if err != nil {
-		http.Error(w, "VvvebJs editor is not installed", http.StatusNotFound)
-		return
-	}
-	pageURL := "/_cms/editor/frame?theme=" + url.QueryEscape(name)
-	pages := map[string]map[string]string{
-		"current": {
-			"name": "current", "file": filepath.ToSlash(filepath.Join("themes", name, "layout.html")),
-			"url": pageURL, "title": friendlyTitle(name) + " theme", "theme": name,
-			"base_sha256": fileSHA256(layoutPath),
-		},
-	}
-	pagesJSON, _ := json.Marshal(pages)
-	pagesJSON = bytes.ReplaceAll(pagesJSON, []byte("<"), []byte(`\\u003c`))
-	htmlSource := s.prepareVvvebEditor(string(source), pagesJSON, friendlyTitle(name)+" theme")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, htmlSource)
-}
-
-func (s *Server) prepareVvvebEditor(source string, pagesJSON []byte, label string) string {
-	htmlSource := source
-	htmlSource = strings.ReplaceAll(htmlSource, `<base href="">`, `<base href="/_cms/vvveb/">`)
-	htmlSource = strings.ReplaceAll(htmlSource, `<title>VvvebJs</title>`, `<title>Fileloom · Visual editor</title>`)
-	htmlSource = strings.ReplaceAll(htmlSource, `window.mediaPath = '../../media';`, `window.mediaPath = '/media'; window.mediaScanUrl = '/_cms/api/media'; window.uploadUrl = '/_cms/api/media?format=vvveb';`)
-	htmlSource = strings.Replace(htmlSource, "<script>\n\tlet renameUrl", `<script src="/_cms/assets/fileloom-vvveb.js"></script>
-  <script>
-	let renameUrl`, 1)
-	htmlSource = strings.ReplaceAll(htmlSource, `Vvveb.themeBaseUrl = 'demo/landing/';`, `Vvveb.themeBaseUrl = '/_cms/vvveb/';`)
-	htmlSource = strings.ReplaceAll(htmlSource, `<script src="demo/landing/sections/sections.js"></script>`, "")
-	htmlSource = strings.ReplaceAll(htmlSource, `<script src="demo/landing/styles/styles.js"></script>`, "")
-	htmlSource = strings.ReplaceAll(htmlSource, `<script src="libs/builder/plugin-google-fonts.js"></script>`, "")
-	htmlSource = strings.ReplaceAll(htmlSource, `<script src="libs/builder/plugin-ai-assistant.js"></script>`, "")
-	htmlSource = regexp.MustCompile(`data-vvveb-url="[^"]*"`).ReplaceAllString(htmlSource, `data-vvveb-url="/_cms/api/editor-save"`)
-	htmlSource = strings.ReplaceAll(htmlSource, "save.php", "/_cms/api/editor-save")
-	badge := `<style>#fileloom-editor-badge{position:fixed;left:16px;bottom:16px;z-index:9999;background:#7557ff;color:#fff;border-radius:999px;padding:7px 12px;font:700 11px/1 system-ui;letter-spacing:.1em;box-shadow:0 8px 20px #0002}#fileloom-editor-badge span{opacity:.7;font-weight:500;letter-spacing:0}</style><div id="fileloom-editor-badge">FILELOOM <span>` + html.EscapeString(label) + `</span></div>`
-	htmlSource = strings.Replace(htmlSource, "</head>", badge+"</head>", 1)
-	boot := `window.fileloomPages = ` + string(pagesJSON) + `;` + `
-	window.fileloomBaseSHA = window.fileloomPages.current?.base_sha256 || "";
-	const fileloomFetch = window.fetch.bind(window);
-	window.fetch = function(input, init) {
-		const url = typeof input === "string" ? input : input?.url || "";
-		if (url.includes("/_cms/api/editor-save") && init?.body) {
-			const body = new URLSearchParams(typeof init.body === "string" ? init.body : init.body.toString());
-			if (window.fileloomBaseSHA) body.set("base_sha256", window.fileloomBaseSHA);
-			init = {...init, body: body.toString()};
-		}
-		return fileloomFetch(input, init);
-	};` + `
-	let pages = window.fileloomPages || defaultPages;`
-	htmlSource = strings.Replace(htmlSource, "let pages = defaultPages;", boot, 1)
-	htmlSource = addMobileEditorShell(htmlSource)
-	return htmlSource
-}
-
-func addMobileEditorShell(source string) string {
-	mobileCSS := `<style>
-@media (max-width:700px){
-  html,body{overflow:hidden!important}
-  #container{width:100vw!important;min-width:0!important}
-  #container .sidebar{display:none!important}
-  #container .main{width:100vw!important;margin:0!important;padding:0!important}
-  #vvveb-builder{--builder-left-panel-width:0px;--builder-right-panel-width:0px;--builder-sidebar-width:0px;--builder-canvas-margin:0px;--builder-header-top-height:50px;--builder-bottom-panel-height:0px}
-  #vvveb-builder #top-panel{height:50px;overflow:hidden;padding:0 5px;justify-content:flex-start;gap:4px}
-  #vvveb-builder #top-panel>div:nth-child(2){display:none!important}
-  #vvveb-builder #top-panel>div:first-child>.btn-group .btn:not(.menu-toggle){display:none!important}
-  #vvveb-builder #top-panel>div:first-child>.btn-group .menu-toggle{display:inline-flex!important}
-  #vvveb-builder #top-panel>div:last-child{margin-left:auto!important}
-  #vvveb-builder #top-panel>div:last-child>.btn-group>div:first-child{display:none!important}
-  #vvveb-builder #top-panel .save-btn{display:inline-flex!important}
-  #vvveb-builder #top-panel .save-btn .button-text{font-size:11px!important}
-  #vvveb-builder #left-panel,#vvveb-builder #right-panel{top:50px;bottom:44px;width:min(88vw,330px);max-width:330px;height:auto;z-index:2001;box-shadow:0 12px 40px #0003;display:none!important}
-  #vvveb-builder.fileloom-mobile-left #left-panel{display:block!important;left:0}
-  #vvveb-builder.fileloom-mobile-right #right-panel{display:block!important;right:0}
-  #vvveb-builder #canvas{top:50px;bottom:44px;left:0;right:0;width:100vw!important;height:calc(100vh - 94px)!important;margin:0!important}
-  #vvveb-builder #bottom-panel{display:none!important}
-  #fileloom-mobile-scrim{display:none;position:fixed;inset:50px 0 44px;z-index:2000;background:rgba(16,20,30,.36)}
-  #fileloom-mobile-scrim.open{display:block}
-  #fileloom-mobile-bar{position:fixed;left:0;right:0;bottom:0;height:44px;z-index:3000;display:flex;align-items:stretch;background:#fff;border-top:1px solid #dfe3e9;box-shadow:0 -5px 18px #0001}
-  #fileloom-mobile-bar button{flex:1;border:0;border-right:1px solid #edf0f4;background:#fff;color:#4f5b6b;font:700 10px/1 system-ui;letter-spacing:.02em}
-  #fileloom-mobile-bar button:active,#fileloom-mobile-bar button.active{color:#5038c8;background:#f0edff}
-  #fileloom-mobile-bar button span{display:block;font-size:16px;line-height:18px;margin-bottom:2px}
-  #fileloom-editor-badge{bottom:52px!important;left:8px!important;font-size:9px!important;padding:6px 9px!important}
-}
-</style>`
-	mobileUI := `<div id="fileloom-mobile-scrim"></div><div id="fileloom-mobile-bar" aria-label="Mobile editor controls"><button data-mobile-action="pages"><span>☷</span>Pages</button><button data-mobile-action="elements"><span>✚</span>Blocks</button><button data-mobile-action="style"><span>◌</span>Style</button><button data-mobile-action="preview"><span>◉</span>Preview</button><button data-mobile-action="save"><span>↥</span>Save</button></div><script>(function(){const builder=document.getElementById('vvveb-builder'),scrim=document.getElementById('fileloom-mobile-scrim'),bar=document.getElementById('fileloom-mobile-bar');if(!builder||!bar)return;function close(){builder.classList.remove('fileloom-mobile-left','fileloom-mobile-right');scrim.classList.remove('open');}function left(tab){close();builder.classList.add('fileloom-mobile-left');scrim.classList.add('open');document.querySelector(tab)?.click();}function right(tab){close();builder.classList.add('fileloom-mobile-right');scrim.classList.add('open');document.querySelector(tab)?.click();}bar.addEventListener('click',function(e){const button=e.target.closest('button');if(!button)return;const action=button.dataset.mobileAction;if(action==='pages')left('#pages-tab');if(action==='elements')left('#components-tab');if(action==='style')right('#configuration-tab');if(action==='preview'){close();document.querySelector('#preview-btn')?.click();}if(action==='save'){const save=document.querySelector('#top-panel .save-btn:not([disabled])')||document.querySelector('#top-panel .save-btn');save?.click();}});scrim.addEventListener('click',close);window.addEventListener('resize',function(){if(window.innerWidth>700)close();});})();</script>`
-	return strings.Replace(source, "</body>", mobileCSS+mobileUI+"</body>", 1)
-}
 func (s *Server) handleEditorFrame(w http.ResponseWriter, r *http.Request) {
 	if themeName := strings.TrimSpace(r.URL.Query().Get("theme")); themeName != "" {
 		s.handleThemeFrame(w, r, themeName)
@@ -4676,16 +4509,7 @@ func (s *Server) handleMediaAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	root := filepath.Join(s.SiteDir, "media")
-	if r.URL.Query().Get("format") == "flat" {
-		result, err := mediaTree(root)
-		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-		return
-	}
-	result, err := mediaVvvebTree(root)
+	result, err := mediaTree(root)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4798,13 +4622,6 @@ func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.gitChangeIfConfigured("Add media " + name); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if r.URL.Query().Get("format") == "vvveb" {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = io.WriteString(w, name)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "name": name, "path": filepath.ToSlash(filepath.Join(mediaRelative, name)), "url": mediaURLPath(mediaRelative, name)})
@@ -5083,64 +4900,6 @@ func uniqueMediaName(root, name string) string {
 		candidate = fmt.Sprintf("%s-%d%s", base, i, ext)
 	}
 	return candidate
-}
-
-func mediaVvvebTree(root string) (map[string]any, error) {
-	info, err := os.Lstat(root)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() {
-		return nil, errors.New("media root must be a directory")
-	}
-	return mediaVvvebFolder(root, "")
-}
-
-func mediaVvvebFolder(root, relative string) (map[string]any, error) {
-	directory := filepath.Join(root, filepath.FromSlash(relative))
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		return nil, err
-	}
-	items := make([]map[string]any, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Type()&fs.ModeSymlink != 0 {
-			return nil, fmt.Errorf("symlinks are not allowed in media: %s", filepath.Join(directory, entry.Name()))
-		}
-		if privateGeneratedPath(entry.Name()) {
-			continue
-		}
-		childRelative := filepath.ToSlash(filepath.Join(strings.TrimPrefix(relative, "/"), entry.Name()))
-		childPath := filepath.Join(directory, entry.Name())
-		childDisplayPath := "/" + childRelative
-		if entry.IsDir() {
-			folder, err := mediaVvvebFolder(root, childRelative)
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, folder)
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return nil, err
-		}
-		if !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("non-regular media file is not allowed: %s", childPath)
-		}
-		fileDirectory := filepath.ToSlash(filepath.Dir(filepath.FromSlash(childRelative)))
-		if fileDirectory == "." {
-			fileDirectory = ""
-		}
-		items = append(items, map[string]any{"name": entry.Name(), "type": "file", "path": childDisplayPath, "url": mediaURLPath(fileDirectory, entry.Name()), "size": info.Size()})
-	}
-	name := ""
-	path := ""
-	if relative != "" {
-		name = filepath.Base(filepath.FromSlash(relative))
-		path = "/" + filepath.ToSlash(strings.TrimPrefix(relative, "/"))
-	}
-	return map[string]any{"name": name, "type": "folder", "path": path, "items": items}, nil
 }
 
 func mediaTree(root string) ([]map[string]any, error) {

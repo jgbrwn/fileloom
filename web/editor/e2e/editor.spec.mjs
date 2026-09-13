@@ -170,17 +170,13 @@ test.describe("Deckflow Fileloom editor", () => {
     }
   });
 
-  test("loads Deckflow without requesting Vvveb fallback assets", async ({ page }) => {
-    const legacyRequests = [];
-    page.on("request", (request) => {
-      if (/fileloom-vvveb|\/vvveb(?:js|\/)/i.test(request.url())) legacyRequests.push(request.url());
-    });
+  test("loads Deckflow with only the production editor engine", async ({ page }) => {
     const response = await page.goto(editorURL);
     expect(response?.status()).toBe(200);
     await expect(page.locator(".editor-shell")).toBeVisible();
-    expect(legacyRequests).toEqual([]);
     const document = await getEditorDocument(page);
     expect(document.editor.selected).toBe("deckflow");
+    expect(document.editor.engines).toEqual([{ name: "deckflow", available: true }]);
   });
 
   test("supports contextual insertion without saving", async ({ page }) => {
@@ -448,18 +444,14 @@ test.describe("Deckflow Fileloom editor", () => {
       await restoreEditorDocument(page, original);
     }
   });
-  test("loads Deckflow theme-layout mode without requesting Vvveb assets", async ({ page }) => {
-    const legacyRequests = [];
-    page.on("request", (request) => {
-      if (/fileloom-vvveb|\/vvveb(?:js|\/)/i.test(request.url())) legacyRequests.push(request.url());
-    });
+  test("loads the Deckflow theme-layout editor", async ({ page }) => {
     await openThemeEditor(page);
     const document = await getThemeDocument(page);
     expect(document.resource).toBe("theme-layout");
     expect(document.editor.selected).toBe("deckflow");
+    expect(document.editor.engines).toEqual([{ name: "deckflow", available: true }]);
     expect(document.html).toContain("{{content}}");
     expect(await page.frameLocator("iframe.deckflow-html-editor__preview").locator("[data-fileloom-template-token]").count()).toBeGreaterThan(0);
-    expect(legacyRequests).toEqual([]);
   });
 
   test("saves and reloads a theme layout while preserving template slots", async ({ page }) => {

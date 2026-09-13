@@ -33,4 +33,4 @@ Include the affected route or feature, impact, reproduction steps, and any relev
 - CMS mutation requests have bounded bodies, admission control, HTTP server timeouts, and structured `slog` audit events containing action, route, actor, status, and result; request bodies and credentials are not logged. Build-dependent mutations roll back source/config/media changes when publication fails.
 - Revision snapshots are retained up to 100 per path and 128 MiB total, retaining newest snapshots first.
 - Git commands are non-interactive and time-bounded. Automatic pushes validate effective fetch/push URLs and reject local, plain-HTTP, and Git-protocol push targets.
-- CSP is opt-in through `FILELOOM_CMS_CSP` and `FILELOOM_PUBLIC_CSP`; it is intentionally not enabled by default because existing VvvebJs/editor and user-theme behavior may depend on inline or external resources.
+- CSP is opt-in through `FILELOOM_CMS_CSP` and `FILELOOM_PUBLIC_CSP`; it is intentionally not enabled by default because Deckflow editor and user-theme behavior may depend on inline or external resources.
