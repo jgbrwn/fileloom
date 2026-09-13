@@ -85,6 +85,7 @@ button:focus-visible, input:focus-visible { outline: 3px solid #9e8cff; outline-
 .canvas-region { position: relative; min-width: 0; min-height: 0; overflow: hidden; padding: 24px; background: radial-gradient(circle at 50% 0%, #fff 0, #f4f5f8 60%); }
 #deckflow-canvas { width: 100%; height: calc(var(--fileloom-vh) - 118px); min-height: 420px; overflow: hidden; border: 1px solid #dce1ea; border-radius: 16px; background: #fff; box-shadow: 0 16px 44px rgba(43, 50, 67, .1); }
 #deckflow-canvas > .deckflow-html-editor { min-height: 100%; }
+#deckflow-canvas .deckflow-html-editor__viewport { overflow: hidden !important; }
 .canvas-hint { position: absolute; right: 42px; bottom: 34px; padding: 7px 10px; border: 1px solid rgba(221, 225, 234, .9); border-radius: 999px; color: #8791a2; background: rgba(255,255,255,.82); font-size: 10px; pointer-events: none; }
 .selection-info { padding: 14px; border: 1px solid #e6e9ef; border-radius: 12px; background: #fff; }
 .selection-info strong { display: block; margin-bottom: 7px; color: #343d4e; font-size: 13px; }

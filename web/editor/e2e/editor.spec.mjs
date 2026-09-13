@@ -170,6 +170,20 @@ test.describe("Deckflow Fileloom editor", () => {
     }
   });
 
+  test("keeps the canvas on one scroll surface", async ({ page }) => {
+    await openEditor(page);
+    const scrollState = await page.locator(".deckflow-html-editor__viewport").evaluate((viewport) => {
+      const iframe = viewport.querySelector("iframe");
+      const previewDocument = iframe?.contentDocument;
+      return {
+        viewportOverflowY: getComputedStyle(viewport).overflowY,
+        iframeHeight: iframe?.clientHeight || 0,
+        previewHeight: Math.max(previewDocument?.documentElement?.scrollHeight || 0, previewDocument?.body?.scrollHeight || 0),
+      };
+    });
+    expect(scrollState.viewportOverflowY).toBe("hidden");
+    expect(scrollState.previewHeight).toBeGreaterThanOrEqual(scrollState.iframeHeight);
+  });
   test("loads Deckflow with only the production editor engine", async ({ page }) => {
     const response = await page.goto(editorURL);
     expect(response?.status()).toBe(200);
