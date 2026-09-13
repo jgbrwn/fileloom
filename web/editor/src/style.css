@@ -100,6 +100,10 @@ button:focus-visible, input:focus-visible { outline: 3px solid #9e8cff; outline-
 .details-form .form-field { display: grid; gap: 6px; color: #6e788a; font-size: 11px; font-weight: 750; }
 .details-form input, .details-form select, .details-form textarea { width: 100%; min-width: 0; padding: 10px 11px; border: 1px solid #dfe3eb; border-radius: 9px; color: #2f3849; background: #fff; font-size: 12px; font-weight: 500; }
 .details-form textarea { resize: vertical; line-height: 1.45; }
+.code-form { display: grid; gap: 13px; }
+.code-form textarea { min-height: 240px; resize: vertical; color: #e8edf7; background: #101522; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; tab-size: 2; }
+.code-help { margin: 0; color: #8993a5; font-size: 11px; line-height: 1.45; }
+.selection-code-action { width: 100%; margin-top: 10px; }
 .details-form small { color: #929bac; font-size: 10px; font-weight: 500; }
 .details-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .details-source { margin-top: 18px; }

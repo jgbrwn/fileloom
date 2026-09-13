@@ -10,6 +10,7 @@ Fileloom keeps the Go server, filesystem source model, static build, themes, Exe
 | Checked-in Deckflow static bundle | Done |
 | Desktop/mobile shell and basic HTML editing | Done, experimental |
 | Selection-aware insertion, local insertion undo/redo, media drag/drop | Initial slice done; needs broader testing |
+| Code blocks with language selector and public syntax highlighting | Initial Deckflow slice done; source remains plain HTML |
 | Metadata/status/revision controls inside new editor | Initial slice done; needs broader save/restore coverage |
 | Theme layout/token editing | Separate existing CMS workflow |
 | Browser/device regression suite | Initial Playwright smoke suite done; full gate pending |
@@ -24,7 +25,7 @@ The frontend source lives under `web/editor`; run `make editor-build` after chan
 - `vvveb` remains available with `?engine=vvveb` as a compatibility fallback.
 - `GET /_cms/api/editor?path=...` returns the body fragment, document metadata, full-source SHA, theme CSS, preview URL, and available engines.
 - `POST /_cms/api/editor-save` accepts the existing form contract and JSON `{path, html, base_sha256, metadata}`. JSON clients must send a precondition and receive a refreshed `source_sha256`/`ETag`. Metadata updates preserve unknown front matter and validate status/scheduling before rebuilding affected public output.
-- The initial Deckflow client is static output under `web/editor-dist`; Node is a development/build dependency, not a production service dependency.
+- `POST /_cms/api/editor-preview` renders the current unsaved body and supported metadata through the active page/post template and layout in memory. It does not write source or `site/public`; the Deckflow Preview action opens this actual theme-applied render.
 
 ## Editor boundary
 
@@ -34,7 +35,8 @@ The editor shell owns mobile and desktop UX:
 
 - mobile: tap-to-add blocks, bottom sheets, keyboard-safe layout, large controls;
 - desktop: side panels, keyboard shortcuts, metadata/status/history controls, optional drag/resize interactions;
-- both: explicit save, preview, media, status, conflict handling, and source-preserving reload.
+- both: explicit save, preview, media, status, conflict handling, and source-preserving reload;
+- code blocks: language-aware semantic insertion/editing with public/preview syntax highlighting.
 
 Deckflow supplies source-aware selection, text editing, structural edits, and undo/redo. Fileloom supplies block insertion, media, themes, metadata, publishing, revisions, and persistence.
 
@@ -45,7 +47,7 @@ Deckflow supplies source-aware selection, text editing, structural edits, and un
 - Fileloom block insertion is now selection-aware when the selected source element can be resolved, with a body-end fallback; it is not yet a block data model.
 - The media sheet handles images, file selection, and drag/drop; batch/deferred builds and richer placement are next.
 - Deckflow does not edit front matter directly; Fileloom's Details sheet handles supported content metadata/status, while theme layouts and CSS tokens remain in the separate CMS workflow.
-- Preview is a synthetic body-plus-active-theme-stylesheet canvas, not the complete generated public template.
+- Preview now renders the current body through the active theme's page/post template and layout in memory. It is closer to the generated public page; full save/build/public-output coverage remains part of the migration gate.
 - `?engine=vvveb` is a compatibility override, not a persisted per-user engine choice.
 
 Puck is not the canonical model for existing HTML pages. If a structured block-page format is added later, it should be opt-in for new content and have an explicit React/Node rendering strategy. Plumix is a UX and host-editor reference, not a dependency. Theme templates remain a separate workflow from content-body editing.

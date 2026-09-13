@@ -924,6 +924,12 @@ type editorSaveRequest struct {
 	Metadata *editorMetadataInput `json:"metadata,omitempty"`
 }
 
+type editorPreviewRequest struct {
+	Path     string               `json:"path"`
+	HTML     string               `json:"html"`
+	Metadata *editorMetadataInput `json:"metadata,omitempty"`
+}
+
 type editorDocumentResponse struct {
 	SchemaVersion int            `json:"schema_version"`
 	Resource      string         `json:"resource"`
@@ -1014,6 +1020,32 @@ func editorMetadataUpdates(input *editorMetadataInput, current Document) (map[st
 		return nil, errors.New("publish_at requires scheduled status")
 	}
 	return updates, nil
+}
+
+func applyEditorMetadata(doc Document, updates map[string]string) Document {
+	if value, ok := updates["title"]; ok {
+		doc.Title = strings.TrimSpace(value)
+	}
+	if value, ok := updates["date"]; ok {
+		doc.Date = strings.TrimSpace(value)
+	}
+	if value, ok := updates["tags"]; ok {
+		doc.Tags = parseTags(value)
+	}
+	if value, ok := updates["category"]; ok {
+		doc.Category = strings.TrimSpace(value)
+	}
+	if value, ok := updates["excerpt"]; ok {
+		doc.Excerpt = strings.TrimSpace(value)
+	}
+	if value, ok := updates["status"]; ok {
+		doc.Status = strings.ToLower(strings.TrimSpace(value))
+	}
+	if value, ok := updates["publish_at"]; ok {
+		doc.PublishAt = strings.TrimSpace(value)
+	}
+	doc.URL = documentURL(doc)
+	return doc
 }
 
 func setETag(w http.ResponseWriter, sha string) {
@@ -2144,6 +2176,65 @@ func postCardsHTML(posts []Document) string {
 	return b.String()
 }
 
+func (s *Server) renderEditorPreview(doc Document) (string, error) {
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		return "", err
+	}
+	docs, err := s.listDocuments()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC()
+	var pages, posts []Document
+	for _, candidate := range docs {
+		if !documentIsPublishable(candidate, now) {
+			continue
+		}
+		if candidate.Type == "post" {
+			posts = append(posts, candidate)
+		} else if candidate.Path != "pages/index.html" {
+			pages = append(pages, candidate)
+		}
+	}
+	sort.SliceStable(posts, func(i, j int) bool { return posts[i].Date > posts[j].Date })
+	sort.SliceStable(pages, func(i, j int) bool { return pages[i].Path < pages[j].Path })
+	themeDir, themeInfo, err := safeResolvedPath(filepath.Join(s.SiteDir, "themes"), config.Theme)
+	if err != nil {
+		return "", fmt.Errorf("theme %q is not available: %w", config.Theme, err)
+	}
+	if !themeInfo.IsDir() {
+		return "", fmt.Errorf("theme %q is not a directory", config.Theme)
+	}
+	layout, err := readThemeTemplateSafe(themeDir, "layout.html", defaultLayoutTemplate)
+	if err != nil {
+		return "", fmt.Errorf("read theme layout: %w", err)
+	}
+	pageTemplate, err := readThemeTemplateSafe(themeDir, "page.html", defaultPageTemplate)
+	if err != nil {
+		return "", fmt.Errorf("read theme page: %w", err)
+	}
+	postTemplate, err := readThemeTemplateSafe(themeDir, "post.html", defaultPostTemplate)
+	if err != nil {
+		return "", fmt.Errorf("read theme post: %w", err)
+	}
+	navigation := navigationHTML(pages)
+	postCards := postCardsHTML(posts)
+	values := templateValues(doc, config, navigation, postCards)
+	values["theme.css"] = "/theme/style.css"
+	bodyTemplate := pageTemplate
+	if doc.Type == "post" {
+		bodyTemplate = postTemplate
+	}
+	values["content"] = doc.HTML
+	values["content"] = applyTokens(bodyTemplate, values)
+	output := applyTokens(layout, values)
+	if fileExists(filepath.Join(s.WebDir, "fileloom-code.css")) && fileExists(filepath.Join(s.WebDir, "fileloom-code.js")) {
+		output = ensureCodeAssets(output)
+	}
+	return ensureAttribution(output), nil
+}
+
 func renderRSS(config SiteConfig, posts []Document) string {
 	base := strings.TrimRight(config.BaseURL, "/")
 	var b strings.Builder
@@ -2976,6 +3067,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleEditorAPI(w, r)
 	case "/_cms/api/editor-save":
 		s.handleEditorSaveAPI(w, r)
+	case "/_cms/api/editor-preview":
+		s.handleEditorPreviewAPI(w, r)
 	case "/_cms/api/media":
 		s.handleMediaAPI(w, r)
 	case "/_cms/api/themes":
@@ -3088,6 +3181,44 @@ func (s *Server) handleEditorAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handleEditorPreviewAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !rejectOversizedDeclaredBody(w, r, maxEditorSize) {
+		return
+	}
+	limitRequestBody(w, r, maxEditorSize)
+	var input editorPreviewRequest
+	if err := decodeJSONBody(r, &input); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	doc, err := s.loadDocument(input.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updates, err := editorMetadataUpdates(input.Metadata, doc)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	doc = applyEditorMetadata(doc, updates)
+	if strings.TrimSpace(input.HTML) != "" {
+		doc.HTML = extractBodyHTML(input.HTML)
+	}
+	preview, err := s.renderEditorPreview(doc)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, preview)
 }
 
 func (s *Server) handleSiteAPI(w http.ResponseWriter, r *http.Request) {

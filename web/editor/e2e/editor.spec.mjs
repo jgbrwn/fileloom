@@ -44,6 +44,42 @@ test.describe("Deckflow Fileloom editor", () => {
     await expect(page.locator('[data-action="save"]').first()).toBeEnabled();
   });
 
+  test("inserts a language-aware code block without saving", async ({ page }) => {
+    await openEditor(page);
+    const mobile = await page.locator(".mobile-nav").isVisible();
+    if (mobile) await page.locator('[data-action="blocks"]').click();
+    const catalog = page.locator(mobile ? '#sheet-content .block-grid [data-block="code"]' : '.desktop-blocks .block-grid [data-block="code"]');
+    await expect(catalog).toBeVisible();
+    await catalog.click();
+    await page.locator('#code-form [name="language"]').selectOption("go");
+    await page.locator('#code-form [name="code"]').fill("package main\n\nfunc main() {}");
+    await page.locator('#code-form button[type="submit"]').click();
+    await expect(page.locator("#editor-status")).toHaveAttribute("data-kind", "dirty");
+    await expect(page.frameLocator("iframe.deckflow-html-editor__preview").locator('pre[data-fileloom-code]')).toHaveAttribute("data-language", "go");
+    await expect(page.frameLocator("iframe.deckflow-html-editor__preview").locator('pre[data-fileloom-code] code')).toContainText("package main");
+  });
+
+  test("opens the actual theme-applied preview", async ({ page }) => {
+    await openEditor(page);
+    const mobile = await page.locator(".mobile-nav").isVisible();
+    if (mobile) await page.locator('[data-action="blocks"]').click();
+    const catalog = page.locator(mobile ? '#sheet-content .block-grid [data-block="code"]' : '.desktop-blocks .block-grid [data-block="code"]');
+    await catalog.click();
+    await page.locator('#code-form [name="language"]').selectOption("javascript");
+    await page.locator('#code-form [name="code"]').fill("const answer = 42;");
+    await page.locator('#code-form button[type="submit"]').click();
+    const popupPromise = page.waitForEvent("popup");
+    await page.locator('[data-action="preview"]:visible').first().click();
+    const popup = await popupPromise;
+    await popup.waitForLoadState("domcontentloaded");
+    await expect(popup.locator("header.site-header")).toBeVisible();
+    await expect(popup.locator("link[href^='/theme/style.css']")).toHaveCount(1);
+    await expect(popup.locator(".article-body")).toContainText("ordinary HTML file");
+    await expect(popup.locator("pre.fileloom-code-block")).toHaveAttribute("data-language", "javascript");
+    await expect(popup.locator("pre.fileloom-code-block code")).toHaveClass(/fileloom-code-highlighted/);
+    await popup.close();
+  });
+
   test("opens source history from the editor", async ({ page }) => {
     await openEditor(page);
     const history = page.locator('[data-action="history"]:visible').first();

@@ -312,6 +312,57 @@ func TestRevisionRestorePrecondition(t *testing.T) {
 	}
 }
 
+func TestEditorPreviewRendersThemeWithoutWritingSource(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	sourcePath := filepath.Join(siteDir, "content", "pages", "about.html")
+	beforeSource, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicPath := filepath.Join(siteDir, "public", "about", "index.html")
+	beforePublic, err := os.ReadFile(publicPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"path":     "pages/about.html",
+		"html":     "<!doctype html><html><body><h1>Unsaved preview</h1><pre class=\"fileloom-code-block\" data-fileloom-code data-language=\"go\"><code class=\"language-go\" data-language=\"go\">package main</code></pre></body></html>",
+		"metadata": map[string]any{"title": "Preview title", "status": "draft"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-preview", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("preview status = %d: %s", res.Code, res.Body)
+	}
+	preview := res.Body.String()
+	for _, expected := range []string{"site-header", "Preview title", "Unsaved preview", "/theme/style.css", "/theme/fileloom-code.css", "/theme/fileloom-code.js"} {
+		if !strings.Contains(preview, expected) {
+			t.Fatalf("preview missing %q: %s", expected, preview)
+		}
+	}
+	if got, want := res.Header().Get("Cache-Control"), "no-store"; got != want {
+		t.Fatalf("preview cache header = %q, want %q", got, want)
+	}
+	afterSource, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterPublic, err := os.ReadFile(publicPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterSource) != string(beforeSource) || string(afterPublic) != string(beforePublic) {
+		t.Fatal("preview mutated source or generated public output")
+	}
+}
+
 func TestCMSRequiresConfiguredExeDevEmail(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")

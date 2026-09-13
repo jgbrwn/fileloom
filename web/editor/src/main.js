@@ -142,7 +142,7 @@ async function fetchJSON(url, options = {}) {
 
 function editorDocument(record) {
   const css = String(record.stylesheet_css || "").replace(/<\/style/gi, "<\\/style");
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${css}</style><style>html{background:#fff}body{min-height:100vh;margin:0}</style></head><body>${record.html || ""}</body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/_cms/assets/fileloom-code.css"><style>${css}</style><style>html{background:#fff}body{min-height:100vh;margin:0}</style></head><body>${record.html || ""}</body></html>`;
 }
 
 function insertIntoBody(source, fragment) {
@@ -164,43 +164,67 @@ function cleanSelectedHTML(element) {
   return clone.outerHTML || "";
 }
 
-function sourceSelectionElement(source, selection) {
+function sourceSelectionInfo(source, selection, closestSelector = "") {
   if (!selection?.target) return null;
   const parsed = new DOMParser().parseFromString(String(source || ""), "text/html");
   const target = selection.target;
+  let resolved = null;
+  let candidates = [];
   if (target.selector) {
     try {
-      const matches = parsed.querySelectorAll(target.selector);
-      if (matches[target.selectorIndex ?? 0]) return matches[target.selectorIndex ?? 0];
+      candidates = [...parsed.querySelectorAll(target.selector)];
+      resolved = candidates[target.selectorIndex ?? 0] || null;
     } catch {
       // Fall through to the stable id/path fallbacks.
     }
   }
-  if (target.id) {
-    const byID = parsed.getElementById(target.id);
-    if (byID) return byID;
+  if (!resolved && target.id) resolved = parsed.getElementById(target.id);
+  if (!resolved) {
+    resolved = parsed.body;
+    for (const index of target.domPath || []) resolved = resolved?.children?.[index];
   }
-  let node = parsed.body;
-  for (const index of target.domPath || []) node = node?.children?.[index];
-  return node || null;
+  const element = closestSelector ? resolved?.closest?.(closestSelector) : resolved;
+  if (!element || ["BODY", "HTML"].includes(element.tagName)) return null;
+  const selectedHTML = cleanSelectedHTML(element);
+  if (!selectedHTML) return null;
+  if (closestSelector) candidates = [...parsed.querySelectorAll(closestSelector)];
+  const selectedIndex = candidates.indexOf(element);
+  const occurrence = selectedIndex < 0
+    ? Math.max(0, Number(target.selectorIndex || 0))
+    : candidates.slice(0, selectedIndex).filter((candidate) => cleanSelectedHTML(candidate) === selectedHTML).length;
+  return { element, selectedHTML, occurrence };
+}
+
+function sourceSelectionElement(source, selection) {
+  return sourceSelectionInfo(source, selection)?.element || null;
 }
 
 function insertAfterSelection(source, fragment, selection) {
-  const resolved = sourceSelectionElement(source, selection);
-  if (resolved && ["BODY", "HTML"].includes(resolved.tagName)) return insertIntoBody(source, fragment);
-  const selectedHTML = cleanSelectedHTML(resolved || selection?.element);
-  if (!selectedHTML) return insertIntoBody(source, fragment);
-  const occurrence = Math.max(0, Number(selection?.target?.selectorIndex || 0));
+  const info = sourceSelectionInfo(source, selection);
+  if (!info) return insertIntoBody(source, fragment);
   let cursor = 0;
   let index = -1;
-  for (let count = 0; count <= occurrence; count += 1) {
-    index = source.indexOf(selectedHTML, cursor);
+  for (let count = 0; count <= info.occurrence; count += 1) {
+    index = source.indexOf(info.selectedHTML, cursor);
     if (index < 0) break;
-    cursor = index + selectedHTML.length;
+    cursor = index + info.selectedHTML.length;
   }
   if (index < 0) return insertIntoBody(source, fragment);
-  const end = index + selectedHTML.length;
+  const end = index + info.selectedHTML.length;
   return `${source.slice(0, end)}\n${fragment}\n${source.slice(end)}`;
+}
+
+function replaceSelection(source, replacement, selection, closestSelector = "") {
+  const info = sourceSelectionInfo(source, selection, closestSelector);
+  if (!info) return source;
+  let cursor = 0;
+  let index = -1;
+  for (let count = 0; count <= info.occurrence; count += 1) {
+    index = source.indexOf(info.selectedHTML, cursor);
+    if (index < 0) return source;
+    cursor = index + info.selectedHTML.length;
+  }
+  return `${source.slice(0, index)}${replacement}${source.slice(index + info.selectedHTML.length)}`;
 }
 
 async function applyEditorHTML(next, { recordHistory = true } = {}) {
@@ -252,6 +276,84 @@ async function redoEditorChange() {
   }
 }
 
+const codeLanguages = [
+  ["plaintext", "Plain text"],
+  ["javascript", "JavaScript"],
+  ["typescript", "TypeScript"],
+  ["html", "HTML"],
+  ["css", "CSS"],
+  ["json", "JSON"],
+  ["go", "Go"],
+  ["python", "Python"],
+  ["bash", "Bash"],
+  ["sql", "SQL"],
+];
+
+function languageClass(value) {
+  return `language-${String(value || "plaintext").toLowerCase().replace(/[^a-z0-9_-]/g, "-")}`;
+}
+
+function codeBlockFragment(language = "plaintext", code = "Paste code here") {
+  const normalized = String(language || "plaintext").toLowerCase();
+  const className = languageClass(normalized);
+  return `<pre class="fileloom-code-block" data-fileloom-code data-language="${escapeHTML(normalized)}"><code class="${className}" data-language="${escapeHTML(normalized)}">${escapeHTML(code)}</code></pre>`;
+}
+
+function selectedCodeBlock() {
+  const element = state.selected?.element;
+  return element?.closest?.("pre.fileloom-code-block, pre[data-fileloom-code]") || null;
+}
+
+function codeBlockValues() {
+  const block = selectedCodeBlock();
+  const code = block?.querySelector("code");
+  const classLanguage = code?.className?.match(/language-([\w-]+)/)?.[1];
+  return {
+    block,
+    language: block?.dataset.language || code?.dataset.language || classLanguage || "plaintext",
+    code: code?.textContent || "",
+  };
+}
+
+function codeSheetHTML(mode = "insert") {
+  const values = mode === "update" ? codeBlockValues() : { language: "plaintext", code: "" };
+  const options = codeLanguages.map(([value, label]) => `<option value="${value}" ${value === values.language ? "selected" : ""}>${label}</option>`).join("");
+  return `<div class="sheet-heading"><div><span class="eyebrow">${mode === "update" ? "Edit element" : "Insert"}</span><h2>Code block</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
+    <form id="code-form" class="code-form" data-code-mode="${mode}">
+      <label class="form-field"><span>Language</span><select name="language">${options}</select></label>
+      <label class="form-field"><span>Code</span><textarea name="code" rows="13" spellcheck="false" autocapitalize="off" autocomplete="off">${escapeHTML(values.code)}</textarea></label>
+      <p class="code-help">Code stays plain in the HTML source. Fileloom applies syntax highlighting in the public/theme preview.</p>
+      <div class="details-actions"><button type="button" class="secondary-button" data-action="close-sheet">Cancel</button><button type="submit" class="primary-button">${mode === "update" ? "Update code" : "Insert code"}</button></div>
+    </form>`;
+}
+
+async function openCodeSheet(mode = "insert") {
+  openSheet("code");
+  document.querySelector("#sheet-content").innerHTML = codeSheetHTML(mode);
+}
+
+async function submitCodeForm(form) {
+  const language = form.elements.language.value || "plaintext";
+  const code = form.elements.code.value;
+  const mode = form.dataset.codeMode;
+  if (mode === "update") {
+    const next = replaceSelection(state.editor.getHtml(), codeBlockFragment(language, code), state.selected, "pre.fileloom-code-block, pre[data-fileloom-code]");
+    if (next === state.editor.getHtml()) {
+      setStatus("Could not resolve the selected code block", "error");
+      return;
+    }
+    await applyEditorHTML(next);
+    closeSheet();
+    setStatus("Code block updated", "dirty");
+    return;
+  }
+  const hadSelection = Boolean(state.selected);
+  const next = insertAfterSelection(state.editor.getHtml(), codeBlockFragment(language, code), state.selected);
+  await applyEditorHTML(next);
+  closeSheet();
+  setStatus(hadSelection ? "Code block added after selection" : "Code block added", "dirty");
+}
+
 function blockFragment(type) {
   switch (type) {
     case "heading":
@@ -263,7 +365,7 @@ function blockFragment(type) {
     case "list":
       return "<ul><li>First item</li><li>Second item</li></ul>";
     case "code":
-      return '<pre class="fileloom-code-block" data-fileloom-code data-language="javascript"><code class="language-javascript" data-language="javascript">// Write code here</code></pre>';
+      return codeBlockFragment("javascript", "// Write code here");
     case "divider":
       return "<hr>";
     case "link":
@@ -388,6 +490,7 @@ function blockCatalogHTML() {
 function detailsSheetHTML() {
   const metadata = metadataPayload();
   const scheduled = metadata.status === "scheduled";
+  const codeAction = selectedCodeBlock() ? '<button type="button" class="secondary-button" data-action="edit-code">Edit code</button>' : "";
   return `<div class="sheet-heading"><div><span class="eyebrow">Page details</span><h2>Metadata & status</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
     <form id="details-form" class="details-form">
       <label class="form-field"><span>Title</span><input data-metadata="title" value="${escapeHTML(metadata.title)}" required></label>
@@ -395,7 +498,7 @@ function detailsSheetHTML() {
       <label class="form-field" data-publish-at-field ${scheduled ? "" : "hidden"}><span>Publish at</span><input data-metadata="publish_at" type="datetime-local" value="${escapeHTML(localDateTimeValue(metadata.publish_at))}"><small>Stored in UTC after saving.</small></label>
       <div class="details-grid"><label class="form-field"><span>Tags</span><input data-metadata="tags" value="${escapeHTML(metadata.tags.join(", "))}" placeholder="design, notes"></label><label class="form-field"><span>Category</span><input data-metadata="category" value="${escapeHTML(metadata.category)}"></label></div>
       <label class="form-field"><span>Excerpt</span><textarea data-metadata="excerpt" rows="3">${escapeHTML(metadata.excerpt)}</textarea></label>
-      <div class="details-actions"><button type="button" class="secondary-button" data-action="history">History</button><button type="button" class="primary-button" data-action="save">Save details</button></div>
+      <div class="details-actions">${codeAction}<button type="button" class="secondary-button" data-action="history">History</button><button type="button" class="primary-button" data-action="save">Save details</button></div>
     </form>
     <div class="info-card details-source"><span class="eyebrow">Source</span><strong>${escapeHTML(state.record?.path || "")}</strong><small>${escapeHTML(state.record?.theme || "default")} theme · slug ${escapeHTML(state.record?.document?.slug || "")}</small></div>`;
 }
@@ -598,7 +701,8 @@ function updateSelection(selection) {
     return;
   }
   const label = selection.element?.tagName?.toLowerCase() || "element";
-  info.innerHTML = `<span class="eyebrow">Selected element</span><strong>&lt;${escapeHTML(label)}&gt;</strong><p>${escapeHTML(selection.textContent || "Empty element")}</p>`;
+  const codeAction = selectedCodeBlock() ? '<button class="secondary-button selection-code-action" data-action="edit-code">Edit code block</button>' : "";
+  info.innerHTML = `<span class="eyebrow">Selected element</span><strong>&lt;${escapeHTML(label)}&gt;</strong><p>${escapeHTML(selection.textContent || "Empty element")}</p>${codeAction}`;
 }
 
 async function saveDocument() {
@@ -663,6 +767,37 @@ async function refreshDocument(force = false) {
   setStatus("Reloaded", "success");
 }
 
+async function openPreview() {
+  const previewWindow = window.open("about:blank", "_blank");
+  if (!previewWindow) {
+    setStatus("Preview was blocked by the browser", "error");
+    return;
+  }
+  setStatus("Rendering preview…", "busy");
+  try {
+    const html = await state.editor.flush();
+    const response = await fetch("/_cms/api/editor-preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: state.record.path, html, metadata: metadataPayload() }),
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      let message = `${response.status} ${response.statusText}`;
+      try { message = (await response.json()).error || message; } catch {}
+      throw new Error(message);
+    }
+    const preview = await response.text();
+    previewWindow.document.open();
+    previewWindow.document.write(preview);
+    previewWindow.document.close();
+    setStatus("Preview opened", "success");
+  } catch (error) {
+    previewWindow.close();
+    setStatus(error.message, "error");
+  }
+}
+
 async function handleAction(action) {
   switch (action) {
     case "back":
@@ -673,13 +808,16 @@ async function handleAction(action) {
       await saveDocument();
       break;
     case "preview":
-      window.open(state.record.document?.status === "published" ? state.record.public_url : state.record.preview_url, "_blank", "noopener,noreferrer");
+      await openPreview();
       break;
     case "blocks":
       openSheet("blocks");
       break;
     case "media":
       await openMediaSheet();
+      break;
+    case "edit-code":
+      await openCodeSheet("update");
       break;
     case "style":
       openSheet("style");
@@ -732,6 +870,7 @@ app.addEventListener("click", async (event) => {
   const block = event.target.closest("[data-block]");
   if (block) {
     if (block.dataset.block === "media") await openMediaSheet();
+    else if (block.dataset.block === "code") await openCodeSheet("insert");
     else await insertBlock(block.dataset.block);
     return;
   }
@@ -752,6 +891,13 @@ app.addEventListener("input", (event) => {
 app.addEventListener("change", (event) => {
   const field = event.target.closest("#details-form [data-metadata]");
   if (field) updateMetadataDraft(field);
+});
+
+app.addEventListener("submit", async (event) => {
+  const form = event.target.closest("#code-form");
+  if (!form) return;
+  event.preventDefault();
+  await submitCodeForm(form);
 });
 
 document.addEventListener("keydown", (event) => {
