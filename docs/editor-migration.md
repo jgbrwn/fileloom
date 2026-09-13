@@ -9,11 +9,11 @@ Fileloom keeps the Go server, filesystem source model, static build, themes, Exe
 | Editor-neutral GET/save/SHA contract | Done |
 | Checked-in Deckflow static bundle | Done |
 | Desktop/mobile shell and basic HTML editing | Done, experimental |
-| Selection-aware insertion, duplicate/delete/move controls, local insertion undo/redo, media drag/drop | Initial slice done; needs broader testing |
+| Selection-aware insertion, duplicate/delete/move controls, property inspector, local insertion undo/redo, media drag/drop | Initial browser/backend coverage done; broader HTML cases remain |
 | Code blocks with language selector and public syntax highlighting | Initial Deckflow slice done; source remains plain HTML |
-| Metadata/status/revision controls inside new editor | Initial slice done; needs broader save/restore coverage |
+| Metadata/status/revision controls inside new editor | Initial save/conflict/restore coverage now includes API and browser paths |
 | Theme layout/token editing | Separate existing CMS workflow |
-| Browser/device regression suite | Initial Playwright smoke suite done; full gate pending |
+| Browser/device regression suite | 36 Playwright tests across desktop, tablet, and Android-sized Chromium; full gate pending |
 | Vvveb removal | Blocked by completion gate |
 | Comments engine | Design-only; see `docs/comments-plan.md` |
 
@@ -42,14 +42,14 @@ Deckflow supplies source-aware selection, text editing, structural edits, and un
 
 ## Current limitations
 
-- The new shell now has an initial Playwright smoke matrix (`web/editor/e2e`) for desktop, tablet, and Android-sized Chromium viewports. It does not yet cover every content/media/build path.
+- The new shell now has a 36-test Playwright regression matrix (`web/editor/e2e`) for desktop, tablet, and Android-sized Chromium viewports. By default Playwright copies the checked-in site into a temporary workspace and starts a disposable Go server, so save/upload tests do not mutate the developer's site; `FILELOOM_E2E_URL` opts into an existing server. It still does not cover every content/media/build path.
 - Save conflicts now show escaped local/remote body summaries, metadata conflict fields, explicit remote/local overwrite choices, and a safe merge path when the changed sides do not overlap. This is not a character-level diff/merge editor.
-- Fileloom block insertion and initial duplicate/delete/sibling movement controls are selection-aware when the selected source element can be resolved, with a body-end fallback; this is not yet a block data model.
-- The media sheet handles images, file selection, drag/drop, and initial selected-image replacement; batch/deferred builds and richer placement are next.
+- Fileloom block insertion and initial duplicate/delete/sibling movement controls are selection-aware when the selected source element can be resolved, with a body-end fallback; link/image properties now patch only the selected opening tag and reject unsafe URLs/classes, but this is not yet a block data model.
+- The media sheet handles images, file selection, drag/drop, selected-image replacement, and contextual placement. Generic JSON uploads, nested media paths, public serving, and generated asset coverage are now tested; batch/deferred builds and richer placement are next.
 - Deckflow does not edit front matter directly; Fileloom's Details sheet handles supported content metadata/status, while theme layouts and CSS tokens remain in the separate CMS workflow.
-- Preview now renders the current body through the active theme's page/post template and layout in memory. It is closer to the generated public page; full save/build/public-output coverage remains part of the migration gate.
+- Preview now renders the current body through the active theme's page/post template and layout in memory. Save/reload, conflict, revision restore, media, generated public output, and preview non-mutation paths have initial coverage; exact preview/public parity across every theme remains part of the migration gate.
 - `?engine=vvveb` is a compatibility override, not a persisted per-user engine choice.
 
 Puck is not the canonical model for existing HTML pages. If a structured block-page format is added later, it should be opt-in for new content and have an explicit React/Node rendering strategy. Plumix is a UX and host-editor reference, not a dependency. Theme templates remain a separate workflow from content-body editing.
 
-**Gate status: not met.** Before removing VvvebJs, complete browser coverage on desktop, tablet, and Android-sized viewports for existing-page load, inline text/headings/links/code, contextual block insertion and movement, image upload/selection, save/reload, stale conflicts, undo/redo, revisions, public build output, keyboard behavior, and theme-token compatibility. Then decide whether to close the remaining media/theme gaps and update VvvebJs attribution/NOTICE.
+**Gate status: not met.** The current suite covers 36 browser cases across desktop, tablet, and Android-sized Chromium plus API coverage for save/reload/public output, stale conflicts, revisions, real media uploads, theme/public preview parity, and preview non-mutation; the default Deckflow route also asserts that Vvveb assets are not requested, and Go coverage exercises a Deckflow-only web bundle. Before removing VvvebJs, add keyboard/inline-link cases beyond the current smoke paths and complete the final attribution/NOTICE review.

@@ -164,6 +164,15 @@ function cleanSelectedHTML(element) {
   return clone.outerHTML || "";
 }
 
+function normalizedSelectionText(value) {
+  return String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function selectionMatchesFingerprint(element, target) {
+  return typeof target?.originalText !== "string"
+    || normalizedSelectionText(element?.textContent) === normalizedSelectionText(target.originalText);
+}
+
 function sourceSelectionInfo(source, selection, closestSelector = "") {
   if (!selection?.target) return null;
   const parsed = new DOMParser().parseFromString(String(source || ""), "text/html");
@@ -173,15 +182,24 @@ function sourceSelectionInfo(source, selection, closestSelector = "") {
   if (target.selector) {
     try {
       candidates = [...parsed.querySelectorAll(target.selector)];
-      resolved = candidates[target.selectorIndex ?? 0] || null;
+      const candidate = candidates[target.selectorIndex ?? 0] || null;
+      if (candidate && selectionMatchesFingerprint(candidate, target)) resolved = candidate;
     } catch {
-      // Fall through to the stable id/path fallbacks.
+      // Fall through to the stable path and fingerprint fallbacks.
     }
   }
-  if (!resolved && target.id) resolved = parsed.getElementById(target.id);
-  if (!resolved) {
+  if (!resolved && Array.isArray(target.domPath)) {
     resolved = parsed.body;
-    for (const index of target.domPath || []) resolved = resolved?.children?.[index];
+    for (const index of target.domPath) resolved = resolved?.children?.[index];
+    if (!selectionMatchesFingerprint(resolved, target)) resolved = null;
+  }
+  if (!resolved && target.id) {
+    const candidate = parsed.getElementById(target.id);
+    if (candidate && selectionMatchesFingerprint(candidate, target)) resolved = candidate;
+  }
+  if (!resolved && /^[a-z][a-z0-9-]*$/i.test(target.tagName || "") && typeof target.originalText === "string") {
+    const matches = [...parsed.querySelectorAll(target.tagName)].filter((candidate) => selectionMatchesFingerprint(candidate, target));
+    if (matches.length === 1) resolved = matches[0];
   }
   const element = closestSelector ? resolved?.closest?.(closestSelector) : resolved;
   if (!element || ["BODY", "HTML"].includes(element.tagName)) return null;
@@ -192,9 +210,120 @@ function sourceSelectionInfo(source, selection, closestSelector = "") {
   const occurrence = selectedIndex < 0
     ? Math.max(0, Number(target.selectorIndex || 0))
     : candidates.slice(0, selectedIndex).filter((candidate) => cleanSelectedHTML(candidate) === selectedHTML).length;
-  return { parsed, element, selectedHTML, occurrence };
+  return { parsed, target, element, selectedHTML, occurrence, selectorIndex: selectedIndex };
 }
 
+function sourceOpeningTagRange(source, info) {
+  if (!info?.element) return null;
+  const tagName = String(info.element.tagName || "").toLowerCase();
+  if (!tagName) return null;
+  const exactStart = Number.isInteger(info.start) ? info.start : -1;
+  if (exactStart >= 0 && new RegExp(`^<${tagName}(?:\\s|>)`, "i").test(source.slice(exactStart))) {
+    const end = scanOpeningTagEnd(source, exactStart);
+    if (end >= 0) return { start: exactStart, end };
+  }
+  const ranges = rawOpeningTagRanges(source, tagName);
+  const index = Number.isInteger(info.selectorIndex) && info.selectorIndex >= 0 ? info.selectorIndex : 0;
+  return ranges[index] || null;
+}
+
+function scanOpeningTagEnd(source, start) {
+  let quote = "";
+  for (let index = start + 1; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === quote) quote = "";
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === ">") return index + 1;
+  }
+  return -1;
+}
+
+function rawOpeningTagRanges(source, tagName) {
+  const ranges = [];
+  const tagPattern = new RegExp(`<${tagName}(?=\\s|/?>)`, "ig");
+  let match;
+  while ((match = tagPattern.exec(source))) {
+    const start = match.index;
+    if (source.slice(Math.max(0, start - 4), start) === "<!--") continue;
+    const end = scanOpeningTagEnd(source, start);
+    if (end >= 0) ranges.push({ start, end });
+    tagPattern.lastIndex = Math.max(tagPattern.lastIndex, end);
+  }
+  return ranges;
+}
+
+function parseOpeningTagAttributes(tag) {
+  const attributes = [];
+  let index = 1;
+  while (index < tag.length && /\s/.test(tag[index])) index += 1;
+  while (index < tag.length && !/[\s/>]/.test(tag[index])) index += 1;
+  while (index < tag.length) {
+    while (index < tag.length && /\s/.test(tag[index])) index += 1;
+    if (index >= tag.length || tag[index] === ">" || tag[index] === "/") break;
+    const start = index;
+    while (index < tag.length && !/[\s=/>]/.test(tag[index])) index += 1;
+    const name = tag.slice(start, index);
+    if (!name) break;
+    while (index < tag.length && /\s/.test(tag[index])) index += 1;
+    let valueStart = index;
+    let valueEnd = index;
+    let quote = "";
+    if (tag[index] === "=") {
+      index += 1;
+      while (index < tag.length && /\s/.test(tag[index])) index += 1;
+      valueStart = index;
+      if (tag[index] === '"' || tag[index] === "'") {
+        quote = tag[index];
+        valueStart = ++index;
+        while (index < tag.length && tag[index] !== quote) index += 1;
+        valueEnd = index;
+        if (index < tag.length) index += 1;
+      } else {
+        while (index < tag.length && !/[\s>]/.test(tag[index])) index += 1;
+        valueEnd = index;
+      }
+    }
+    attributes.push({ name, normalized: name.toLowerCase(), start, valueStart, valueEnd, end: index, quote });
+  }
+  return attributes;
+}
+
+function patchOpeningTagAttributes(tag, values = {}, remove = new Set()) {
+  const attributes = parseOpeningTagAttributes(tag);
+  const replacements = [];
+  for (const [name, value] of Object.entries(values)) {
+    const normalized = name.toLowerCase();
+    const existing = attributes.find((attribute) => attribute.normalized === normalized);
+    if (existing) {
+      if (remove.has(normalized)) {
+        let start = existing.start;
+        while (start > 0 && /\s/.test(tag[start - 1])) start -= 1;
+        replacements.push({ start, end: existing.end, value: "" });
+      } else {
+        const escaped = escapeHTML(value);
+        if (existing.quote || !/[\s"'`=<>]/.test(String(value))) {
+          replacements.push({ start: existing.valueStart, end: existing.valueEnd, value: escaped });
+        } else {
+          replacements.push({ start: existing.start, end: existing.end, value: `${existing.name}="${escaped}"` });
+        }
+      }
+      continue;
+    }
+    if (remove.has(normalized)) continue;
+    const closeStart = tag.endsWith("/>") ? tag.length - 2 : tag.length - 1;
+    replacements.push({ start: closeStart, end: closeStart, value: ` ${name}="${escapeHTML(value)}"` });
+  }
+  replacements.sort((left, right) => right.start - left.start || right.end - left.end);
+  let result = tag;
+  for (const replacement of replacements) result = `${result.slice(0, replacement.start)}${replacement.value}${result.slice(replacement.end)}`;
+  return result;
+}
 function sourceRangeFromHTML(source, selectedHTML, occurrence) {
   let cursor = 0;
   let index = -1;
@@ -338,13 +467,134 @@ function structuralSelectionInfo(source) {
   return sourceSelectionRange(source, state.selected, selector);
 }
 
+function elementInspectorTarget() {
+  const element = state.selected?.element;
+  if (!element) return null;
+  const link = element.closest?.("a");
+  if (link) return link;
+  const image = element.closest?.("img");
+  if (image) return image;
+  return element;
+}
+
+function elementInspectorSelector(element) {
+  if (!element) return "";
+  if (element.tagName === "A") return "a";
+  if (element.tagName === "IMG") return "img";
+  return "";
+}
+
+function elementInspectorInfo(source) {
+  const element = elementInspectorTarget();
+  if (!element) return null;
+  const selector = elementInspectorSelector(element);
+  return sourceSelectionInfo(source, state.selected, selector);
+}
+
+function inspectorURLIsSafe(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized || /[\u0000-\u001f\u007f]/.test(normalized)) return false;
+  if (/^(?:javascript|vbscript|data):/i.test(normalized)) return false;
+  if (normalized.startsWith("//")) return false;
+  if (/^(?:https?:|mailto:|tel:|\/|#|\?|\.{0,2}\/)/i.test(normalized)) return true;
+  return !/^[a-z][a-z0-9+.-]*:/i.test(normalized);
+}
+
+function inspectorClassIsSafe(value) {
+  return String(value || "").trim().split(/\s+/).filter(Boolean).every((token) => /^[A-Za-z_][A-Za-z0-9_-]*$/.test(token));
+}
+
+function inspectorIDIsSafe(value) {
+  return !value || /^[A-Za-z][A-Za-z0-9_.:-]*$/.test(value);
+}
+
+function inspectorTextValue(element, name) {
+  return element?.getAttribute?.(name) || "";
+}
+
+function elementInspectorHTML() {
+  const element = elementInspectorTarget();
+  if (!element || ["BODY", "HTML"].includes(element.tagName)) return "";
+  const tag = element.tagName.toLowerCase();
+  const isLink = tag === "a";
+  const isImage = tag === "img";
+  const linkFields = isLink ? `<div class="details-grid"><label class="form-field"><span>Link URL</span><input name="href" value="${escapeHTML(inspectorTextValue(element, "href"))}" required></label><label class="form-field"><span>Target</span><select name="target"><option value="">Same tab</option><option value="_blank" ${element.getAttribute("target") === "_blank" ? "selected" : ""}>New tab</option><option value="_self" ${element.getAttribute("target") === "_self" ? "selected" : ""}>This frame</option></select></label></div><div class="details-grid"><label class="form-field"><span>Rel</span><input name="rel" value="${escapeHTML(inspectorTextValue(element, "rel"))}" placeholder="nofollow"></label><label class="form-field"><span>Title</span><input name="title" value="${escapeHTML(inspectorTextValue(element, "title"))}"></label></div>` : "";
+  const imageFields = isImage ? `<div class="details-grid"><label class="form-field"><span>Image source</span><input name="src" value="${escapeHTML(inspectorTextValue(element, "src"))}" required></label><label class="form-field"><span>Alt text</span><input name="alt" value="${escapeHTML(inspectorTextValue(element, "alt"))}"></label></div><div class="details-grid"><label class="form-field"><span>Loading</span><select name="loading"><option value="">Browser default</option><option value="lazy" ${element.getAttribute("loading") === "lazy" ? "selected" : ""}>Lazy</option><option value="eager" ${element.getAttribute("loading") === "eager" ? "selected" : ""}>Eager</option></select></label><label class="form-field"><span>Decoding</span><select name="decoding"><option value="">Browser default</option><option value="async" ${element.getAttribute("decoding") === "async" ? "selected" : ""}>Async</option><option value="sync" ${element.getAttribute("decoding") === "sync" ? "selected" : ""}>Sync</option></select></label></div><label class="form-field"><span>Image title</span><input name="title" value="${escapeHTML(inspectorTextValue(element, "title"))}"></label>` : "";
+  return `<div class="sheet-heading"><div><span class="eyebrow">Element inspector</span><h2>&lt;${escapeHTML(tag)}&gt; properties</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div><form id="element-inspector-form" class="details-form" data-inspector-tag="${escapeHTML(tag)}"><div class="details-grid"><label class="form-field"><span>Element</span><input value="${escapeHTML(tag)}" readonly></label><label class="form-field"><span>ID</span><input name="id" value="${escapeHTML(element.id || "")}" placeholder="optional"></label></div><label class="form-field"><span>Classes</span><input name="class" value="${escapeHTML(element.className || "")}" placeholder="optional"></label>${linkFields}${imageFields}<p class="code-help">Apply changes to the selected source element without reserializing the rest of the document.</p><div class="details-actions"><button type="button" class="secondary-button" data-action="close-sheet">Cancel</button><button type="submit" class="primary-button">Apply properties</button></div></form>`;
+}
+
+function inspectorAttributeChanges(form) {
+  const tag = form.dataset.inspectorTag;
+  const values = { id: form.elements.id.value.trim(), class: form.elements.class.value.trim() };
+  const remove = new Set();
+  if (!values.id) remove.add("id");
+  if (!values.class) remove.add("class");
+  if (tag === "a") {
+    values.href = form.elements.href.value.trim();
+    values.target = form.elements.target.value;
+    values.rel = form.elements.rel.value.trim();
+    values.title = form.elements.title.value.trim();
+    if (!values.target) remove.add("target");
+    if (!values.rel) remove.add("rel");
+    if (!values.title) remove.add("title");
+  }
+  if (tag === "img") {
+    values.src = form.elements.src.value.trim();
+    values.alt = form.elements.alt.value;
+    values.loading = form.elements.loading.value;
+    values.decoding = form.elements.decoding.value;
+    values.title = form.elements.title.value.trim();
+    if (!values.loading) remove.add("loading");
+    if (!values.decoding) remove.add("decoding");
+    if (!values.title) remove.add("title");
+  }
+  return { values, remove };
+}
+
+async function submitElementInspector(form) {
+  const { values, remove } = inspectorAttributeChanges(form);
+  if (!inspectorIDIsSafe(values.id)) {
+    setStatus("ID contains unsupported characters", "error");
+    return;
+  }
+  if (!inspectorClassIsSafe(values.class)) {
+    setStatus("Classes must be space-separated CSS names", "error");
+    return;
+  }
+  if (form.dataset.inspectorTag === "a" && !inspectorURLIsSafe(values.href)) {
+    setStatus("Link URL is unsafe or invalid", "error");
+    return;
+  }
+  if (form.dataset.inspectorTag === "img" && !inspectorURLIsSafe(values.src)) {
+    setStatus("Image source is unsafe or invalid", "error");
+    return;
+  }
+  const source = state.editor?.getHtml() || "";
+  const info = elementInspectorInfo(source);
+  const range = sourceOpeningTagRange(source, info);
+  if (!info || !range) {
+    setStatus("Could not resolve the selected element", "error");
+    return;
+  }
+  const openingTag = source.slice(range.start, range.end);
+  const nextOpeningTag = patchOpeningTagAttributes(openingTag, values, remove);
+  if (nextOpeningTag === openingTag) {
+    closeSheet();
+    setStatus("No property changes", "neutral");
+    return;
+  }
+  await applyEditorHTML(`${source.slice(0, range.start)}${nextOpeningTag}${source.slice(range.end)}`);
+  closeSheet();
+  setStatus("Element properties updated", "dirty");
+}
+
 function selectionOperationsHTML() {
   const element = selectedStructuralElement();
   if (!element || ["BODY", "HTML"].includes(element.tagName)) return "";
   const previous = element.previousElementSibling;
   const next = element.nextElementSibling;
   const imageAction = selectedImageBlock() ? '<button class="secondary-button" data-action="media">Replace image</button>' : "";
-  return `<div class="selection-actions"><span class="eyebrow">Element actions</span><div class="selection-action-grid">${imageAction}<button class="secondary-button" data-action="duplicate">Duplicate</button><button class="secondary-button" data-action="move-up" ${previous ? "" : "disabled"}>Move up</button><button class="secondary-button" data-action="move-down" ${next ? "" : "disabled"}>Move down</button><button class="secondary-button danger-button" data-action="delete-selection">Delete</button></div></div>`;
+  return `<div class="selection-actions"><span class="eyebrow">Element actions</span><div class="selection-action-grid"><button class="secondary-button" data-action="properties">Edit properties</button>${imageAction}<button class="secondary-button" data-action="duplicate">Duplicate</button><button class="secondary-button" data-action="move-up" ${previous ? "" : "disabled"}>Move up</button><button class="secondary-button" data-action="move-down" ${next ? "" : "disabled"}>Move down</button><button class="secondary-button danger-button" data-action="delete-selection">Delete</button></div></div>`;
 }
 
 function duplicateWithoutIDs(element) {
@@ -572,6 +822,8 @@ function openSheet(kind) {
   } else if (kind === "details") {
     document.querySelector("#sheet-content").innerHTML = detailsSheetHTML();
     syncPublishAtField();
+  } else if (kind === "properties") {
+    document.querySelector("#sheet-content").innerHTML = elementInspectorHTML();
   } else if (kind === "history") {
     document.querySelector("#sheet-content").innerHTML = '<div class="sheet-heading"><div><span class="eyebrow">Source history</span><h2>Revision history</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div><div class="sheet-loading">Loading history…</div>';
   } else if (kind === "conflict") {
@@ -925,6 +1177,9 @@ async function handleAction(action) {
     case "edit-code":
       await openCodeSheet("update");
       break;
+    case "properties":
+      openSheet("properties");
+      break;
     case "duplicate":
       await duplicateSelection();
       break;
@@ -1012,10 +1267,12 @@ app.addEventListener("change", (event) => {
 });
 
 app.addEventListener("submit", async (event) => {
-  const form = event.target.closest("#code-form");
-  if (!form) return;
+  const codeForm = event.target.closest("#code-form");
+  const inspectorForm = event.target.closest("#element-inspector-form");
+  if (!codeForm && !inspectorForm) return;
   event.preventDefault();
-  await submitCodeForm(form);
+  if (codeForm) await submitCodeForm(codeForm);
+  else await submitElementInspector(inspectorForm);
 });
 
 document.addEventListener("keydown", (event) => {

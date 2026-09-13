@@ -1154,6 +1154,9 @@ func patchFrontMatter(source []byte, updates map[string]string) []byte {
 			continue
 		}
 		value = strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(value), "\r", " "), "\n", " ")
+		if value == "" {
+			continue
+		}
 		missing = append(missing, fmt.Sprintf("%s: %s\n", key, value))
 	}
 	if len(missing) > 0 && closingOffset >= 0 {

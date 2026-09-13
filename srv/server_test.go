@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -1002,6 +1003,387 @@ func TestGitPushURLIsValidated(t *testing.T) {
 	}
 	if err := validateRemoteURL("ssh://git@github.com/example/site.git"); err != nil {
 		t.Fatalf("SSH remote with username rejected: %v", err)
+	}
+}
+func TestDeckflowSaveReloadAndPublicOutput(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	getEditor := func() editorDocumentResponse {
+		req := httptest.NewRequest(http.MethodGet, "/_cms/api/editor?path=pages%2Fabout.html&engine=deckflow", nil)
+		req.Header.Set("X-ExeDev-Email", "owner@example.com")
+		res := httptest.NewRecorder()
+		server.Handler().ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("editor GET status = %d: %s", res.Code, res.Body)
+		}
+		var response editorDocumentResponse
+		if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	opened := getEditor()
+	payload, _ := json.Marshal(map[string]any{
+		"path":        "pages/about.html",
+		"engine":      "deckflow",
+		"base_sha256": opened.SourceSHA256,
+		"html":        "<!doctype html><html><body><p data-save-probe=\"yes\">Saved through Deckflow</p><p>Second saved paragraph</p></body></html>",
+		"metadata":    map[string]any{"title": "Saved About", "status": "published", "excerpt": "Saved excerpt"},
+	})
+	saveReq := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", bytes.NewReader(payload))
+	saveReq.Header.Set("Content-Type", "application/json")
+	saveReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	saveRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(saveRes, saveReq)
+	if saveRes.Code != http.StatusOK {
+		t.Fatalf("Deckflow save status = %d: %s", saveRes.Code, saveRes.Body)
+	}
+	var saved struct {
+		SourceSHA256 string   `json:"source_sha256"`
+		Document     Document `json:"document"`
+	}
+	if err := json.Unmarshal(saveRes.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.SourceSHA256 == opened.SourceSHA256 || saved.Document.Title != "Saved About" {
+		t.Fatalf("unexpected saved response: %#v", saved)
+	}
+	updated, err := os.ReadFile(filepath.Join(siteDir, "content", "pages", "about.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(updated), "<!doctype html>") {
+		t.Fatal("editor wrapper leaked into source")
+	}
+	if !strings.Contains(string(updated), `data-save-probe="yes"`) || !strings.Contains(string(updated), "title: Saved About") {
+		t.Fatalf("saved source missing body or metadata: %s", updated)
+	}
+	if strings.Contains(string(updated), "category: ") || strings.Contains(string(updated), "publish_at: ") || strings.Contains(string(updated), "tags: ") {
+		t.Fatalf("save added empty metadata keys to source: %s", updated)
+	}
+	reloaded := getEditor()
+	if !strings.Contains(reloaded.HTML, "Saved through Deckflow") || reloaded.Document.Title != "Saved About" {
+		t.Fatalf("editor reload lost saved content: %#v", reloaded)
+	}
+	publicReq := httptest.NewRequest(http.MethodGet, "/about/", nil)
+	publicRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(publicRes, publicReq)
+	if publicRes.Code != http.StatusOK || !strings.Contains(publicRes.Body.String(), "Saved through Deckflow") || !strings.Contains(publicRes.Body.String(), "Saved About") {
+		t.Fatalf("public output did not reflect saved content: %d %s", publicRes.Code, publicRes.Body)
+	}
+}
+
+func TestDeckflowMediaJSONUploadAndPublicAsset(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "hero.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	png := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
+	if _, err := part.Write(png); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("mediaPath", "media/uploads"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/media", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusCreated {
+		t.Fatalf("media upload status = %d: %s", res.Code, res.Body)
+	}
+	var uploaded struct {
+		OK   bool   `json:"ok"`
+		Name string `json:"name"`
+		Path string `json:"path"`
+		URL  string `json:"url"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &uploaded); err != nil {
+		t.Fatal(err)
+	}
+	if !uploaded.OK || uploaded.Name != "hero.png" || uploaded.Path != "uploads/hero.png" || uploaded.URL != "/media/uploads/hero.png" {
+		t.Fatalf("unexpected media response: %#v", uploaded)
+	}
+	publicReq := httptest.NewRequest(http.MethodGet, uploaded.URL, nil)
+	publicRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(publicRes, publicReq)
+	if publicRes.Code != http.StatusOK || publicRes.Header().Get("Content-Type") != "image/png" || !bytes.Equal(publicRes.Body.Bytes(), png) {
+		t.Fatalf("public media response = %d %q %q", publicRes.Code, publicRes.Header().Get("Content-Type"), publicRes.Body.Bytes())
+	}
+	flatReq := httptest.NewRequest(http.MethodGet, "/_cms/api/media?format=flat", nil)
+	flatReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	flatRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(flatRes, flatReq)
+	if flatRes.Code != http.StatusOK || !strings.Contains(flatRes.Body.String(), "/media/uploads/hero.png") {
+		t.Fatalf("flat media response = %d: %s", flatRes.Code, flatRes.Body)
+	}
+	if _, err := os.Stat(filepath.Join(siteDir, "public", "media", "uploads", "hero.png")); err != nil {
+		t.Fatalf("generated public media missing: %v", err)
+	}
+}
+
+func TestRevisionAPIHappyPath(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	get := func() editorDocumentResponse {
+		req := httptest.NewRequest(http.MethodGet, "/_cms/api/editor?path=pages%2Fabout.html&engine=deckflow", nil)
+		req.Header.Set("X-ExeDev-Email", "owner@example.com")
+		res := httptest.NewRecorder()
+		server.Handler().ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("editor GET status = %d: %s", res.Code, res.Body)
+		}
+		var response editorDocumentResponse
+		if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	save := func(html, baseSHA string) {
+		payload, _ := json.Marshal(map[string]any{"path": "pages/about.html", "html": html, "base_sha256": baseSHA, "engine": "deckflow"})
+		req := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-ExeDev-Email", "owner@example.com")
+		res := httptest.NewRecorder()
+		server.Handler().ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("save status = %d: %s", res.Code, res.Body)
+		}
+	}
+	base := get()
+	save("<p>Revision API A</p>", base.SourceSHA256)
+	middle := get()
+	save("<p>Revision API B</p>", middle.SourceSHA256)
+	current := get()
+	revisionsReq := httptest.NewRequest(http.MethodGet, "/_cms/api/revisions?path=pages%2Fabout.html", nil)
+	revisionsReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	revisionsRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(revisionsRes, revisionsReq)
+	if revisionsRes.Code != http.StatusOK {
+		t.Fatalf("revisions GET status = %d: %s", revisionsRes.Code, revisionsRes.Body)
+	}
+	var revisionsPayload struct {
+		Revisions []Revision `json:"revisions"`
+	}
+	if err := json.Unmarshal(revisionsRes.Body.Bytes(), &revisionsPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(revisionsPayload.Revisions) < 2 || revisionsPayload.Revisions[0].CreatedAt < revisionsPayload.Revisions[1].CreatedAt {
+		t.Fatalf("unexpected revision ordering: %#v", revisionsPayload.Revisions)
+	}
+	originalRevision := revisionsPayload.Revisions[len(revisionsPayload.Revisions)-1]
+	restoreForm := url.Values{"path": {"pages/about.html"}, "id": {originalRevision.ID}, "base_sha256": {current.SourceSHA256}}
+	restoreReq := httptest.NewRequest(http.MethodPost, "/_cms/api/revisions/restore", strings.NewReader(restoreForm.Encode()))
+	restoreReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	restoreReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	restoreRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(restoreRes, restoreReq)
+	if restoreRes.Code != http.StatusOK {
+		t.Fatalf("revision restore status = %d: %s", restoreRes.Code, restoreRes.Body)
+	}
+	restored := get()
+	if strings.Contains(restored.HTML, "Revision API B") || !strings.Contains(restored.HTML, "ordinary HTML file") {
+		t.Fatalf("revision restore did not recover original body: %s", restored.HTML)
+	}
+	publicReq := httptest.NewRequest(http.MethodGet, "/about/", nil)
+	publicRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(publicRes, publicReq)
+	if publicRes.Code != http.StatusOK || strings.Contains(publicRes.Body.String(), "Revision API B") || !strings.Contains(publicRes.Body.String(), "ordinary HTML file") {
+		t.Fatalf("public output did not follow revision restore: %d %s", publicRes.Code, publicRes.Body)
+	}
+}
+func TestPreviewAndPublicOutputAcrossThemes(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	themesRoot := filepath.Join(siteDir, "themes")
+	for _, theme := range []string{"midnight", "terminal", "editorial", "bento", "brutalist"} {
+		sourceRoot := filepath.Join("..", "site", "themes", theme)
+		err := filepath.WalkDir(sourceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			rel, err := filepath.Rel(sourceRoot, path)
+			if err != nil {
+				return err
+			}
+			target := filepath.Join(themesRoot, theme, rel)
+			if entry.IsDir() {
+				return os.MkdirAll(target, 0o755)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(target, data, 0o644)
+		})
+		if err != nil {
+			t.Fatalf("copy theme %s: %v", theme, err)
+		}
+	}
+	config, err := server.loadSiteConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, theme := range []string{"default", "midnight", "terminal", "editorial", "bento", "brutalist"} {
+		t.Run(theme, func(t *testing.T) {
+			config.Theme = theme
+			if err := server.saveSiteConfig(config); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := server.Build(); err != nil {
+				t.Fatal(err)
+			}
+			publicReq := httptest.NewRequest(http.MethodGet, "/about/", nil)
+			publicRes := httptest.NewRecorder()
+			server.Handler().ServeHTTP(publicRes, publicReq)
+			if publicRes.Code != http.StatusOK || !strings.Contains(publicRes.Body.String(), "ordinary HTML file") || !strings.Contains(publicRes.Body.String(), "/theme/style.css") {
+				t.Fatalf("public theme output = %d: %s", publicRes.Code, publicRes.Body)
+			}
+			previewPayload, _ := json.Marshal(map[string]any{
+				"path":     "pages/about.html",
+				"html":     "<p data-preview-theme=\"yes\">Unsaved theme preview</p>",
+				"metadata": map[string]any{"title": "Theme preview title", "status": "published"},
+			})
+			previewReq := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-preview", bytes.NewReader(previewPayload))
+			previewReq.Header.Set("Content-Type", "application/json")
+			previewReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+			previewRes := httptest.NewRecorder()
+			server.Handler().ServeHTTP(previewRes, previewReq)
+			if previewRes.Code != http.StatusOK || !strings.Contains(previewRes.Body.String(), "Unsaved theme preview") || !strings.Contains(previewRes.Body.String(), "Theme preview title") || !strings.Contains(previewRes.Body.String(), "/theme/style.css") {
+				t.Fatalf("theme preview = %d: %s", previewRes.Code, previewRes.Body)
+			}
+		})
+	}
+}
+
+func TestEditorPreviewUsesPostTemplate(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"path":     "posts/2026/welcome-to-fileloom.html",
+		"html":     "<p>Unsaved post body</p>",
+		"metadata": map[string]any{"title": "Unsaved post title", "status": "published"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-preview", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `<article class="article">`) || !strings.Contains(res.Body.String(), "Unsaved post body") || !strings.Contains(res.Body.String(), "Unsaved post title") {
+		t.Fatalf("post preview = %d: %s", res.Code, res.Body)
+	}
+}
+func TestDeckflowWorksWithoutVvvebAssets(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	webDir := filepath.Join(t.TempDir(), "web")
+	copyTree := func(sourceRoot, targetRoot string) error {
+		return filepath.WalkDir(sourceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			rel, err := filepath.Rel(sourceRoot, path)
+			if err != nil {
+				return err
+			}
+			target := filepath.Join(targetRoot, rel)
+			if entry.IsDir() {
+				return os.MkdirAll(target, 0o755)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(target, data, 0o644)
+		})
+	}
+	if err := copyTree(filepath.Join("..", "web", "editor-dist"), filepath.Join(webDir, "editor-dist")); err != nil {
+		t.Fatalf("copy Deckflow bundle: %v", err)
+	}
+	for _, name := range []string{"fileloom-code.css", "fileloom-code.js"} {
+		data, err := os.ReadFile(filepath.Join("..", "web", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(webDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(webDir, name), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server, err := New(siteDir, webDir, "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	config, err := server.loadSiteConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.EditorEngine = "deckflow"
+	if err := server.saveSiteConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	pageReq := httptest.NewRequest(http.MethodGet, "/_cms/editor?path=pages%2Fabout.html", nil)
+	pageReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	pageRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(pageRes, pageReq)
+	if pageRes.Code != http.StatusOK || strings.Contains(pageRes.Body.String(), "fileloom-vvveb.js") {
+		t.Fatalf("Deckflow-only editor route = %d: %s", pageRes.Code, pageRes.Body)
+	}
+	fallbackReq := httptest.NewRequest(http.MethodGet, "/_cms/editor?path=pages%2Fabout.html&engine=vvveb", nil)
+	fallbackReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	fallbackRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(fallbackRes, fallbackReq)
+	if fallbackRes.Code != http.StatusNotFound {
+		t.Fatalf("Vvveb route without fallback assets = %d, want 404", fallbackRes.Code)
+	}
+	apiReq := httptest.NewRequest(http.MethodGet, "/_cms/api/editor?path=pages%2Fabout.html", nil)
+	apiReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	apiRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(apiRes, apiReq)
+	var apiPayload struct {
+		Editor struct {
+			Selected string `json:"selected"`
+			Engines  []struct {
+				Name      string `json:"name"`
+				Available bool   `json:"available"`
+			} `json:"engines"`
+		} `json:"editor"`
+	}
+	if err := json.Unmarshal(apiRes.Body.Bytes(), &apiPayload); err != nil {
+		t.Fatal(err)
+	}
+	vvvebAvailable := true
+	for _, engine := range apiPayload.Editor.Engines {
+		if engine.Name == "vvveb" {
+			vvvebAvailable = engine.Available
+		}
+	}
+	if apiRes.Code != http.StatusOK || apiPayload.Editor.Selected != "deckflow" || vvvebAvailable {
+		t.Fatalf("Deckflow-only API contract = %d: %s", apiRes.Code, apiRes.Body)
 	}
 }
 func TestPathValidation(t *testing.T) {
