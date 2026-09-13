@@ -93,8 +93,31 @@ button:focus-visible, input:focus-visible { outline: 3px solid #9e8cff; outline-
 .info-card strong { overflow-wrap: anywhere; color: #3c4658; font-size: 12px; }
 .info-card small { color: #8d97a7; font-size: 11px; }
 .quick-actions { display: flex; gap: 8px; margin: -4px 0 16px; }
+.inspector-actions { margin: 0 0 16px; }
+.quick-actions .secondary-button { flex: 1; min-width: 0; padding-inline: 9px; }
+.details-form { display: grid; gap: 13px; }
+.details-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.details-form .form-field { display: grid; gap: 6px; color: #6e788a; font-size: 11px; font-weight: 750; }
+.details-form input, .details-form select, .details-form textarea { width: 100%; min-width: 0; padding: 10px 11px; border: 1px solid #dfe3eb; border-radius: 9px; color: #2f3849; background: #fff; font-size: 12px; font-weight: 500; }
+.details-form textarea { resize: vertical; line-height: 1.45; }
+.details-form small { color: #929bac; font-size: 10px; font-weight: 500; }
+.details-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+.details-source { margin-top: 18px; }
+.revision-list { display: grid; gap: 9px; }
+.revision-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid #e5e8ef; border-radius: 11px; background: #fbfcfe; }
+.revision-row > div { display: grid; gap: 4px; min-width: 0; }
+.revision-row strong { color: #3d4656; font-size: 11px; }
+.revision-row small { overflow-wrap: anywhere; color: #8b95a6; font-size: 10px; line-height: 1.35; }
+.button-small { min-height: 32px; padding-inline: 10px; white-space: nowrap; }
 .conflict-card { gap: 10px; border-color: #f0d79c; background: #fffaf0; }
 .conflict-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 5px; }
+.conflict-fields { margin: 0; color: #9a6910; font-size: 11px; line-height: 1.45; }
+.conflict-diff { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin: 12px 0; }
+.conflict-diff article { display: grid; gap: 6px; min-width: 0; padding: 11px; border: 1px solid #e7e9ef; border-radius: 11px; background: #fff; }
+.conflict-diff p { min-height: 45px; margin: 0; overflow-wrap: anywhere; color: #4e596b; font-size: 11px; line-height: 1.45; }
+.conflict-diff small { color: #8b95a6; font-size: 10px; }
+.conflict-actions-stack { display: grid; margin-top: 12px; }
+.secondary-button:disabled, .icon-button:disabled { cursor: default; opacity: .45; }
 
 .mobile-nav, .mobile-only { display: none; }
 .sheet-backdrop { position: fixed; inset: 0; z-index: 80; background: rgba(24, 29, 42, .36); backdrop-filter: blur(3px); }
@@ -144,7 +167,7 @@ button:focus-visible, input:focus-visible { outline: 3px solid #9e8cff; outline-
   .canvas-region { height: calc(var(--fileloom-vh) - 114px); padding: 9px; background: #eef0f5; }
   #deckflow-canvas { height: 100%; min-height: 0; border-radius: 13px; box-shadow: 0 8px 25px rgba(42, 48, 64, .11); }
   .canvas-hint { right: 17px; bottom: 16px; padding: 6px 8px; font-size: 9px; }
-  .mobile-nav { position: fixed; z-index: 30; right: 0; bottom: 0; left: 0; display: grid; grid-template-columns: repeat(5, 1fr); height: calc(56px + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom); border-top: 1px solid #dfe3eb; background: rgba(255,255,255,.96); box-shadow: 0 -5px 18px rgba(37, 45, 60, .08); backdrop-filter: blur(16px); }
+  .mobile-nav { position: fixed; z-index: 30; right: 0; bottom: 0; left: 0; display: grid; grid-template-columns: repeat(6, 1fr); height: calc(56px + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom); border-top: 1px solid #dfe3eb; background: rgba(255,255,255,.96); box-shadow: 0 -5px 18px rgba(37, 45, 60, .08); backdrop-filter: blur(16px); }
   .mobile-nav button { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 0; color: #647084; background: transparent; }
   .mobile-nav button:hover, .mobile-nav button:active { color: var(--purple-dark); background: #f5f3ff; }
   .mobile-nav button span { font-size: 20px; line-height: 20px; }

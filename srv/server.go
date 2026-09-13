@@ -904,13 +904,24 @@ func (e *sourceConflictError) Error() string {
 	return fmt.Sprintf("%s changed since it was opened; reload before saving", e.Path)
 }
 
+type editorMetadataInput struct {
+	Title     *string   `json:"title,omitempty"`
+	Date      *string   `json:"date,omitempty"`
+	Tags      *[]string `json:"tags,omitempty"`
+	Category  *string   `json:"category,omitempty"`
+	Excerpt   *string   `json:"excerpt,omitempty"`
+	Status    *string   `json:"status,omitempty"`
+	PublishAt *string   `json:"publish_at,omitempty"`
+}
+
 type editorSaveRequest struct {
-	Path    string `json:"path"`
-	File    string `json:"file"`
-	HTML    string `json:"html"`
-	BaseSHA string `json:"base_sha256"`
-	Engine  string `json:"engine,omitempty"`
-	Theme   string `json:"theme,omitempty"`
+	Path     string               `json:"path"`
+	File     string               `json:"file"`
+	HTML     string               `json:"html"`
+	BaseSHA  string               `json:"base_sha256"`
+	Engine   string               `json:"engine,omitempty"`
+	Theme    string               `json:"theme,omitempty"`
+	Metadata *editorMetadataInput `json:"metadata,omitempty"`
 }
 
 type editorDocumentResponse struct {
@@ -927,6 +938,82 @@ type editorDocumentResponse struct {
 	MediaAPI      string         `json:"media_api"`
 	SaveAPI       string         `json:"save_api"`
 	Editor        map[string]any `json:"editor"`
+}
+
+func editorTagsValue(tags []string) string {
+	seen := map[string]bool{}
+	clean := make([]string, 0, len(tags))
+	for _, value := range tags {
+		value = strings.TrimSpace(strings.Trim(value, "[]\\\"'"))
+		if value == "" || seen[strings.ToLower(value)] {
+			continue
+		}
+		seen[strings.ToLower(value)] = true
+		clean = append(clean, value)
+	}
+	sort.Strings(clean)
+	if len(clean) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(clean, ", ") + "]"
+}
+
+func editorMetadataUpdates(input *editorMetadataInput, current Document) (map[string]string, error) {
+	if input == nil {
+		return nil, nil
+	}
+	updates := map[string]string{}
+	if input.Title != nil {
+		title := strings.TrimSpace(*input.Title)
+		if title == "" {
+			return nil, errors.New("title is required")
+		}
+		updates["title"] = title
+	}
+	if input.Date != nil {
+		updates["date"] = strings.TrimSpace(*input.Date)
+	}
+	if input.Tags != nil {
+		updates["tags"] = editorTagsValue(*input.Tags)
+	}
+	if input.Category != nil {
+		updates["category"] = strings.TrimSpace(*input.Category)
+	}
+	if input.Excerpt != nil {
+		updates["excerpt"] = strings.TrimSpace(*input.Excerpt)
+	}
+
+	effectiveStatus := strings.ToLower(strings.TrimSpace(current.Status))
+	if effectiveStatus == "" {
+		effectiveStatus = "published"
+	}
+	effectivePublishAt := strings.TrimSpace(current.PublishAt)
+	if input.Status != nil {
+		effectiveStatus = strings.ToLower(strings.TrimSpace(*input.Status))
+		if effectiveStatus != "draft" && effectiveStatus != "private" && effectiveStatus != "published" && effectiveStatus != "scheduled" {
+			return nil, errors.New("status must be draft, private, published, or scheduled")
+		}
+		updates["status"] = effectiveStatus
+	}
+	if input.PublishAt != nil {
+		publishAt, err := normalizePublishAt(*input.PublishAt)
+		if err != nil {
+			return nil, err
+		}
+		effectivePublishAt = publishAt
+		updates["publish_at"] = publishAt
+	}
+	if input.Status != nil && effectiveStatus != "scheduled" {
+		effectivePublishAt = ""
+		updates["publish_at"] = ""
+	}
+	if effectiveStatus == "scheduled" && effectivePublishAt == "" {
+		return nil, errors.New("publish_at is required for scheduled content")
+	}
+	if input.PublishAt != nil && effectiveStatus != "scheduled" && strings.TrimSpace(*input.PublishAt) != "" {
+		return nil, errors.New("publish_at requires scheduled status")
+	}
+	return updates, nil
 }
 
 func setETag(w http.ResponseWriter, sha string) {
@@ -1016,7 +1103,12 @@ func patchFrontMatter(source []byte, updates map[string]string) []byte {
 		}
 	}
 	// Apply existing values from the end so byte offsets remain valid.
-	for i := len(replacements) - 1; i >= 0; i-- {
+	sort.Slice(replacements, func(i, j int) bool {
+		startI, _ := strconv.Atoi(replacements[i][0])
+		startJ, _ := strconv.Atoi(replacements[j][0])
+		return startI > startJ
+	})
+	for i := 0; i < len(replacements); i++ {
 		start, _ := strconv.Atoi(replacements[i][0])
 		end, _ := strconv.Atoi(replacements[i][1])
 		text = text[:start] + replacements[i][2] + text[end:]
@@ -3315,6 +3407,12 @@ func (s *Server) handleRevisionRestoreAPI(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	baseSHA := requestPreconditionSHA(r, r.FormValue("base_sha256"))
+	actualSHA := sourceSHA256(original.Source)
+	if baseSHA != "" && !strings.EqualFold(baseSHA, actualSHA) {
+		writeEditorConflict(w, &sourceConflictError{Path: original.Document.Path, ExpectedSHA: baseSHA, ActualSHA: actualSHA})
+		return
+	}
 	doc, err := s.restoreRevision(targetPath, r.FormValue("id"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -3417,7 +3515,12 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	updated, err := s.patchDocumentSource(input.Path, extractBodyHTML(input.HTML), true, nil, baseSHA, "Edit "+input.Path)
+	metadata, err := editorMetadataUpdates(input.Metadata, original.Document)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := s.patchDocumentSource(input.Path, extractBodyHTML(input.HTML), true, metadata, baseSHA, "Edit "+input.Path)
 	if err != nil {
 		var conflict *sourceConflictError
 		if errors.As(err, &conflict) {
@@ -3428,7 +3531,7 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var build BuildResult
-	if documentIsPublishable(updated, time.Now().UTC()) {
+	if documentIsPublishable(original.Document, time.Now().UTC()) || documentIsPublishable(updated, time.Now().UTC()) {
 		build, err = s.Build()
 		if err != nil {
 			rollbackErr := s.writeContentSource(updated.Path, original.Source)

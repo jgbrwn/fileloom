@@ -1,4 +1,4 @@
-.PHONY: build editor-build clean test run fmt
+.PHONY: build editor-build editor-test clean test run fmt
 
 build:
 	go build -o fileloom ./cmd/fileloom
@@ -6,6 +6,9 @@ build:
 editor-build:
 	npm ci --prefix web/editor
 	npm run build --prefix web/editor
+
+editor-test:
+	npm run test:e2e --prefix web/editor
 
 run:
 	go run ./cmd/fileloom

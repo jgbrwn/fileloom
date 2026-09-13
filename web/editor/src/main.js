@@ -9,6 +9,9 @@ const state = {
   record: null,
   editor: null,
   currentHTML: "",
+  baseHTML: "",
+  baseDocument: null,
+  metadata: null,
   dirty: false,
   saving: false,
   changeVersion: 0,
@@ -18,6 +21,76 @@ const state = {
   selected: null,
   sheet: null,
 };
+
+const metadataFields = ["title", "date", "tags", "category", "excerpt", "status", "publish_at"];
+
+function metadataFromDocument(document) {
+  return {
+    title: String(document?.title || ""),
+    date: String(document?.date || ""),
+    tags: [...(document?.tags || [])],
+    category: String(document?.category || ""),
+    excerpt: String(document?.excerpt || ""),
+    status: String(document?.status || "published"),
+    publish_at: String(document?.publish_at || ""),
+  };
+}
+
+function cloneMetadata(metadata) {
+  return metadataFromDocument(metadata || {});
+}
+
+function metadataValue(metadata, field) {
+  const value = metadata?.[field];
+  return Array.isArray(value) ? value.join("\u001f") : String(value ?? "");
+}
+
+function metadataPayload() {
+  const metadata = cloneMetadata(state.metadata || state.record?.document || {});
+  metadata.tags = metadata.tags.map((tag) => String(tag).trim()).filter(Boolean);
+  return metadata;
+}
+
+function bodyHTMLFromEditorDocument(html) {
+  try {
+    const parsed = new DOMParser().parseFromString(String(html || ""), "text/html");
+    return parsed.body?.innerHTML || "";
+  } catch {
+    return String(html || "");
+  }
+}
+
+function normalizedBodyHTML(html) {
+  return bodyHTMLFromEditorDocument(html).replace(/\s+/g, " ").trim();
+}
+
+function textSummary(html, fallback = "(empty)") {
+  try {
+    const parsed = new DOMParser().parseFromString(String(html || ""), "text/html");
+    const text = (parsed.body?.textContent || "").replace(/\s+/g, " ").trim();
+    return text ? `${text.slice(0, 180)}${text.length > 180 ? "…" : ""}` : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function localDateTimeValue(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (number) => String(number).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function updateDocumentHeading() {
+  const heading = document.querySelector(".document-heading strong");
+  if (!heading) return;
+  const title = state.record?.document?.title || state.record?.path || "";
+  heading.textContent = title;
+  heading.title = title;
+  const summary = document.querySelector("[data-document-summary]");
+  if (summary) summary.textContent = `${state.record?.theme || "default"} theme · ${state.record?.document?.status || "published"} · HTML-first`;
+}
 
 const escapeHTML = (value) => String(value ?? "")
   .replaceAll("&", "&amp;")
@@ -91,8 +164,31 @@ function cleanSelectedHTML(element) {
   return clone.outerHTML || "";
 }
 
+function sourceSelectionElement(source, selection) {
+  if (!selection?.target) return null;
+  const parsed = new DOMParser().parseFromString(String(source || ""), "text/html");
+  const target = selection.target;
+  if (target.selector) {
+    try {
+      const matches = parsed.querySelectorAll(target.selector);
+      if (matches[target.selectorIndex ?? 0]) return matches[target.selectorIndex ?? 0];
+    } catch {
+      // Fall through to the stable id/path fallbacks.
+    }
+  }
+  if (target.id) {
+    const byID = parsed.getElementById(target.id);
+    if (byID) return byID;
+  }
+  let node = parsed.body;
+  for (const index of target.domPath || []) node = node?.children?.[index];
+  return node || null;
+}
+
 function insertAfterSelection(source, fragment, selection) {
-  const selectedHTML = cleanSelectedHTML(selection?.element);
+  const resolved = sourceSelectionElement(source, selection);
+  if (resolved && ["BODY", "HTML"].includes(resolved.tagName)) return insertIntoBody(source, fragment);
+  const selectedHTML = cleanSelectedHTML(resolved || selection?.element);
   if (!selectedHTML) return insertIntoBody(source, fragment);
   const occurrence = Math.max(0, Number(selection?.target?.selectorIndex || 0));
   let cursor = 0;
@@ -179,10 +275,11 @@ function blockFragment(type) {
 
 async function insertBlock(type) {
   if (!state.editor) return;
+  const hadSelection = Boolean(state.selected);
   const next = insertAfterSelection(state.editor.getHtml(), blockFragment(type), state.selected);
   await applyEditorHTML(next);
   closeSheet();
-  setStatus(state.selected ? "Block added after selection" : "Block added", "dirty");
+  setStatus(hadSelection ? "Block added after selection" : "Block added", "dirty");
 }
 
 function flattenMedia(node, result = []) {
@@ -244,11 +341,12 @@ async function openMediaSheet() {
 }
 
 async function insertImage(url, name) {
+  const hadSelection = Boolean(state.selected);
   const fragment = `<figure class="fileloom-image"><img src="${escapeHTML(url)}" alt="${escapeHTML(name)}"><figcaption>${escapeHTML(name)}</figcaption></figure>`;
   const next = insertAfterSelection(state.editor.getHtml(), fragment, state.selected);
   await applyEditorHTML(next);
   closeSheet();
-  setStatus(state.selected ? "Image added after selection" : "Image added", "dirty");
+  setStatus(hadSelection ? "Image added after selection" : "Image added", "dirty");
 }
 
 function openSheet(kind) {
@@ -263,6 +361,11 @@ function openSheet(kind) {
     document.querySelector("#sheet-content").innerHTML = blockCatalogHTML();
   } else if (kind === "style") {
     document.querySelector("#sheet-content").innerHTML = styleSheetHTML();
+  } else if (kind === "details") {
+    document.querySelector("#sheet-content").innerHTML = detailsSheetHTML();
+    syncPublishAtField();
+  } else if (kind === "history") {
+    document.querySelector("#sheet-content").innerHTML = '<div class="sheet-heading"><div><span class="eyebrow">Source history</span><h2>Revision history</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div><div class="sheet-loading">Loading history…</div>';
   } else if (kind === "conflict") {
     document.querySelector("#sheet-content").innerHTML = conflictSheetHTML();
   }
@@ -282,9 +385,185 @@ function blockCatalogHTML() {
   ].map(([type, label, icon]) => `<button class="block-card" data-block="${type}"><span>${icon}</span><strong>${label}</strong><small>Tap to add</small></button>`).join("")}</div>`;
 }
 
+function detailsSheetHTML() {
+  const metadata = metadataPayload();
+  const scheduled = metadata.status === "scheduled";
+  return `<div class="sheet-heading"><div><span class="eyebrow">Page details</span><h2>Metadata & status</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
+    <form id="details-form" class="details-form">
+      <label class="form-field"><span>Title</span><input data-metadata="title" value="${escapeHTML(metadata.title)}" required></label>
+      <div class="details-grid"><label class="form-field"><span>Date</span><input data-metadata="date" type="date" value="${escapeHTML(metadata.date)}"></label><label class="form-field"><span>Status</span><select data-metadata="status"><option value="draft" ${metadata.status === "draft" ? "selected" : ""}>Draft</option><option value="private" ${metadata.status === "private" ? "selected" : ""}>Private</option><option value="published" ${metadata.status === "published" ? "selected" : ""}>Published</option><option value="scheduled" ${metadata.status === "scheduled" ? "selected" : ""}>Scheduled</option></select></label></div>
+      <label class="form-field" data-publish-at-field ${scheduled ? "" : "hidden"}><span>Publish at</span><input data-metadata="publish_at" type="datetime-local" value="${escapeHTML(localDateTimeValue(metadata.publish_at))}"><small>Stored in UTC after saving.</small></label>
+      <div class="details-grid"><label class="form-field"><span>Tags</span><input data-metadata="tags" value="${escapeHTML(metadata.tags.join(", "))}" placeholder="design, notes"></label><label class="form-field"><span>Category</span><input data-metadata="category" value="${escapeHTML(metadata.category)}"></label></div>
+      <label class="form-field"><span>Excerpt</span><textarea data-metadata="excerpt" rows="3">${escapeHTML(metadata.excerpt)}</textarea></label>
+      <div class="details-actions"><button type="button" class="secondary-button" data-action="history">History</button><button type="button" class="primary-button" data-action="save">Save details</button></div>
+    </form>
+    <div class="info-card details-source"><span class="eyebrow">Source</span><strong>${escapeHTML(state.record?.path || "")}</strong><small>${escapeHTML(state.record?.theme || "default")} theme · slug ${escapeHTML(state.record?.document?.slug || "")}</small></div>`;
+}
+
+function syncPublishAtField() {
+  const field = document.querySelector("[data-publish-at-field]");
+  const status = document.querySelector('[data-metadata="status"]');
+  const input = document.querySelector('[data-metadata="publish_at"]');
+  if (field) field.hidden = status?.value !== "scheduled";
+  if (input) input.required = status?.value === "scheduled";
+}
+
+function parseTagsInput(value) {
+  const seen = new Set();
+  return String(value || "").split(",").map((tag) => tag.trim()).filter((tag) => {
+    const key = tag.toLowerCase();
+    if (!tag || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function updateMetadataDraft(field) {
+  if (!state.metadata) state.metadata = metadataFromDocument(state.record?.document || {});
+  const name = field.dataset.metadata;
+  if (!metadataFields.includes(name)) return;
+  state.metadata[name] = name === "tags" ? parseTagsInput(field.value) : field.value;
+  state.changeVersion += 1;
+  if (name === "status") syncPublishAtField();
+  setDirty(true);
+}
+
+function metadataMerge(remoteDocument) {
+  const base = state.baseDocument || metadataFromDocument(state.record?.document || {});
+  const local = state.metadata || base;
+  const remote = metadataFromDocument(remoteDocument);
+  const merged = {};
+  const conflicts = [];
+  for (const field of metadataFields) {
+    const localValue = metadataValue(local, field);
+    const baseValue = metadataValue(base, field);
+    const remoteValue = metadataValue(remote, field);
+    if (localValue === baseValue) merged[field] = Array.isArray(remote[field]) ? [...remote[field]] : remote[field];
+    else if (remoteValue === baseValue || localValue === remoteValue) merged[field] = Array.isArray(local[field]) ? [...local[field]] : local[field];
+    else {
+      merged[field] = Array.isArray(local[field]) ? [...local[field]] : local[field];
+      conflicts.push(field);
+    }
+  }
+  return { merged, conflicts };
+}
+
 function conflictSheetHTML() {
-  const current = state.conflict?.current_sha256 || "";
-  return `<div class="sheet-heading"><div><span class="eyebrow">Save conflict</span><h2>Someone changed this page</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div><div class="info-card conflict-card"><p>Your local edits are still in the canvas. Reloading replaces them with the newer source version.</p><small>Current source: ${escapeHTML(current.slice(0, 12))}…</small><div class="conflict-actions"><button class="secondary-button" data-action="keep-conflict">Keep my edits</button><button class="primary-button" data-action="reload-conflict">Reload newer source</button></div></div>`;
+  const conflict = state.conflict || {};
+  const remote = conflict.remote;
+  if (!remote) {
+    return `<div class="sheet-heading"><div><span class="eyebrow">Save conflict</span><h2>Someone changed this page</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div><div class="info-card conflict-card"><p>Your local edits are safe in this canvas. Loading the current source…</p></div>`;
+  }
+  const merge = conflict.merge || metadataMerge(remote.document);
+  const baseBody = state.baseHTML || state.record?.html || "";
+  const localBody = bodyHTMLFromEditorDocument(state.editor?.getHtml() || state.currentHTML);
+  const localChanged = normalizedBodyHTML(localBody) !== normalizedBodyHTML(baseBody);
+  const remoteChanged = normalizedBodyHTML(remote.html) !== normalizedBodyHTML(baseBody);
+  const bodyConflict = localChanged && remoteChanged && normalizedBodyHTML(localBody) !== normalizedBodyHTML(remote.html);
+  const fields = merge.conflicts.length ? `<p class="conflict-fields"><strong>Metadata conflicts:</strong> ${escapeHTML(merge.conflicts.join(", "))}</p>` : `<p class="conflict-fields">Metadata changes can be merged safely.</p>`;
+  const mergeDisabled = bodyConflict || merge.conflicts.length > 0;
+  return `<div class="sheet-heading"><div><span class="eyebrow">Save conflict</span><h2>Review newer source</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
+    <div class="info-card conflict-card"><p>The source changed after this editor opened. Choose deliberately; nothing has been overwritten yet.</p><small>Remote source: ${escapeHTML(String(remote.source_sha256 || conflict.current_sha256 || "").slice(0, 12))}…</small>${fields}</div>
+    <div class="conflict-diff"><article><span class="eyebrow">Your local body</span><p>${escapeHTML(textSummary(localBody))}</p><small>${localChanged ? "Changed locally" : "Unchanged locally"}</small></article><article><span class="eyebrow">Remote body</span><p>${escapeHTML(textSummary(remote.html))}</p><small>${remoteChanged ? "Changed remotely" : "Unchanged remotely"}</small></article></div>
+    <div class="conflict-actions conflict-actions-stack"><button class="secondary-button" data-action="reload-conflict">Use remote version</button><button class="secondary-button" data-action="merge-conflict" ${mergeDisabled ? "disabled" : ""}>Merge safe changes, keep local body</button><button class="primary-button" data-action="overwrite-conflict">Keep all local edits</button></div>`;
+}
+
+function historySheetHTML(revisions) {
+  const rows = revisions.length ? revisions.map((revision) => `<article class="revision-row"><div><strong>${escapeHTML(new Date(revision.created_at).toLocaleString())}</strong><small>${escapeHTML(revision.reason || "Source change")} · ${escapeHTML(String(revision.size || 0))} bytes</small></div><button class="secondary-button button-small" data-revision-id="${escapeHTML(revision.id)}">Restore</button></article>`).join("") : '<p class="empty-state">No revisions yet. A snapshot is created before the next change.</p>';
+  return `<div class="sheet-heading"><div><span class="eyebrow">Source history</span><h2>Revision history</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div><div class="revision-list">${rows}</div>`;
+}
+
+async function openHistorySheet() {
+  openSheet("history");
+  const content = document.querySelector("#sheet-content");
+  try {
+    const data = await fetchJSON(`/_cms/api/revisions?path=${encodeURIComponent(state.record.path)}`);
+    if (state.sheet !== "history") return;
+    content.innerHTML = historySheetHTML(data.revisions || []);
+  } catch (error) {
+    content.innerHTML = `<p class="error-card">${escapeHTML(error.message)}</p>`;
+  }
+}
+
+async function restoreRevision(id, button) {
+  if (state.dirty && !window.confirm("Restore this revision and discard your unsaved editor changes?")) return;
+  if (button) button.disabled = true;
+  try {
+    const body = new URLSearchParams({ path: state.record.path, id, base_sha256: state.record.source_sha256 });
+    await fetchJSON("/_cms/api/revisions/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    });
+    closeSheet();
+    await refreshDocument(true);
+    setStatus("Revision restored", "success");
+  } catch (error) {
+    if (error.status === 409) {
+      await showConflict(error.payload);
+    } else {
+      setStatus(error.message, "error");
+    }
+    if (button) button.disabled = false;
+  }
+}
+
+async function showConflict(payload) {
+  state.conflict = payload || {};
+  openSheet("conflict");
+  const content = document.querySelector("#sheet-content");
+  try {
+    const url = state.conflict.reload_url || `/_cms/api/editor?path=${encodeURIComponent(state.record.path)}&engine=deckflow`;
+    state.conflict.remote = await fetchJSON(url);
+    state.conflict.merge = metadataMerge(state.conflict.remote.document);
+    if (state.sheet === "conflict") content.innerHTML = conflictSheetHTML();
+  } catch (error) {
+    content.innerHTML = `<div class="sheet-heading"><div><span class="eyebrow">Save conflict</span><h2>Review newer source</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div><p class="error-card">Could not load the newer source: ${escapeHTML(error.message)}</p>`;
+  }
+}
+
+async function useRemoteConflict() {
+  closeSheet();
+  await refreshDocument(true);
+}
+
+async function overwriteConflict() {
+  const remote = state.conflict?.remote;
+  if (!remote) return;
+  state.record = remote;
+  state.baseDocument = metadataFromDocument(remote.document);
+  state.baseHTML = remote.html || "";
+  state.record.source_sha256 = remote.source_sha256;
+  state.conflict = null;
+  closeSheet();
+  setStatus("Retrying with local edits…", "busy");
+  await saveDocument();
+}
+
+async function mergeConflict() {
+  const remote = state.conflict?.remote;
+  const merge = state.conflict?.merge;
+  if (!remote || !merge || merge.conflicts.length) return;
+  const baseBody = state.baseHTML || state.record?.html || "";
+  const localBody = bodyHTMLFromEditorDocument(state.editor?.getHtml() || state.currentHTML);
+  const localChanged = normalizedBodyHTML(localBody) !== normalizedBodyHTML(baseBody);
+  const remoteChanged = normalizedBodyHTML(remote.html) !== normalizedBodyHTML(baseBody);
+  if (localChanged && remoteChanged && normalizedBodyHTML(localBody) !== normalizedBodyHTML(remote.html)) return;
+  if (!localChanged && remoteChanged) {
+    await state.editor.setHtml(editorDocument(remote));
+    state.currentHTML = state.editor.getHtml();
+  }
+  state.record = remote;
+  state.baseDocument = metadataFromDocument(remote.document);
+  state.baseHTML = remote.html || "";
+  state.record.source_sha256 = remote.source_sha256;
+  state.metadata = merge.merged;
+  state.conflict = null;
+  state.changeVersion += 1;
+  closeSheet();
+  setDirty(true);
+  setStatus("Merged safe changes; saving…", "busy");
+  await saveDocument();
 }
 
 function styleSheetHTML() {
@@ -303,9 +582,9 @@ function renderShell(record) {
       <main class="editor-workspace">
         <aside class="desktop-panel desktop-blocks"><div class="panel-heading"><div><span class="eyebrow">Add</span><h2>Blocks</h2></div></div>${blockCatalogHTML()}</aside>
         <section class="canvas-region"><div id="deckflow-canvas" aria-label="Editable page canvas"></div><div class="canvas-hint">Tap text to edit · Select an element for controls</div></section>
-        <aside class="desktop-panel desktop-inspector"><div class="panel-heading"><div><span class="eyebrow">Inspect</span><h2>Selection</h2></div></div><div id="selection-info" class="selection-info"><strong>Nothing selected</strong><p>Choose an element in the canvas to edit it.</p></div><div class="inspector-divider"></div><div class="info-card"><span class="eyebrow">Source</span><strong>${escapeHTML(record.path)}</strong><small>${escapeHTML(record.theme || "default")} theme · HTML-first</small></div></aside>
+        <aside class="desktop-panel desktop-inspector"><div class="panel-heading"><div><span class="eyebrow">Inspect</span><h2>Selection</h2></div></div><div id="selection-info" class="selection-info"><strong>Nothing selected</strong><p>Choose an element in the canvas to edit it.</p></div><div class="inspector-divider"></div><div class="quick-actions inspector-actions"><button class="secondary-button" data-action="details">Details</button><button class="secondary-button" data-action="history">History</button></div><div class="info-card"><span class="eyebrow">Source</span><strong>${escapeHTML(record.path)}</strong><small data-document-summary>${escapeHTML(record.theme || "default")} theme · ${escapeHTML(record.document?.status || "published")} · HTML-first</small></div></aside>
       </main>
-      <nav class="mobile-nav" aria-label="Editor tools"><button data-action="blocks"><span>＋</span><small>Blocks</small></button><button data-action="media"><span>▧</span><small>Media</small></button><button data-action="style"><span>◌</span><small>Style</small></button><button data-action="preview"><span>◉</span><small>Preview</small></button><button data-action="save"><span>↑</span><small>Save</small></button></nav>
+      <nav class="mobile-nav" aria-label="Editor tools"><button data-action="blocks"><span>＋</span><small>Blocks</small></button><button data-action="media"><span>▧</span><small>Media</small></button><button data-action="details"><span>≡</span><small>Details</small></button><button data-action="style"><span>◌</span><small>Style</small></button><button data-action="preview"><span>◉</span><small>Preview</small></button><button data-action="save"><span>↑</span><small>Save</small></button></nav>
       <div id="sheet-backdrop" class="sheet-backdrop" hidden data-action="close-sheet"></div><section id="editor-sheet" class="editor-sheet" hidden aria-label="Editor panel"><div id="sheet-grabber"></div><div id="sheet-content"></div></section>
     </div>`;
 }
@@ -330,15 +609,22 @@ async function saveDocument() {
   try {
     const html = await state.editor.flush();
     const versionAtStart = state.changeVersion;
+    const metadata = metadataPayload();
     const payload = await fetchJSON("/_cms/api/editor-save", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: state.record.path, html, base_sha256: state.record.source_sha256, engine: "deckflow" }),
+      body: JSON.stringify({ path: state.record.path, html, metadata, base_sha256: state.record.source_sha256, engine: "deckflow" }),
     });
     state.record.source_sha256 = payload.source_sha256;
+    state.record.document = payload.document || state.record.document;
+    state.record.html = payload.document?.html || state.record.html;
+    state.baseDocument = metadataFromDocument(state.record.document);
+    state.baseHTML = state.record.html || "";
     state.currentHTML = html;
     state.conflict = null;
+    updateDocumentHeading();
     if (state.changeVersion === versionAtStart) {
+      state.metadata = metadataFromDocument(state.record.document);
       setDirty(false);
       setStatus("Saved", "success");
     } else {
@@ -347,16 +633,15 @@ async function saveDocument() {
     }
   } catch (error) {
     if (error.status === 409) {
-      state.conflict = error.payload;
-      setStatus("Conflict — your changes are still here", "error");
-      openSheet("conflict");
+      await showConflict(error.payload);
+      setStatus("Conflict — review the newer source", "error");
     } else {
       setStatus(error.message, "error");
     }
   } finally {
     state.saving = false;
     setDirty(state.dirty);
-    if (state.conflict) setStatus("Conflict — your changes are still here", "error");
+    if (state.conflict && !state.sheet) setStatus("Conflict — review the newer source", "error");
   }
 }
 
@@ -365,11 +650,15 @@ async function refreshDocument(force = false) {
   const fresh = await fetchJSON(`/_cms/api/editor?path=${encodeURIComponent(state.path)}&engine=deckflow`);
   state.record = fresh;
   state.currentHTML = editorDocument(fresh);
+  state.baseHTML = fresh.html || "";
+  state.baseDocument = metadataFromDocument(fresh.document);
+  state.metadata = metadataFromDocument(fresh.document);
   state.hostUndo = [];
   state.hostRedo = [];
   state.conflict = null;
   state.changeVersion += 1;
   await state.editor.setHtml(state.currentHTML);
+  updateDocumentHeading();
   setDirty(false);
   setStatus("Reloaded", "success");
 }
@@ -380,6 +669,7 @@ async function handleAction(action) {
       if (!state.dirty || window.confirm("Leave without saving your changes?")) window.location.href = "/_cms/";
       break;
     case "save":
+      if (document.querySelector("#details-form") && !document.querySelector("#details-form").reportValidity()) break;
       await saveDocument();
       break;
     case "preview":
@@ -395,7 +685,13 @@ async function handleAction(action) {
       openSheet("style");
       break;
     case "more":
-      openSheet("style");
+      openSheet("details");
+      break;
+    case "details":
+      openSheet("details");
+      break;
+    case "history":
+      await openHistorySheet();
       break;
     case "undo":
       await undoEditorChange();
@@ -404,8 +700,13 @@ async function handleAction(action) {
       await redoEditorChange();
       break;
     case "reload-conflict":
-      closeSheet();
-      await refreshDocument(true);
+      await useRemoteConflict();
+      break;
+    case "merge-conflict":
+      await mergeConflict();
+      break;
+    case "overwrite-conflict":
+      await overwriteConflict();
       break;
     case "keep-conflict":
       closeSheet();
@@ -434,8 +735,23 @@ app.addEventListener("click", async (event) => {
     else await insertBlock(block.dataset.block);
     return;
   }
+  const revision = event.target.closest("[data-revision-id]");
+  if (revision) {
+    await restoreRevision(revision.dataset.revisionId, revision);
+    return;
+  }
   const action = event.target.closest("[data-action]")?.dataset.action;
   if (action) await handleAction(action);
+});
+
+app.addEventListener("input", (event) => {
+  const field = event.target.closest("#details-form [data-metadata]");
+  if (field) updateMetadataDraft(field);
+});
+
+app.addEventListener("change", (event) => {
+  const field = event.target.closest("#details-form [data-metadata]");
+  if (field) updateMetadataDraft(field);
 });
 
 document.addEventListener("keydown", (event) => {
@@ -458,6 +774,9 @@ setViewportHeight();
 async function start() {
   if (!path) throw new Error("No content path was provided");
   state.record = await fetchJSON(`/_cms/api/editor?path=${encodeURIComponent(path)}&engine=deckflow`);
+  state.baseHTML = state.record.html || "";
+  state.baseDocument = metadataFromDocument(state.record.document);
+  state.metadata = metadataFromDocument(state.record.document);
   if (!state.record.editor?.engines?.some((engine) => engine.name === "deckflow" && engine.available)) {
     throw new Error("The Deckflow editor bundle is not installed yet");
   }

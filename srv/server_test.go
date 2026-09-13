@@ -181,6 +181,137 @@ func TestEditorAPIGetAndJSONSaveContract(t *testing.T) {
 	}
 }
 
+func TestEditorJSONMetadataSaveAndPublishingTransition(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	path := filepath.Join(siteDir, "content", "pages", "about.html")
+	original := "---\n# keep this source comment\ntitle: About\nslug: about\ndate: 2026-09-09\nstatus: published\ncustom: preserve-me\n---\n\n<p>Original body</p>\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Build(); err != nil {
+		t.Fatal(err)
+	}
+	base := sourceSHA256([]byte(original))
+	metadata := map[string]any{
+		"title":      "Updated About",
+		"date":       "2026-09-13",
+		"tags":       []string{"Design", "notes", "design"},
+		"category":   "Guide",
+		"excerpt":    "Updated excerpt",
+		"status":     "draft",
+		"publish_at": "",
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"path":        "pages/about.html",
+		"html":        "<!doctype html><html><body><p>Updated body</p></body></html>",
+		"base_sha256": base,
+		"engine":      "deckflow",
+		"metadata":    metadata,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("metadata save status = %d: %s", res.Code, res.Body)
+	}
+	var saved struct {
+		SourceSHA256 string   `json:"source_sha256"`
+		Document     Document `json:"document"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.SourceSHA256 == "" || saved.Document.Title != "Updated About" || saved.Document.Status != "draft" || saved.Document.Category != "Guide" {
+		t.Fatalf("unexpected metadata response: %#v", saved)
+	}
+	if strings.Join(saved.Document.Tags, ",") != "Design,notes" {
+		t.Fatalf("unexpected tags: %#v", saved.Document.Tags)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"# keep this source comment", "custom: preserve-me", "title: Updated About", "status: draft", "tags: [Design, notes]", "<p>Updated body</p>"} {
+		if !strings.Contains(string(updated), expected) {
+			t.Fatalf("metadata save missing %q: %s", expected, updated)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(siteDir, "public", "about", "index.html")); !os.IsNotExist(err) {
+		t.Fatalf("draft transition left public output, stat error = %v", err)
+	}
+
+	scheduledMetadata := map[string]any{"status": "scheduled", "publish_at": "2026-09-14T12:00:00-05:00"}
+	scheduledPayload, _ := json.Marshal(map[string]any{"path": "pages/about.html", "html": "<p>Updated body</p>", "base_sha256": saved.SourceSHA256, "metadata": scheduledMetadata})
+	scheduledReq := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", bytes.NewReader(scheduledPayload))
+	scheduledReq.Header.Set("Content-Type", "application/json")
+	scheduledReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	scheduledRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(scheduledRes, scheduledReq)
+	if scheduledRes.Code != http.StatusOK {
+		t.Fatalf("scheduled metadata save status = %d: %s", scheduledRes.Code, scheduledRes.Body)
+	}
+	var scheduled struct {
+		Document Document `json:"document"`
+	}
+	if err := json.Unmarshal(scheduledRes.Body.Bytes(), &scheduled); err != nil {
+		t.Fatal(err)
+	}
+	if scheduled.Document.Status != "scheduled" || scheduled.Document.PublishAt != "2026-09-14T17:00:00Z" {
+		t.Fatalf("scheduled metadata = %#v", scheduled.Document)
+	}
+
+	invalidPayload, _ := json.Marshal(map[string]any{"path": "pages/about.html", "html": "<p>Updated body</p>", "base_sha256": scheduledRes.Header().Get("ETag"), "metadata": map[string]any{"status": "scheduled", "publish_at": ""}})
+	invalidReq := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", bytes.NewReader(invalidPayload))
+	invalidReq.Header.Set("Content-Type", "application/json")
+	invalidReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	invalidRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(invalidRes, invalidReq)
+	if invalidRes.Code != http.StatusBadRequest {
+		t.Fatalf("missing schedule time status = %d: %s", invalidRes.Code, invalidRes.Body)
+	}
+}
+
+func TestRevisionRestorePrecondition(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	path := filepath.Join(siteDir, "content", "pages", "about.html")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.patchDocumentSource("pages/about.html", "<p>Revision body</p>", true, nil, sourceSHA256(before), "revision test"); err != nil {
+		t.Fatal(err)
+	}
+	revisions, err := server.listRevisions("pages/about.html")
+	if err != nil || len(revisions) == 0 {
+		t.Fatalf("revisions = %#v, err=%v", revisions, err)
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.patchDocumentSource("pages/about.html", "<p>Newer body</p>", true, nil, sourceSHA256(current), "newer test"); err != nil {
+		t.Fatal(err)
+	}
+	stale := httptest.NewRequest(http.MethodPost, "/_cms/api/revisions/restore", strings.NewReader(url.Values{"path": {"pages/about.html"}, "id": {revisions[0].ID}, "base_sha256": {sourceSHA256(current)}}.Encode()))
+	stale.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	stale.Header.Set("X-ExeDev-Email", "owner@example.com")
+	staleRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(staleRes, stale)
+	if staleRes.Code != http.StatusConflict || !strings.Contains(staleRes.Body.String(), `"code":"source_conflict"`) {
+		t.Fatalf("stale restore = %d: %s", staleRes.Code, staleRes.Body)
+	}
+}
+
 func TestCMSRequiresConfiguredExeDevEmail(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")

@@ -5,6 +5,9 @@
 # generated site output
 /site/public/
 
+/web/editor/test-results/
+/web/editor/playwright-report/
+
 # local secrets/config
 .env
 *.swp
