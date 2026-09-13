@@ -1,11 +1,18 @@
 import { createElementTarget } from "@deckflow/html-editor/core";
 import { patchElementInHtml } from "@deckflow/html-editor/html-patch";
 import { mountHtmlEditor } from "@deckflow/html-editor/ui";
+import {
+  injectThemePreviewStyles,
+  shieldThemeTemplate,
+  stripThemePreviewStyles,
+  unshieldThemeTemplate,
+} from "./theme-template.js";
 import "./style.css";
 
 const app = document.querySelector("#app");
 const params = new URLSearchParams(window.location.search);
 const path = params.get("path") || "";
+const themeParam = params.get("theme") || "";
 const state = {
   path,
   record: null,
@@ -14,6 +21,8 @@ const state = {
   baseHTML: "",
   baseDocument: null,
   metadata: null,
+  resource: "content",
+  themeTokens: [],
   dirty: false,
   saving: false,
   changeVersion: 0,
@@ -144,7 +153,26 @@ async function fetchJSON(url, options = {}) {
   return payload;
 }
 
+function isThemeResource(record = state.record) {
+  return record?.resource === "theme-layout" || Boolean(record?.theme && String(record?.path || "").startsWith("themes/"));
+}
+
+function editorRequestURL() {
+  if (themeParam) return `/_cms/api/editor?theme=${encodeURIComponent(themeParam)}&engine=deckflow`;
+  return `/_cms/api/editor?path=${encodeURIComponent(path)}&engine=deckflow`;
+}
+
+function sourceHTMLForSave(html) {
+  if (!isThemeResource()) return html;
+  return unshieldThemeTemplate(stripThemePreviewStyles(html), state.themeTokens);
+}
+
 function editorDocument(record) {
+  if (isThemeResource(record)) {
+    const shielded = shieldThemeTemplate(record.html || "");
+    state.themeTokens = shielded.tokens;
+    return injectThemePreviewStyles(shielded.html, record.stylesheet_css || "");
+  }
   const css = String(record.stylesheet_css || "").replace(/<\/style/gi, "<\\/style");
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/_cms/assets/fileloom-code.css"><style>${css}</style><style>html{background:#fff}body{min-height:100vh;margin:0}</style></head><body>${record.html || ""}</body></html>`;
 }
@@ -919,7 +947,12 @@ function blockCatalogHTML() {
   ].map(([type, label, icon]) => `<button class="block-card" data-block="${type}"><span>${icon}</span><strong>${label}</strong><small>Tap to add</small></button>`).join("")}</div>`;
 }
 
+function themeDetailsSheetHTML() {
+  return `<div class="sheet-heading"><div><span class="eyebrow">Theme layout</span><h2>${escapeHTML(state.record?.theme || "Theme")}</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>${selectionOperationsHTML()}<div class="details-actions"><button type="button" class="secondary-button" data-action="history">History</button></div><div class="info-card details-source"><span class="eyebrow">Source</span><strong>${escapeHTML(state.record?.path || "")}</strong><small>Template placeholders are protected while editing. Use Style tokens for CSS variables.</small></div>`;
+}
+
 function detailsSheetHTML() {
+  if (isThemeResource()) return themeDetailsSheetHTML();
   const metadata = metadataPayload();
   const scheduled = metadata.status === "scheduled";
   const codeAction = selectedCodeBlock() ? '<button type="button" class="secondary-button" data-action="edit-code">Edit code</button>' : "";
@@ -991,7 +1024,9 @@ function conflictSheetHTML() {
   }
   const merge = conflict.merge || metadataMerge(remote.document);
   const baseBody = state.baseHTML || state.record?.html || "";
-  const localBody = bodyHTMLFromEditorDocument(state.editor?.getHtml() || state.currentHTML);
+  const localBody = isThemeResource()
+    ? sourceHTMLForSave(state.editor?.getHtml() || state.currentHTML)
+    : bodyHTMLFromEditorDocument(state.editor?.getHtml() || state.currentHTML);
   const localChanged = normalizedBodyHTML(localBody) !== normalizedBodyHTML(baseBody);
   const remoteChanged = normalizedBodyHTML(remote.html) !== normalizedBodyHTML(baseBody);
   const bodyConflict = localChanged && remoteChanged && normalizedBodyHTML(localBody) !== normalizedBodyHTML(remote.html);
@@ -1048,7 +1083,7 @@ async function showConflict(payload) {
   openSheet("conflict");
   const content = document.querySelector("#sheet-content");
   try {
-    const url = state.conflict.reload_url || `/_cms/api/editor?path=${encodeURIComponent(state.record.path)}&engine=deckflow`;
+    const url = state.conflict.reload_url || editorRequestURL();
     state.conflict.remote = await fetchJSON(url);
     state.conflict.merge = metadataMerge(state.conflict.remote.document);
     if (state.sheet === "conflict") content.innerHTML = conflictSheetHTML();
@@ -1080,7 +1115,9 @@ async function mergeConflict() {
   const merge = state.conflict?.merge;
   if (!remote || !merge || merge.conflicts.length) return;
   const baseBody = state.baseHTML || state.record?.html || "";
-  const localBody = bodyHTMLFromEditorDocument(state.editor?.getHtml() || state.currentHTML);
+  const localBody = isThemeResource()
+    ? sourceHTMLForSave(state.editor?.getHtml() || state.currentHTML)
+    : bodyHTMLFromEditorDocument(state.editor?.getHtml() || state.currentHTML);
   const localChanged = normalizedBodyHTML(localBody) !== normalizedBodyHTML(baseBody);
   const remoteChanged = normalizedBodyHTML(remote.html) !== normalizedBodyHTML(baseBody);
   if (localChanged && remoteChanged && normalizedBodyHTML(localBody) !== normalizedBodyHTML(remote.html)) return;
@@ -1143,17 +1180,25 @@ async function saveDocument() {
   setDirty(true);
   setStatus("Saving…", "busy");
   try {
-    const html = await state.editor.flush();
+    const html = sourceHTMLForSave(await state.editor.flush());
     const versionAtStart = state.changeVersion;
-    const metadata = metadataPayload();
+    const metadata = isThemeResource() ? undefined : metadataPayload();
     const payload = await fetchJSON("/_cms/api/editor-save", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: state.record.path, html, metadata, base_sha256: state.record.source_sha256, engine: "deckflow" }),
+      body: JSON.stringify({
+        resource: state.resource,
+        theme: isThemeResource() ? state.record.theme : undefined,
+        path: state.record.path,
+        html,
+        metadata,
+        base_sha256: state.record.source_sha256,
+        engine: "deckflow",
+      }),
     });
     state.record.source_sha256 = payload.source_sha256;
     state.record.document = payload.document || state.record.document;
-    state.record.html = payload.document?.html || state.record.html;
+    state.record.html = payload.document?.html || payload.html || state.record.html;
     state.baseDocument = metadataFromDocument(state.record.document);
     state.baseHTML = state.record.html || "";
     state.currentHTML = html;
@@ -1183,8 +1228,10 @@ async function saveDocument() {
 
 async function refreshDocument(force = false) {
   if (!force && state.dirty && !window.confirm("Discard your unsaved changes and reload this page?")) return;
-  const fresh = await fetchJSON(`/_cms/api/editor?path=${encodeURIComponent(state.path)}&engine=deckflow`);
+  const fresh = await fetchJSON(editorRequestURL());
   state.record = fresh;
+  state.resource = fresh.resource || state.resource;
+  state.path = fresh.path || state.path;
   state.currentHTML = editorDocument(fresh);
   state.baseHTML = fresh.html || "";
   state.baseDocument = metadataFromDocument(fresh.document);
@@ -1207,11 +1254,17 @@ async function openPreview() {
   }
   setStatus("Rendering preview…", "busy");
   try {
-    const html = await state.editor.flush();
+    const html = sourceHTMLForSave(await state.editor.flush());
     const response = await fetch("/_cms/api/editor-preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: state.record.path, html, metadata: metadataPayload() }),
+      body: JSON.stringify({
+        resource: state.resource,
+        theme: isThemeResource() ? state.record.theme : undefined,
+        path: state.record.path,
+        html,
+        metadata: isThemeResource() ? undefined : metadataPayload(),
+      }),
       cache: "no-store",
     });
     if (!response.ok) {
@@ -1367,8 +1420,10 @@ window.addEventListener("resize", setViewportHeight);
 setViewportHeight();
 
 async function start() {
-  if (!path) throw new Error("No content path was provided");
-  state.record = await fetchJSON(`/_cms/api/editor?path=${encodeURIComponent(path)}&engine=deckflow`);
+  if (!path && !themeParam) throw new Error("No content or theme was provided");
+  state.record = await fetchJSON(editorRequestURL());
+  state.resource = state.record.resource || (themeParam ? "theme-layout" : "content");
+  state.path = state.record.path || path;
   state.baseHTML = state.record.html || "";
   state.baseDocument = metadataFromDocument(state.record.document);
   state.metadata = metadataFromDocument(state.record.document);

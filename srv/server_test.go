@@ -630,6 +630,118 @@ func TestDeckflowEditorRouteAndVvvebFallback(t *testing.T) {
 	}
 }
 
+func TestThemeLayoutDeckflowAPIAndRevisionFlow(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	get := func() editorDocumentResponse {
+		req := httptest.NewRequest(http.MethodGet, "/_cms/api/editor?theme=default&engine=deckflow", nil)
+		req.Header.Set("X-ExeDev-Email", "owner@example.com")
+		res := httptest.NewRecorder()
+		server.Handler().ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("theme editor GET status = %d: %s", res.Code, res.Body)
+		}
+		var response editorDocumentResponse
+		if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Resource != "theme-layout" || !strings.Contains(response.HTML, "{{content}}") {
+			t.Fatalf("unexpected theme editor response: %#v", response)
+		}
+		return response
+	}
+	base := get()
+	previewPayload, _ := json.Marshal(map[string]any{"resource": "theme-layout", "theme": "default", "path": base.Path, "html": base.HTML})
+	previewReq := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-preview", bytes.NewReader(previewPayload))
+	previewReq.Header.Set("Content-Type", "application/json")
+	previewReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	previewRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(previewRes, previewReq)
+	if previewRes.Code != http.StatusOK || strings.Contains(previewRes.Body.String(), "{{content}}") || !strings.Contains(previewRes.Body.String(), "Theme layout preview") {
+		t.Fatalf("theme preview = %d: %s", previewRes.Code, previewRes.Body)
+	}
+	layoutPath := filepath.Join(siteDir, filepath.FromSlash(base.Path))
+	before, err := os.ReadFile(layoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modified := strings.Replace(string(before), "<body>", `<body data-theme-probe="true">`, 1)
+	save := func(html, sha string) *httptest.ResponseRecorder {
+		payload, _ := json.Marshal(map[string]any{"resource": "theme-layout", "theme": "default", "path": base.Path, "html": html, "base_sha256": sha, "engine": "deckflow"})
+		req := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-ExeDev-Email", "owner@example.com")
+		res := httptest.NewRecorder()
+		server.Handler().ServeHTTP(res, req)
+		return res
+	}
+	savedRes := save(modified, base.SourceSHA256)
+	if savedRes.Code != http.StatusOK {
+		t.Fatalf("theme save status = %d: %s", savedRes.Code, savedRes.Body)
+	}
+	var saved struct {
+		SourceSHA256 string `json:"source_sha256"`
+	}
+	if err := json.Unmarshal(savedRes.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := os.ReadFile(layoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updated), `data-theme-probe="true"`) || !strings.Contains(string(updated), "{{content}}") {
+		t.Fatalf("theme save lost source placeholders or edit: %s", updated)
+	}
+	drift := strings.Replace(modified, "{{content}}", "{{changed}}", 1)
+	driftRes := save(drift, saved.SourceSHA256)
+	if driftRes.Code != http.StatusBadRequest {
+		t.Fatalf("placeholder drift status = %d: %s", driftRes.Code, driftRes.Body)
+	}
+	current, _ := os.ReadFile(layoutPath)
+	if string(current) != string(updated) {
+		t.Fatal("placeholder drift changed the theme source")
+	}
+	revisionsReq := httptest.NewRequest(http.MethodGet, "/_cms/api/revisions?path="+url.QueryEscape(base.Path), nil)
+	revisionsReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	revisionsRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(revisionsRes, revisionsReq)
+	if revisionsRes.Code != http.StatusOK {
+		t.Fatalf("theme revisions status = %d: %s", revisionsRes.Code, revisionsRes.Body)
+	}
+	var revisions struct {
+		Revisions []Revision `json:"revisions"`
+	}
+	if err := json.Unmarshal(revisionsRes.Body.Bytes(), &revisions); err != nil {
+		t.Fatal(err)
+	}
+	var originalRevision Revision
+	for _, revision := range revisions.Revisions {
+		if revision.SHA256 == base.SourceSHA256 {
+			originalRevision = revision
+			break
+		}
+	}
+	if originalRevision.ID == "" {
+		t.Fatalf("original theme revision missing: %#v", revisions.Revisions)
+	}
+	restoreForm := url.Values{"path": {base.Path}, "id": {originalRevision.ID}, "base_sha256": {saved.SourceSHA256}}
+	restoreReq := httptest.NewRequest(http.MethodPost, "/_cms/api/revisions/restore", strings.NewReader(restoreForm.Encode()))
+	restoreReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	restoreReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	restoreRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(restoreRes, restoreReq)
+	if restoreRes.Code != http.StatusOK {
+		t.Fatalf("theme restore status = %d: %s", restoreRes.Code, restoreRes.Body)
+	}
+	restored, _ := os.ReadFile(layoutPath)
+	if string(restored) != string(before) {
+		t.Fatalf("theme restore did not recover exact source: %s", restored)
+	}
+}
+
 func TestGeneratedCodeAssets(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	server, err := New(siteDir, filepath.Join("..", "web"), "")

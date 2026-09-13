@@ -170,6 +170,7 @@ type documentMeta struct {
 }
 
 var tokenPattern = regexp.MustCompile(`\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}`)
+var themeTokenPattern = regexp.MustCompile(`\{\{[^{}]*\}\}`)
 
 const defaultCMSCSP = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-src 'self' blob:; worker-src 'self' blob:; form-action 'self'"
 const defaultPublicCSP = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'"
@@ -765,6 +766,14 @@ func normalizeContentPath(value string) (string, error) {
 	return clean, nil
 }
 
+func normalizeWorkspaceSourcePath(value string) (string, error) {
+	clean := strings.TrimPrefix(strings.TrimSpace(value), "/")
+	if strings.HasPrefix(clean, "themes/") {
+		_, normalized, err := normalizeThemeLayoutPath(clean)
+		return normalized, err
+	}
+	return normalizeContentPath(clean)
+}
 func documentType(rel string) string {
 	if strings.HasPrefix(filepath.ToSlash(rel), "posts/") {
 		return "post"
@@ -917,6 +926,7 @@ type editorMetadataInput struct {
 }
 
 type editorSaveRequest struct {
+	Resource string               `json:"resource,omitempty"`
 	Path     string               `json:"path"`
 	File     string               `json:"file"`
 	HTML     string               `json:"html"`
@@ -927,7 +937,9 @@ type editorSaveRequest struct {
 }
 
 type editorPreviewRequest struct {
+	Resource string               `json:"resource,omitempty"`
 	Path     string               `json:"path"`
+	Theme    string               `json:"theme,omitempty"`
 	HTML     string               `json:"html"`
 	Metadata *editorMetadataInput `json:"metadata,omitempty"`
 }
@@ -1414,7 +1426,7 @@ func maxInt(a, b int) int {
 }
 
 func (s *Server) listRevisions(rel string) ([]Revision, error) {
-	rel, err := normalizeContentPath(rel)
+	rel, err := normalizeWorkspaceSourcePath(rel)
 	if err != nil {
 		return nil, err
 	}
@@ -1468,7 +1480,7 @@ func (s *Server) listRevisions(rel string) ([]Revision, error) {
 }
 
 func (s *Server) restoreRevision(rel, id string) (Document, error) {
-	rel, err := normalizeContentPath(rel)
+	rel, err := normalizeWorkspaceSourcePath(rel)
 	if err != nil {
 		return Document{}, err
 	}
@@ -1510,6 +1522,20 @@ func (s *Server) restoreRevision(rel, id string) (Document, error) {
 	}
 	if sourceSHA256(source) != revision.SHA256 {
 		return Document{}, errors.New("revision checksum mismatch")
+	}
+	if strings.HasPrefix(rel, "themes/") {
+		if err := s.recordWorkspaceRevision(rel, source, "Before restore "+id); err != nil {
+			return Document{}, err
+		}
+		filePath, err := safeWorkspacePath(s.SiteDir, rel)
+		if err != nil {
+			return Document{}, err
+		}
+		if err := writeAtomicFile(filePath, source); err != nil {
+			return Document{}, err
+		}
+		parts := strings.Split(rel, "/")
+		return Document{Path: rel, Type: "theme", Title: friendlyTitle(parts[1]), HTML: string(source)}, nil
 	}
 	if err := s.recordRevision(rel, "Before restore "+id); err != nil {
 		return Document{}, err
@@ -2012,8 +2038,28 @@ func (s *Server) listThemes() ([]ThemeInfo, error) {
 	return themes, nil
 }
 
+func (s *Server) loadThemeLayout(themeName string) (string, string, []byte, []byte, error) {
+	name, err := normalizeThemeName(themeName)
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	layoutRel := filepath.ToSlash(filepath.Join("themes", name, "layout.html"))
+	layoutPath, info, err := safeResolvedPath(s.SiteDir, layoutRel)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", "", nil, nil, errors.New("theme layout not found")
+	}
+	layout, err := os.ReadFile(layoutPath)
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	css := []byte{}
+	if _, cssPath, cssErr := themeStylesPath(s.SiteDir, name); cssErr == nil {
+		css, _ = os.ReadFile(cssPath)
+	}
+	return name, layoutRel, layout, css, nil
+}
+
 func normalizeThemeName(value string) (string, error) {
-	value = strings.TrimSpace(value)
 	if value == "" || value == "." || value == ".." || value != filepath.Base(value) {
 		return "", errors.New("invalid theme name")
 	}
@@ -3138,9 +3184,20 @@ func (s *Server) resolveEditorEngine(r *http.Request, config SiteConfig) (string
 	return normalizeEditorEngine(value)
 }
 
+func (s *Server) resolveThemeEditorEngine(r *http.Request, config SiteConfig) (string, error) {
+	if strings.TrimSpace(r.URL.Query().Get("engine")) == "" {
+		return "deckflow", nil
+	}
+	return s.resolveEditorEngine(r, config)
+}
+
 func (s *Server) handleEditorAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		methodNotAllowedAllow(w, "GET, HEAD")
+		return
+	}
+	if themeName := strings.TrimSpace(r.URL.Query().Get("theme")); themeName != "" {
+		s.handleThemeEditorAPI(w, r, themeName)
 		return
 	}
 	pathValue := r.URL.Query().Get("path")
@@ -3190,6 +3247,94 @@ func (s *Server) handleEditorAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+func (s *Server) handleThemeEditorAPI(w http.ResponseWriter, r *http.Request, themeName string) {
+	name, layoutPath, layout, css, err := s.loadThemeLayout(themeName)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	engine, err := s.resolveThemeEditorEngine(r, config)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if engine != "deckflow" {
+		writeJSONError(w, http.StatusBadRequest, "Deckflow is required for theme-layout editing")
+		return
+	}
+	sha := sourceSHA256(layout)
+	setETag(w, sha)
+	doc := Document{Path: layoutPath, Type: "theme", Title: friendlyTitle(name), HTML: string(layout)}
+	response := editorDocumentResponse{
+		SchemaVersion: 1,
+		Resource:      "theme-layout",
+		Path:          layoutPath,
+		Document:      doc,
+		HTML:          string(layout),
+		SourceSHA256:  sha,
+		PreviewURL:    "/_cms/editor/frame?theme=" + url.QueryEscape(name),
+		PreviewAPI:    "/_cms/api/editor-preview",
+		Theme:         name,
+		StylesheetCSS: string(css),
+		MediaAPI:      "/_cms/api/media",
+		SaveAPI:       "/_cms/api/editor-save",
+		Editor: map[string]any{
+			"selected": engine,
+			"engines": []map[string]any{
+				{"name": "deckflow", "available": s.editorEngineAvailable("deckflow")},
+			},
+		},
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) renderThemeLayoutPreview(themeName, layout string) (string, error) {
+	name, _, _, css, err := s.loadThemeLayout(themeName)
+	if err != nil {
+		return "", err
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		return "", err
+	}
+	docs, err := s.listDocuments()
+	if err != nil {
+		return "", err
+	}
+	var pages, posts []Document
+	for _, doc := range docs {
+		if !documentIsPublishable(doc, time.Now().UTC()) {
+			continue
+		}
+		if doc.Type == "post" {
+			posts = append(posts, doc)
+		} else if doc.Path != "pages/index.html" {
+			pages = append(pages, doc)
+		}
+	}
+	sort.SliceStable(pages, func(i, j int) bool { return pages[i].Path < pages[j].Path })
+	sort.SliceStable(posts, func(i, j int) bool { return posts[i].Date > posts[j].Date })
+	sample := Document{Type: "page", Title: friendlyTitle(name) + " theme", Slug: "theme-preview", Excerpt: "Theme layout preview", HTML: `<section class="fileloom-theme-preview"><h1>Theme layout preview</h1><p>This content is rendered in memory while editing the theme layout.</p></section>`, URL: "/"}
+	values := templateValues(sample, config, navigationHTML(pages), postCardsHTML(posts))
+	values["theme.css"] = "/theme/style.css"
+	values["content"] = sample.HTML
+	output := applyTokens(layout, values)
+	if !strings.Contains(strings.ToLower(output), "<html") {
+		output = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body>` + output + `</body></html>`
+	}
+	cssText := strings.ReplaceAll(string(css), "</style>", "<\\/style>")
+	if strings.Contains(strings.ToLower(output), "</head>") {
+		output = strings.Replace(output, "</head>", `<style data-fileloom-preview>`+cssText+`</style></head>`, 1)
+	} else {
+		output = `<style data-fileloom-preview>` + cssText + `</style>` + output
+	}
+	return output, nil
+}
 func (s *Server) handleEditorPreviewAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -3202,6 +3347,35 @@ func (s *Server) handleEditorPreviewAPI(w http.ResponseWriter, r *http.Request) 
 	var input editorPreviewRequest
 	if err := decodeJSONBody(r, &input); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if input.Resource == "theme-layout" || strings.HasPrefix(strings.TrimPrefix(input.Path, "/"), "themes/") {
+		themeName := input.Theme
+		var err error
+		if themeName == "" {
+			themeName, _, err = normalizeThemeLayoutPath(input.Path)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		layout := input.HTML
+		if strings.TrimSpace(layout) == "" {
+			_, _, source, _, loadErr := s.loadThemeLayout(themeName)
+			if loadErr != nil {
+				writeJSONError(w, http.StatusBadRequest, loadErr.Error())
+				return
+			}
+			layout = string(source)
+		}
+		preview, err := s.renderThemeLayoutPreview(themeName, layout)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, preview)
 		return
 	}
 	doc, err := s.loadDocument(input.Path)
@@ -3533,12 +3707,16 @@ func (s *Server) handleRevisionRestoreAPI(w http.ResponseWriter, r *http.Request
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if strings.HasPrefix(strings.TrimPrefix(r.FormValue("path"), "/"), "themes/") {
+		s.handleThemeRevisionRestoreAPI(w, r)
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	targetPath := r.FormValue("path")
 	original, err := s.loadSourceDocument(targetPath)
 	if err != nil {
@@ -3572,6 +3750,55 @@ func (s *Server) handleRevisionRestoreAPI(w http.ResponseWriter, r *http.Request
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": doc.Path, "build": build, "source_sha256": fileSHA256(filepath.Join(s.SiteDir, "content", filepath.FromSlash(doc.Path)))})
 }
+
+func (s *Server) handleThemeRevisionRestoreAPI(w http.ResponseWriter, r *http.Request) {
+	limitRequestBody(w, r, maxFormSize)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rel, err := normalizeWorkspaceSourcePath(r.FormValue("path"))
+	if err != nil || !strings.HasPrefix(rel, "themes/") {
+		writeJSONError(w, http.StatusBadRequest, "theme layout path is required")
+		return
+	}
+	path, info, err := safeResolvedPath(s.SiteDir, rel)
+	if err != nil || !info.Mode().IsRegular() {
+		writeJSONError(w, http.StatusBadRequest, "theme layout not found")
+		return
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	baseSHA := requestPreconditionSHA(r, r.FormValue("base_sha256"))
+	actualSHA := sourceSHA256(current)
+	if baseSHA != "" && !strings.EqualFold(baseSHA, actualSHA) {
+		writeEditorConflict(w, &sourceConflictError{Path: rel, ExpectedSHA: baseSHA, ActualSHA: actualSHA})
+		return
+	}
+	doc, err := s.restoreRevision(rel, r.FormValue("id"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	build, err := s.Build()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "theme revision restore failed: "+err.Error())
+		return
+	}
+	if err := s.gitChangeIfConfigured("Restore " + doc.Path); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	sha := fileSHA256(path)
+	setETag(w, sha)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "resource": "theme-layout", "path": doc.Path, "source_sha256": sha, "build": build})
+}
+
 func (s *Server) handleBuildAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -3593,6 +3820,12 @@ func (s *Server) handleBuildAPI(w http.ResponseWriter, r *http.Request) {
 
 func writeEditorConflict(w http.ResponseWriter, conflict *sourceConflictError) {
 	setETag(w, conflict.ActualSHA)
+	reloadURL := "/_cms/api/editor?path=" + url.QueryEscape(conflict.Path)
+	if strings.HasPrefix(conflict.Path, "themes/") {
+		if name, _, err := normalizeThemeLayoutPath(conflict.Path); err == nil {
+			reloadURL = "/_cms/api/editor?theme=" + url.QueryEscape(name) + "&engine=deckflow"
+		}
+	}
 	writeJSON(w, http.StatusConflict, map[string]any{
 		"ok":              false,
 		"code":            "source_conflict",
@@ -3600,7 +3833,7 @@ func writeEditorConflict(w http.ResponseWriter, conflict *sourceConflictError) {
 		"path":            conflict.Path,
 		"expected_sha256": conflict.ExpectedSHA,
 		"current_sha256":  conflict.ActualSHA,
-		"reload_url":      "/_cms/api/editor?path=" + url.QueryEscape(conflict.Path),
+		"reload_url":      reloadURL,
 	})
 }
 
@@ -3632,6 +3865,10 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.Path == "" {
 		input.Path = input.File
+	}
+	if isJSON && (input.Resource == "theme-layout" || strings.HasPrefix(strings.TrimPrefix(input.Path, "/"), "themes/")) {
+		s.handleThemeSaveJSONAPI(w, r, input)
+		return
 	}
 	if !isJSON && (strings.TrimSpace(input.Theme) != "" || strings.HasPrefix(strings.TrimPrefix(input.File, "/"), "themes/")) {
 		s.handleThemeSaveAPI(w, r, input.Theme, input.File)
@@ -3690,6 +3927,26 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": updated.Path, "source_sha256": sha, "document": updated, "build": build})
 }
 
+func themeTemplatePlaceholders(source string) []string {
+	values := themeTokenPattern.FindAllString(source, -1)
+	sort.Strings(values)
+	return values
+}
+
+func sameThemeTemplatePlaceholders(before, after string) bool {
+	left := themeTemplatePlaceholders(before)
+	right := themeTemplatePlaceholders(after)
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func normalizeThemeLayoutPath(value string) (string, string, error) {
 	value = strings.TrimPrefix(strings.TrimSpace(value), "/")
 	value = strings.TrimPrefix(value, "themes/")
@@ -3704,6 +3961,76 @@ func normalizeThemeLayoutPath(value string) (string, string, error) {
 	return name, filepath.ToSlash(filepath.Join("themes", name, "layout.html")), nil
 }
 
+func (s *Server) handleThemeSaveJSONAPI(w http.ResponseWriter, r *http.Request, input editorSaveRequest) {
+	name, file, err := normalizeThemeLayoutPath(input.Path)
+	if strings.TrimSpace(input.Theme) != "" {
+		name, err = normalizeThemeName(input.Theme)
+		file = filepath.ToSlash(filepath.Join("themes", name, "layout.html"))
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	baseSHA := requestPreconditionSHA(r, input.BaseSHA)
+	if baseSHA == "" {
+		writeJSON(w, http.StatusPreconditionRequired, map[string]any{
+			"ok":    false,
+			"code":  "precondition_required",
+			"error": "base_sha256 or If-Match is required for JSON theme saves",
+		})
+		return
+	}
+	path, info, err := safeResolvedPath(s.SiteDir, file)
+	if err != nil || !info.Mode().IsRegular() {
+		writeJSONError(w, http.StatusBadRequest, "theme layout not found")
+		return
+	}
+	previous, err := os.ReadFile(path)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	actualSHA := sourceSHA256(previous)
+	if !strings.EqualFold(baseSHA, actualSHA) {
+		writeEditorConflict(w, &sourceConflictError{Path: file, ExpectedSHA: baseSHA, ActualSHA: actualSHA})
+		return
+	}
+	if !sameThemeTemplatePlaceholders(string(previous), input.HTML) {
+		writeJSONError(w, http.StatusBadRequest, "theme template placeholders cannot be added, removed, or changed")
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.recordWorkspaceRevision(file, previous, "Edit theme layout"); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := writeAtomicFile(path, []byte(input.HTML)); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	build, err := s.Build()
+	if err != nil {
+		rollbackErr := writeAtomicFile(path, previous)
+		message := "theme edit rolled back because build failed: " + err.Error()
+		if rollbackErr != nil {
+			message += "; rollback failed: " + rollbackErr.Error()
+		}
+		writeJSONError(w, http.StatusInternalServerError, message)
+		return
+	}
+	if err := s.gitChangeIfConfigured("Edit " + file); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	sha := fileSHA256(path)
+	setETag(w, sha)
+	doc := Document{Path: file, Type: "theme", Title: friendlyTitle(name), HTML: input.HTML}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "resource": "theme-layout", "theme": name, "path": file,
+		"source_sha256": sha, "html": input.HTML, "document": doc, "build": build,
+	})
+}
 func stripThemePreview(source string) string {
 	previewStyle := regexp.MustCompile(`(?is)<style[^>]*data-fileloom-preview[^>]*>.*?</style>\s*`)
 	return previewStyle.ReplaceAllString(source, "")
@@ -4100,6 +4427,24 @@ func extractBodyHTML(source string) string {
 
 func (s *Server) handleEditor(w http.ResponseWriter, r *http.Request) {
 	if themeName := strings.TrimSpace(r.URL.Query().Get("theme")); themeName != "" {
+		config, err := s.loadSiteConfig()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		engine, err := s.resolveThemeEditorEngine(r, config)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if engine == "deckflow" {
+			if !s.editorEngineAvailable(engine) {
+				http.Error(w, "Deckflow editor is not installed", http.StatusNotImplemented)
+				return
+			}
+			s.serveWebFile(w, r, filepath.ToSlash(filepath.Join("editor-dist", "index.html")))
+			return
+		}
 		s.handleThemeEditor(w, r, themeName)
 		return
 	}

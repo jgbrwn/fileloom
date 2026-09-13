@@ -1,11 +1,20 @@
 import { test, expect } from "@playwright/test";
 
 const editorURL = "/_cms/editor?path=pages%2Fabout.html";
+const themeEditorURL = "/_cms/editor?theme=brutalist";
 const e2eBaseURL = process.env.FILELOOM_E2E_URL || "http://127.0.0.1:8010";
 const e2eOwnerEmail = process.env.FILELOOM_E2E_EMAIL || "owner@example.com";
 
 async function openEditor(page) {
   await page.goto(editorURL);
+  await expect(page.locator(".editor-shell")).toBeVisible();
+  const mobile = await page.locator(".mobile-nav").isVisible();
+  if (mobile) await expect(page.locator(".mobile-nav")).toBeVisible();
+  else await expect(page.locator(".desktop-blocks .block-grid")).toBeVisible();
+}
+
+async function openThemeEditor(page) {
+  await page.goto(themeEditorURL);
   await expect(page.locator(".editor-shell")).toBeVisible();
   const mobile = await page.locator(".mobile-nav").isVisible();
   if (mobile) await expect(page.locator(".mobile-nav")).toBeVisible();
@@ -32,10 +41,33 @@ async function getEditorDocument(page) {
   return response.body;
 }
 
+async function getThemeDocument(page) {
+  const response = await cmsJSON(page, "/_cms/api/editor?theme=brutalist&engine=deckflow");
+  expect(response.status).toBe(200);
+  return response.body;
+}
+
+async function restoreThemeDocument(page, original) {
+  const current = await getThemeDocument(page);
+  if (current.source_sha256 === original.source_sha256) return;
+  const response = await cmsJSON(page, "/_cms/api/editor-save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      resource: "theme-layout",
+      theme: "brutalist",
+      path: original.path,
+      html: original.html,
+      base_sha256: current.source_sha256,
+      engine: "deckflow",
+    }),
+  });
+  expect(response.status, JSON.stringify(response.body)).toBe(200);
+}
+
 function editorMetadata(document) {
   return {
     title: document.title,
-    date: document.date,
     tags: document.tags || [],
     category: document.category || "",
     excerpt: document.excerpt || "",
@@ -414,6 +446,79 @@ test.describe("Deckflow Fileloom editor", () => {
       await expect(reloadedParagraph.locator("code")).toHaveText(originalCode);
     } finally {
       await restoreEditorDocument(page, original);
+    }
+  });
+  test("loads Deckflow theme-layout mode without requesting Vvveb assets", async ({ page }) => {
+    const legacyRequests = [];
+    page.on("request", (request) => {
+      if (/fileloom-vvveb|\/vvveb(?:js|\/)/i.test(request.url())) legacyRequests.push(request.url());
+    });
+    await openThemeEditor(page);
+    const document = await getThemeDocument(page);
+    expect(document.resource).toBe("theme-layout");
+    expect(document.editor.selected).toBe("deckflow");
+    expect(document.html).toContain("{{content}}");
+    expect(await page.frameLocator("iframe.deckflow-html-editor__preview").locator("[data-fileloom-template-token]").count()).toBeGreaterThan(0);
+    expect(legacyRequests).toEqual([]);
+  });
+
+  test("saves and reloads a theme layout while preserving template slots", async ({ page }) => {
+    const original = await getThemeDocument(page);
+    try {
+      await openThemeEditor(page);
+      await insertParagraphBlock(page);
+      await page.locator('[data-action="save"]:visible').first().click();
+      await expect(page.locator("#editor-status")).toHaveText("Saved");
+      await page.reload();
+      const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+      await expect(frame.locator("p").filter({ hasText: "Write something here." })).toBeVisible();
+      const saved = await getThemeDocument(page);
+      expect(saved.html).toContain("{{content}}");
+      expect(saved.html).toContain("Write something here.");
+      expect(saved.html).not.toContain("FILELOOM_TEMPLATE");
+      expect(saved.html).not.toContain("data-fileloom-template-token");
+    } finally {
+      await restoreThemeDocument(page, original);
+    }
+  });
+
+  test("renders an unsaved theme layout preview without literal placeholders", async ({ page }) => {
+    const original = await getThemeDocument(page);
+    try {
+      await openThemeEditor(page);
+      await insertParagraphBlock(page);
+      const popupPromise = page.waitForEvent("popup");
+      await page.locator('[data-action="preview"]:visible').first().click();
+      const popup = await popupPromise;
+      await popup.waitForLoadState("domcontentloaded");
+      await expect(popup.locator("header.site-header")).toBeVisible();
+      await expect(popup.locator(".fileloom-theme-preview")).toBeVisible();
+      await expect(popup.locator("body")).not.toContainText("{{content}}");
+      await popup.close();
+    } finally {
+      await restoreThemeDocument(page, original);
+    }
+  });
+  test("restores a theme-layout revision from Deckflow history", async ({ page }) => {
+    const original = await getThemeDocument(page);
+    try {
+      await openThemeEditor(page);
+      await insertParagraphBlock(page);
+      await page.locator('[data-action="save"]:visible').first().click();
+      await expect(page.locator("#editor-status")).toHaveText("Saved");
+      const mobile = await page.locator(".mobile-nav").isVisible();
+      if (mobile) {
+        await page.locator('[data-action="details"]:visible').click();
+        await page.locator('#sheet-content [data-action="history"]').click();
+      } else {
+        await page.locator('[data-action="history"]:visible').first().click();
+      }
+      await expect(page.locator('[data-sheet="history"] .revision-list')).toBeVisible();
+      await page.locator('[data-sheet="history"] [data-revision-id]').last().click();
+      await expect(page.locator("#editor-status")).toHaveText("Revision restored");
+      await expect(page.frameLocator("iframe.deckflow-html-editor__preview").locator("p").filter({ hasText: "Write something here." })).toHaveCount(0);
+    } finally {
+      await restoreThemeDocument(page, original);
     }
   });
   test("saves, reloads, and preserves the generated public page", async ({ page }) => {
