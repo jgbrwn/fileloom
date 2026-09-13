@@ -178,6 +178,7 @@ const defaultSiteJSON = `{
   "description": "An HTML-first static site made with Fileloom.",
   "base_url": "http://localhost:8000",
 	"theme": "default",
+  "editor_engine": "deckflow",
   "footer": "Made with Fileloom.",
   "git": {
     "enabled": false,
@@ -465,12 +466,13 @@ func writeIfMissing(path string, contents []byte) error {
 
 func (s *Server) loadSiteConfig() (SiteConfig, error) {
 	config := SiteConfig{
-		Title:       "A Fileloom site",
-		Description: "An HTML-first static site made with Fileloom.",
-		BaseURL:     "http://localhost:8000",
-		Theme:       "default",
-		Footer:      "Made with Fileloom.",
-		Git:         GitConfig{CommitOn: "build", Remote: "origin"},
+		Title:        "A Fileloom site",
+		Description:  "An HTML-first static site made with Fileloom.",
+		BaseURL:      "http://localhost:8000",
+		Theme:        "default",
+		EditorEngine: "deckflow",
+		Footer:       "Made with Fileloom.",
+		Git:          GitConfig{CommitOn: "build", Remote: "origin"},
 	}
 	path, info, err := safeResolvedPath(s.SiteDir, "site.json")
 	if err != nil {
@@ -3107,7 +3109,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 func normalizeEditorEngine(value string) (string, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {
-		return "vvveb", nil
+		return "deckflow", nil
 	}
 	switch value {
 	case "vvveb", "deckflow":

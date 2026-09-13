@@ -96,7 +96,7 @@ func TestEditorAPIGetAndJSONSaveContract(t *testing.T) {
 	if err := json.Unmarshal(getRes.Body.Bytes(), &opened); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(opened.HTML, "ordinary HTML file") || opened.SourceSHA256 == "" || opened.Editor.Selected != "vvveb" {
+	if !strings.Contains(opened.HTML, "ordinary HTML file") || opened.SourceSHA256 == "" || opened.Editor.Selected != "deckflow" {
 		t.Fatalf("unexpected editor document: %#v", opened)
 	}
 	if opened.PublicURL != "/about/" {
@@ -609,7 +609,7 @@ func TestDeckflowEditorRouteAndVvvebFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config.EditorEngine = "deckflow"
+	config.EditorEngine = ""
 	if err := server.saveSiteConfig(config); err != nil {
 		t.Fatal(err)
 	}

@@ -126,6 +126,7 @@ test.describe("Deckflow Fileloom editor", () => {
     await expect(page.locator(".canvas-hint")).toContainText("Tap text to edit");
     await openDetails(page);
     await expect(page.locator("#details-form [data-metadata=title]")).toHaveValue("About");
+    await expect(page.locator("[data-publish-at-field]")).toBeHidden();
     await page.locator('[data-metadata="status"]').selectOption("scheduled");
     await expect(page.locator('[data-publish-at-field]')).toBeVisible();
     await page.locator('#sheet-content [data-action="close-sheet"]').click();
