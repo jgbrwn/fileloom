@@ -1005,6 +1005,57 @@ func TestGitPushURLIsValidated(t *testing.T) {
 		t.Fatalf("SSH remote with username rejected: %v", err)
 	}
 }
+func TestDeckflowSavePreservesArbitraryBodyMarkup(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	source := "---\n# preserve this comment\ntitle: Fidelity\nslug: fidelity\ndate: 2026-09-13\nstatus: published\ncustom: keep-me\n---\n\n<section class='alpha' data-json='{\"x\":1}'><a href=\"/docs?x=1&amp;y=2\" data-note=\"a > b\">Linked</a><!-- keep this comment --></section>\n"
+	path := filepath.Join(siteDir, "content", "pages", "fidelity.html")
+	if err := os.WriteFile(path, []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Build(); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"path":        "pages/fidelity.html",
+		"engine":      "deckflow",
+		"base_sha256": sourceSHA256([]byte(source)),
+		"html":        "<!doctype html><html><body><section class='alpha' data-json='{\"x\":1}'><a href=\"/docs?x=1&amp;y=2\" data-note=\"a > b\">Linked</a><!-- keep this comment --></section></body></html>",
+		"metadata":    map[string]any{"title": "Fidelity updated"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("fidelity save status = %d: %s", res.Code, res.Body)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedText := string(updated)
+	for _, expected := range []string{
+		"# preserve this comment",
+		"custom: keep-me",
+		"title: Fidelity updated",
+		`<section class='alpha' data-json='{"x":1}'>`,
+		`href="/docs?x=1&amp;y=2" data-note="a > b"`,
+		"<!-- keep this comment -->",
+	} {
+		if !strings.Contains(updatedText, expected) {
+			t.Fatalf("source lost arbitrary markup %q: %s", expected, updatedText)
+		}
+	}
+	if strings.Contains(updatedText, "<!doctype html>") {
+		t.Fatal("editor wrapper leaked into arbitrary source")
+	}
+}
+
 func TestDeckflowSaveReloadAndPublicOutput(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")

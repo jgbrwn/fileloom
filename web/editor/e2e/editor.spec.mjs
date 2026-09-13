@@ -7,7 +7,9 @@ const e2eOwnerEmail = process.env.FILELOOM_E2E_EMAIL || "owner@example.com";
 async function openEditor(page) {
   await page.goto(editorURL);
   await expect(page.locator(".editor-shell")).toBeVisible();
-  await expect(page.locator("iframe.deckflow-html-editor__preview")).toBeVisible();
+  const mobile = await page.locator(".mobile-nav").isVisible();
+  if (mobile) await expect(page.locator(".mobile-nav")).toBeVisible();
+  else await expect(page.locator(".desktop-blocks .block-grid")).toBeVisible();
 }
 
 async function cmsJSON(page, url, init = {}) {
@@ -168,11 +170,17 @@ test.describe("Deckflow Fileloom editor", () => {
     const count = await frame.locator("p").count();
     await page.locator('[data-action="duplicate"]:visible').click();
     await expect(frame.locator("p")).toHaveCount(count + 1);
+    await frame.locator("p").last().click();
+    if (mobile) await page.locator('[data-action="details"]:visible').click();
+    await page.locator('[data-action="delete-selection"]:visible').click();
+    await expect(frame.locator("p")).toHaveCount(count);
   });
 
   test("edits safe link properties without reserializing the body", async ({ page }) => {
-    await openEditor(page);
-    const mobile = await page.locator(".mobile-nav").isVisible();
+    const original = await getEditorDocument(page);
+    try {
+      await openEditor(page);
+      const mobile = await page.locator(".mobile-nav").isVisible();
     if (mobile) await page.locator('[data-action="blocks"]:visible').click();
     const catalog = page.locator(mobile ? '#sheet-content .block-grid [data-block="link"]' : '.desktop-blocks .block-grid [data-block="link"]');
     await catalog.click();
@@ -182,6 +190,10 @@ test.describe("Deckflow Fileloom editor", () => {
     await page.locator('[data-action="properties"]:visible').click();
     await expect(page.locator("#element-inspector-form")).toBeVisible();
     await expect(page.locator('#element-inspector-form [name="href"]')).toHaveValue("/");
+    await page.locator('#element-inspector-form [name="href"]').fill("javascript:alert(1)");
+    await page.locator('#element-inspector-form button[type="submit"]').click();
+    await expect(page.locator("#editor-status")).toHaveText("Link URL is unsafe or invalid");
+    await expect(page.locator("#element-inspector-form")).toBeVisible();
     await page.locator('#element-inspector-form [name="href"]').fill("https://example.com/docs");
     await page.locator('#element-inspector-form [name="id"]').fill("docs-link");
     await page.locator('#element-inspector-form [name="class"]').fill("primary-link");
@@ -194,6 +206,18 @@ test.describe("Deckflow Fileloom editor", () => {
     await expect(link).toHaveAttribute("target", "_blank");
     await expect(link).toHaveAttribute("rel", "noopener");
     await expect(page.locator("#editor-status")).toHaveAttribute("data-kind", "dirty");
+    await page.locator('[data-action="save"]:visible').first().click();
+    await expect(page.locator("#editor-status")).toHaveText("Saved");
+    await page.reload();
+    const reloadedFrame = page.frameLocator("iframe.deckflow-html-editor__preview");
+    const reloadedLink = reloadedFrame.locator('a[href="https://example.com/docs"]').last();
+    await expect(reloadedLink).toHaveAttribute("id", "docs-link");
+    await expect(reloadedLink).toHaveClass(/primary-link/);
+    await expect(reloadedLink).toHaveAttribute("target", "_blank");
+    await expect(reloadedLink).toHaveAttribute("rel", "noopener");
+    } finally {
+      await restoreEditorDocument(page, original);
+    }
   });
 
   test("saves, reloads, and preserves the generated public page", async ({ page }) => {
@@ -250,9 +274,11 @@ test.describe("Deckflow Fileloom editor", () => {
     const mobile = await page.locator(".mobile-nav").isVisible();
     if (mobile) await page.locator('[data-action="media"]:visible').click();
     else await page.locator('.desktop-blocks [data-block="media"]').click();
-    await page.locator("#media-upload").setInputFiles({ name: firstName, mimeType: "image/png", buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]) });
+    await page.locator("#media-upload").setInputFiles([
+      { name: firstName, mimeType: "image/png", buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+      { name: secondName, mimeType: "image/png", buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d]) },
+    ]);
     await expect(page.locator(`[data-media-name="${firstName}"]`)).toBeVisible();
-    await page.locator("#media-upload").setInputFiles({ name: secondName, mimeType: "image/png", buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d]) });
     await expect(page.locator(`[data-media-name="${secondName}"]`)).toBeVisible();
     await page.locator(`[data-media-name="${firstName}"]`).click();
     const frame = page.frameLocator("iframe.deckflow-html-editor__preview");

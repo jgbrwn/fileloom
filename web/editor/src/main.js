@@ -1,3 +1,5 @@
+import { createElementTarget } from "@deckflow/html-editor/core";
+import { patchElementInHtml } from "@deckflow/html-editor/html-patch";
 import { mountHtmlEditor } from "@deckflow/html-editor/ui";
 import "./style.css";
 
@@ -616,11 +618,22 @@ async function duplicateSelection() {
   setStatus("Element duplicated", "dirty");
 }
 
+function patchSelectedStructuralElement(source, operation) {
+  const element = selectedStructuralElement();
+  if (!element) return null;
+  const result = patchElementInHtml(source, createElementTarget(element), [operation]);
+  return result.matched ? result.html : null;
+}
+
+
 async function deleteSelection() {
   const source = state.editor?.getHtml() || "";
-  const info = structuralSelectionInfo(source);
-  if (!info) return;
-  await applyEditorHTML(`${source.slice(0, info.start)}${source.slice(info.end)}`);
+  const next = patchSelectedStructuralElement(source, { type: "delete-element" });
+  if (next == null || next === source) {
+    setStatus("Could not resolve the selected element", "error");
+    return;
+  }
+  await applyEditorHTML(next);
   closeSheet();
   setStatus("Element deleted", "dirty");
 }
