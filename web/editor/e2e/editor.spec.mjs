@@ -16,6 +16,7 @@ async function cmsJSON(page, url, init = {}) {
   const { body: requestBody, ...requestInit } = init;
   const response = await page.request.fetch(new URL(url, e2eBaseURL).toString(), {
     ...requestInit,
+    timeout: requestInit.timeout ?? 15000,
     ...(requestBody === undefined ? {} : { data: requestBody }),
     headers: { "X-ExeDev-Email": e2eOwnerEmail, ...(init.headers || {}) },
   });
@@ -45,15 +46,17 @@ function editorMetadata(document) {
 
 async function restoreEditorDocument(page, original) {
   const current = await getEditorDocument(page);
-  const revisionsResponse = await cmsJSON(page, `/_cms/api/revisions?path=${encodeURIComponent(original.path)}`);
-  expect(revisionsResponse.status, JSON.stringify(revisionsResponse.body)).toBe(200);
-  const revision = (revisionsResponse.body.revisions || []).find((candidate) => candidate.sha256 === original.source_sha256);
-  if (!revision) throw new Error(`Could not find original revision ${original.source_sha256}`);
-  const body = new URLSearchParams({ path: original.path, id: revision.id, base_sha256: current.source_sha256 }).toString();
-  const response = await cmsJSON(page, "/_cms/api/revisions/restore", {
+  if (current.source_sha256 === original.source_sha256) return;
+  const response = await cmsJSON(page, "/_cms/api/editor-save", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      path: original.path,
+      engine: "deckflow",
+      html: original.html,
+      metadata: editorMetadata(original.document),
+      base_sha256: current.source_sha256,
+    }),
   });
   expect(response.status, JSON.stringify(response.body)).toBe(200);
 }
@@ -67,6 +70,53 @@ async function insertParagraphBlock(page) {
 async function openDetails(page) {
   await page.locator('[data-action="details"]:visible').first().click();
   await expect(page.locator("#details-form")).toBeVisible();
+}
+
+async function focusTextEnd(page, locator) {
+  await locator.click();
+  const alreadyEditing = (await locator.getAttribute("data-local-editor-editing")) === "true";
+  await page.locator("iframe.deckflow-html-editor__preview").focus();
+  if (!alreadyEditing) await page.keyboard.press("Enter");
+  await locator.evaluate((element) => {
+    const selection = element.ownerDocument.defaultView.getSelection();
+    const range = element.ownerDocument.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    element.focus();
+  });
+  await page.locator("iframe.deckflow-html-editor__preview").focus();
+}
+
+async function selectTextRange(locator, start, end) {
+  await locator.click();
+  await locator.evaluate((element, offsets) => {
+    const document = element.ownerDocument;
+    const walker = document.createTreeWalker(element, document.defaultView.NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    let cursor = 0;
+    let startPoint = null;
+    let endPoint = null;
+    for (const node of nodes) {
+      const next = cursor + node.data.length;
+      if (!startPoint && offsets.start <= next) startPoint = { node, offset: Math.max(0, offsets.start - cursor) };
+      if (!endPoint && offsets.end <= next) {
+        endPoint = { node, offset: Math.max(0, offsets.end - cursor) };
+        break;
+      }
+      cursor = next;
+    }
+    if (!startPoint || !endPoint) return;
+    const range = document.createRange();
+    range.setStart(startPoint.node, startPoint.offset);
+    range.setEnd(endPoint.node, endPoint.offset);
+    const selection = document.defaultView.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+  }, { start, end });
 }
 
 test.describe("Deckflow Fileloom editor", () => {
@@ -220,12 +270,156 @@ test.describe("Deckflow Fileloom editor", () => {
     }
   });
 
+  test("supports keyboard inline editing and preserves mixed markup", async ({ page }) => {
+    const original = await getEditorDocument(page);
+    try {
+      await openEditor(page);
+      const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+      const mixed = frame.locator("p").first();
+      const originalCode = await mixed.locator("code").textContent();
+      await focusTextEnd(page, mixed);
+      await expect(mixed).toHaveAttribute("contenteditable", "true");
+      await page.keyboard.insertText(" [mixed-inline]");
+      await page.keyboard.press("Control+Enter");
+      await expect(mixed).toContainText("[mixed-inline]");
+      await expect(mixed.locator("code")).toHaveText(originalCode);
+      await expect(mixed).not.toHaveAttribute("data-local-editor-editing", "true");
+      await expect(mixed).not.toHaveAttribute("contenteditable", /.*/);
+
+      const plain = frame.locator("p").nth(1);
+      const originalPlain = await plain.textContent();
+      await focusTextEnd(page, plain);
+      await expect(plain).toHaveAttribute("contenteditable", "plaintext-only");
+      await page.keyboard.insertText(" [cancelled]");
+      await page.keyboard.press("Escape");
+      await expect(plain).toHaveText(originalPlain);
+      await expect(plain).not.toHaveAttribute("data-local-editor-editing", "true");
+      await focusTextEnd(page, plain);
+      await page.keyboard.insertText(" [committed]");
+      await page.keyboard.press("Control+Enter");
+      await expect(plain).toContainText("[committed]");
+      await expect(page.locator("#editor-status")).toHaveAttribute("data-kind", "dirty");
+      await focusTextEnd(page, plain);
+      await page.keyboard.insertText(" [keyboard-save]");
+      await page.keyboard.press("Control+S");
+      await expect(page.locator("#editor-status")).toHaveText("Saved");
+      await page.reload();
+      const reloadedFrame = page.frameLocator("iframe.deckflow-html-editor__preview");
+      await expect(reloadedFrame.locator("p").first()).toContainText("[mixed-inline]");
+      await expect(reloadedFrame.locator("p").first().locator("code")).toHaveText(originalCode);
+      await expect(reloadedFrame.locator("p").nth(1)).toContainText("[committed]");
+      await expect(reloadedFrame.locator("p").nth(1)).toContainText("[keyboard-save]");
+    } finally {
+      await restoreEditorDocument(page, original);
+    }
+  });
+
+  test("rejects mixed-text edits that would change source structure", async ({ page }) => {
+    const original = await getEditorDocument(page);
+    try {
+      await openEditor(page);
+      const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+      const paragraph = frame.locator("p").first();
+      const originalCode = await paragraph.locator("code").textContent();
+      await focusTextEnd(page, paragraph);
+      await page.keyboard.press("Control+A");
+      await page.keyboard.insertText("flattened mixed markup");
+      await page.keyboard.press("Control+Enter");
+      await expect(page.locator("#editor-status")).toHaveText("The text edit changed the HTML structure and was reverted");
+      await expect(paragraph.locator("code")).toHaveText(originalCode);
+      await expect(paragraph).not.toContainText("flattened mixed markup");
+    } finally {
+      await restoreEditorDocument(page, original);
+    }
+  });
+  test("keeps keyboard undo and redo ordered across inline and structural edits", async ({ page }) => {
+    const original = await getEditorDocument(page);
+    try {
+      await openEditor(page);
+      const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+      const paragraphs = frame.locator("p");
+      const initialCount = await paragraphs.count();
+      await insertParagraphBlock(page);
+      const token = " [keyboard-history]";
+      await focusTextEnd(page, paragraphs.first());
+      await page.keyboard.insertText(token);
+      await page.keyboard.press("Control+Enter");
+      await expect(paragraphs.first()).toContainText(token);
+
+      await page.keyboard.press("Control+Z");
+      await expect(paragraphs.first()).not.toContainText(token);
+      await expect(paragraphs).toHaveCount(initialCount + 1);
+      await page.keyboard.press("Control+Z");
+      await expect(paragraphs).toHaveCount(initialCount);
+      await page.keyboard.press("Control+Shift+Z");
+      await expect(paragraphs).toHaveCount(initialCount + 1);
+      await page.keyboard.press("Control+Z");
+      await expect(paragraphs).toHaveCount(initialCount);
+      await focusTextEnd(page, paragraphs.first());
+      await page.keyboard.press("Control+Enter");
+      await page.locator("iframe.deckflow-html-editor__preview").focus();
+      await page.keyboard.press("Control+D");
+      await expect(paragraphs).toHaveCount(initialCount + 1);
+      await page.locator("iframe.deckflow-html-editor__preview").focus();
+      await page.keyboard.press("Delete");
+      await expect(paragraphs).toHaveCount(initialCount);
+      await page.keyboard.press("Escape");
+      await expect(page.locator("#selection-info")).toContainText("Nothing selected");
+    } finally {
+      await restoreEditorDocument(page, original);
+    }
+  });
+
+  test("keeps undo and redo controls usable on desktop and mobile", async ({ page }) => {
+    const original = await getEditorDocument(page);
+    try {
+      await openEditor(page);
+      const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+      const initialCount = await frame.locator("p").count();
+      await insertParagraphBlock(page);
+      await expect(frame.locator("p")).toHaveCount(initialCount + 1);
+      const mobile = await page.locator(".mobile-nav").isVisible();
+      if (mobile) await page.locator('[data-action="style"]:visible').click();
+      const undo = page.locator('[data-action="undo"]:visible').first();
+      const redo = page.locator('[data-action="redo"]:visible').first();
+      await undo.click();
+      await expect(frame.locator("p")).toHaveCount(initialCount);
+      await redo.click();
+      await expect(frame.locator("p")).toHaveCount(initialCount + 1);
+    } finally {
+      await restoreEditorDocument(page, original);
+    }
+  });
+
+  test("formats a selected text range without flattening inline markup", async ({ page }) => {
+    const original = await getEditorDocument(page);
+    try {
+      await openEditor(page);
+      const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+      const paragraph = frame.locator("p").first();
+      const originalCode = await paragraph.locator("code").textContent();
+      await selectTextRange(paragraph, 0, 4);
+      const toolbar = frame.locator(".local-editor-toolbar");
+      await expect(toolbar).toBeVisible();
+      await toolbar.locator('[data-tool="bold"]').click();
+      await expect(paragraph.locator('[data-local-text-key][style*="font-weight"]')).toHaveCount(1);
+      await expect(paragraph.locator("code")).toHaveText(originalCode);
+      await expect(page.locator("#editor-status")).toHaveAttribute("data-kind", "dirty");
+      await page.locator('[data-action="save"]:visible').first().click();
+      await expect(page.locator("#editor-status")).toHaveText("Saved");
+      await page.reload();
+      const reloadedParagraph = page.frameLocator("iframe.deckflow-html-editor__preview").locator("p").first();
+      await expect(reloadedParagraph.locator('[data-local-text-key][style*="font-weight"]')).toHaveCount(1);
+      await expect(reloadedParagraph.locator("code")).toHaveText(originalCode);
+    } finally {
+      await restoreEditorDocument(page, original);
+    }
+  });
   test("saves, reloads, and preserves the generated public page", async ({ page }) => {
     const original = await getEditorDocument(page);
     try {
       await openEditor(page);
       await insertParagraphBlock(page);
-      const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
       await page.keyboard.press("Control+S");
       await expect(page.locator("#editor-status")).toHaveText("Saved");
       await page.reload();

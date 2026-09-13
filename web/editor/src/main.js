@@ -19,6 +19,8 @@ const state = {
   changeVersion: 0,
   hostUndo: [],
   hostRedo: [],
+  historyTask: Promise.resolve(),
+  editorKeyboardCleanup: null,
   conflict: null,
   selected: null,
   sheet: null,
@@ -371,53 +373,112 @@ function replaceSelection(source, replacement, selection, closestSelector = "") 
   return `${source.slice(0, info.start)}${replacement}${source.slice(info.end)}`;
 }
 
+function replaceEditorHTML(next, { clearSelection = true } = {}) {
+  if (!state.editor) return Promise.resolve();
+  if (clearSelection) {
+    state.selected = null;
+    updateSelection(null);
+  }
+  return state.editor.setHtml(next).then(() => {
+    state.currentHTML = state.editor.getHtml();
+    installEditorKeyboardShortcuts();
+  });
+}
+
+function pushHostUndo(html) {
+  if (!html) return;
+  state.hostUndo.push(html);
+  if (state.hostUndo.length > 50) state.hostUndo.shift();
+}
+
+function recordHostChange(previous, next) {
+  if (!previous || previous === next) return;
+  pushHostUndo(previous);
+  state.hostRedo = [];
+}
+
+function queueHistoryOperation(operation) {
+  const task = state.historyTask.then(operation, operation);
+  state.historyTask = task.catch(() => {});
+  return task;
+}
+
+function installEditorKeyboardShortcuts() {
+  state.editorKeyboardCleanup?.();
+  state.editorKeyboardCleanup = null;
+  const previewDocument = state.editor?.iframe?.contentDocument;
+  if (!previewDocument) return;
+  const handleKeyDown = (event) => {
+    const target = event.target;
+    const key = event.key.toLowerCase();
+    if (!(event.metaKey || event.ctrlKey)) return;
+    if (key === "s") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void saveDocument();
+      return;
+    }
+    if (target?.isContentEditable || target?.closest?.("[contenteditable]")) return;
+    if (target?.closest?.("input, textarea, select")) return;
+    if (key !== "z" && key !== "y") return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (key === "y" || event.shiftKey) void redoEditorChange();
+    else void undoEditorChange();
+  };
+  previewDocument.addEventListener("keydown", handleKeyDown, true);
+  state.editorKeyboardCleanup = () => previewDocument.removeEventListener("keydown", handleKeyDown, true);
+}
+
 async function applyEditorHTML(next, { recordHistory = true } = {}) {
   if (!state.editor) return;
   const previous = state.editor.getHtml();
   if (next === previous) return;
-  if (recordHistory) {
-    state.hostUndo.push(previous);
-    if (state.hostUndo.length > 50) state.hostUndo.shift();
-    state.hostRedo = [];
-  }
+  if (recordHistory) recordHostChange(previous, next);
   state.changeVersion += 1;
-  state.selected = null;
-  updateSelection(null);
-  await state.editor.setHtml(next);
-  state.currentHTML = state.editor.getHtml();
+  await replaceEditorHTML(next);
   setDirty(true);
 }
 
-async function undoEditorChange() {
-  if (state.hostUndo.length) {
-    const current = state.editor.getHtml();
-    const previous = state.hostUndo.pop();
-    state.hostRedo.push(current);
-    await applyEditorHTML(previous, { recordHistory: false });
-    setStatus("Undid insertion", "dirty");
+async function undoEditorChangeNow() {
+  if (!state.editor) return;
+  await state.editor.flush();
+  if (!state.hostUndo.length) {
+    setStatus("Nothing to undo", "neutral");
     return;
   }
-  if (state.editor?.canUndo) {
-    await state.editor.undo();
-    state.changeVersion += 1;
-    setDirty(true);
-  }
+  const current = state.editor.getHtml();
+  const previous = state.hostUndo.pop();
+  state.hostRedo.push(current);
+  if (state.hostRedo.length > 50) state.hostRedo.shift();
+  state.changeVersion += 1;
+  await replaceEditorHTML(previous);
+  setDirty(true);
+  setStatus("Undid change", "dirty");
 }
 
-async function redoEditorChange() {
-  if (state.hostRedo.length) {
-    const current = state.editor.getHtml();
-    const next = state.hostRedo.pop();
-    state.hostUndo.push(current);
-    await applyEditorHTML(next, { recordHistory: false });
-    setStatus("Redid insertion", "dirty");
+function undoEditorChange() {
+  return queueHistoryOperation(undoEditorChangeNow);
+}
+
+async function redoEditorChangeNow() {
+  if (!state.editor) return;
+  await state.editor.flush();
+  if (!state.hostRedo.length) {
+    setStatus("Nothing to redo", "neutral");
     return;
   }
-  if (state.editor?.canRedo) {
-    await state.editor.redo();
-    state.changeVersion += 1;
-    setDirty(true);
-  }
+  const current = state.editor.getHtml();
+  const next = state.hostRedo.pop();
+  pushHostUndo(current);
+  state.changeVersion += 1;
+  await replaceEditorHTML(next);
+  setDirty(true);
+  setStatus("Redid change", "dirty");
+}
+
+function redoEditorChange() {
+  return queueHistoryOperation(redoEditorChangeNow);
 }
 
 const codeLanguages = [
@@ -1024,7 +1085,7 @@ async function mergeConflict() {
   const remoteChanged = normalizedBodyHTML(remote.html) !== normalizedBodyHTML(baseBody);
   if (localChanged && remoteChanged && normalizedBodyHTML(localBody) !== normalizedBodyHTML(remote.html)) return;
   if (!localChanged && remoteChanged) {
-    await state.editor.setHtml(editorDocument(remote));
+    await replaceEditorHTML(editorDocument(remote));
     state.currentHTML = state.editor.getHtml();
   }
   state.record = remote;
@@ -1132,7 +1193,7 @@ async function refreshDocument(force = false) {
   state.hostRedo = [];
   state.conflict = null;
   state.changeVersion += 1;
-  await state.editor.setHtml(state.currentHTML);
+  await replaceEditorHTML(state.currentHTML);
   updateDocumentHeading();
   setDirty(false);
   setStatus("Reloaded", "success");
@@ -1325,8 +1386,10 @@ async function start() {
     fit: "none",
     showScaleToggle: false,
     title: `${state.record.document?.title || state.record.path} editor canvas`,
-    onChange: ({ html }) => {
+    onChange: ({ html, reason }) => {
+      const previous = state.currentHTML;
       state.currentHTML = html;
+      if (reason !== "undo" && reason !== "redo") recordHostChange(previous, html);
       state.changeVersion += 1;
       setDirty(true);
     },
@@ -1334,6 +1397,7 @@ async function start() {
     onError: (error) => setStatus(error.message, "error"),
   });
   await state.editor.ready;
+  installEditorKeyboardShortcuts();
   setStatus("Ready", "success");
 }
 
