@@ -208,7 +208,7 @@ const defaultLayoutTemplate = `<!doctype html>
     </div>
   </header>
   <main class="shell">{{content}}</main>
-  <footer class="site-footer"><div class="shell">{{site.footer}} <span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a>.</span></div></footer>
+  <footer class="site-footer"><div class="shell">{{site.footer}} <span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a> and <a href="https://github.com/deckflow/html-editor" rel="noreferrer">Deckflow</a>.</span></div></footer>
 </body>
 </html>
 `
@@ -2192,7 +2192,7 @@ func templateValues(doc Document, config SiteConfig, navigation, posts string) m
 		"site.footer":      html.EscapeString(config.Footer),
 		"site.base_url":    html.EscapeString(config.BaseURL),
 		"site.theme":       html.EscapeString(config.Theme),
-		"site.attribution": `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a>.</span>`,
+		"site.attribution": `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a> and <a href="https://github.com/deckflow/html-editor" rel="noreferrer">Deckflow</a>.</span>`,
 		"theme.css":        "/theme/style.css",
 		"navigation":       navigation,
 		"posts":            posts,
@@ -2459,7 +2459,7 @@ func ensureAttribution(source string) string {
 	if strings.Contains(source, "class=\"fileloom-attribution\"") || strings.Contains(source, "class='fileloom-attribution'") {
 		return source
 	}
-	attribution := `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a>.</span>`
+	attribution := `<span class="fileloom-attribution">Powered by <a href="https://github.com/jgbrwn/fileloom" rel="noreferrer">Fileloom</a> and <a href="https://github.com/deckflow/html-editor" rel="noreferrer">Deckflow</a>.</span>`
 	if index := strings.LastIndex(strings.ToLower(source), "</body>"); index >= 0 {
 		return source[:index] + `<footer class="fileloom-generated-attribution" style="display:block;margin-top:8px;font-size:.8em">` + attribution + `</footer>` + source[index:]
 	}

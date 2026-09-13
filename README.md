@@ -164,7 +164,7 @@ The media panel supports multi-file selection and drag-and-drop uploads. Fileloo
 
 Themes are plain folders containing `theme.json`, HTML templates, and `assets/style.css`. The dashboard can activate themes, edit layout HTML visually, and edit CSS custom properties through the **Style tokens** editor. The built-in themes are intentionally inspectable and dependency-light.
 
-Generated pages include an attribution link for [Fileloom](https://github.com/jgbrwn/fileloom). The checked-in Deckflow bundle and its MIT license are documented in [NOTICE](NOTICE).
+Generated pages include attribution links for [Fileloom](https://github.com/jgbrwn/fileloom) and [Deckflow](https://github.com/deckflow/html-editor). The checked-in Deckflow bundle and its MIT license are documented in [NOTICE](NOTICE).
 
 Project development is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
