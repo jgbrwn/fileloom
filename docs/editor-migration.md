@@ -9,7 +9,7 @@ Fileloom keeps the Go server, filesystem source model, static build, themes, Exe
 | Editor-neutral GET/save/SHA contract | Done |
 | Checked-in Deckflow static bundle | Done |
 | Desktop/mobile shell and basic HTML editing | Done, experimental |
-| Selection-aware insertion, local insertion undo/redo, media drag/drop | Initial slice done; needs broader testing |
+| Selection-aware insertion, duplicate/delete/move controls, local insertion undo/redo, media drag/drop | Initial slice done; needs broader testing |
 | Code blocks with language selector and public syntax highlighting | Initial Deckflow slice done; source remains plain HTML |
 | Metadata/status/revision controls inside new editor | Initial slice done; needs broader save/restore coverage |
 | Theme layout/token editing | Separate existing CMS workflow |
@@ -44,8 +44,8 @@ Deckflow supplies source-aware selection, text editing, structural edits, and un
 
 - The new shell now has an initial Playwright smoke matrix (`web/editor/e2e`) for desktop, tablet, and Android-sized Chromium viewports. It does not yet cover every content/media/build path.
 - Save conflicts now show escaped local/remote body summaries, metadata conflict fields, explicit remote/local overwrite choices, and a safe merge path when the changed sides do not overlap. This is not a character-level diff/merge editor.
-- Fileloom block insertion is now selection-aware when the selected source element can be resolved, with a body-end fallback; it is not yet a block data model.
-- The media sheet handles images, file selection, and drag/drop; batch/deferred builds and richer placement are next.
+- Fileloom block insertion and initial duplicate/delete/sibling movement controls are selection-aware when the selected source element can be resolved, with a body-end fallback; this is not yet a block data model.
+- The media sheet handles images, file selection, drag/drop, and initial selected-image replacement; batch/deferred builds and richer placement are next.
 - Deckflow does not edit front matter directly; Fileloom's Details sheet handles supported content metadata/status, while theme layouts and CSS tokens remain in the separate CMS workflow.
 - Preview now renders the current body through the active theme's page/post template and layout in memory. It is closer to the generated public page; full save/build/public-output coverage remains part of the migration gate.
 - `?engine=vvveb` is a compatibility override, not a persisted per-user engine choice.

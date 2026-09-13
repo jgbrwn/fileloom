@@ -938,6 +938,7 @@ type editorDocumentResponse struct {
 	HTML          string         `json:"html"`
 	SourceSHA256  string         `json:"source_sha256"`
 	PreviewURL    string         `json:"preview_url"`
+	PreviewAPI    string         `json:"preview_api"`
 	PublicURL     string         `json:"public_url"`
 	Theme         string         `json:"theme"`
 	StylesheetCSS string         `json:"stylesheet_css,omitempty"`
@@ -3163,6 +3164,7 @@ func (s *Server) handleEditorAPI(w http.ResponseWriter, r *http.Request) {
 		HTML:          source.Document.HTML,
 		SourceSHA256:  sha,
 		PreviewURL:    "/_cms/editor/frame?path=" + url.QueryEscape(source.Document.Path),
+		PreviewAPI:    "/_cms/api/editor-preview",
 		PublicURL:     source.Document.URL,
 		Theme:         config.Theme,
 		MediaAPI:      "/_cms/api/media",

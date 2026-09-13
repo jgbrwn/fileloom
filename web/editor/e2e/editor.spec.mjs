@@ -80,6 +80,29 @@ test.describe("Deckflow Fileloom editor", () => {
     await popup.close();
   });
 
+  test("supports selection-aware duplicate and movement actions", async ({ page }) => {
+    await openEditor(page);
+    const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+    const paragraphs = frame.locator("p");
+    await paragraphs.nth(1).click();
+    const mobile = await page.locator(".mobile-nav").isVisible();
+    if (mobile) {
+      await page.locator('[data-action="details"]:visible').click();
+      await expect(page.locator("#sheet-content .selection-actions")).toBeVisible();
+    } else {
+      await expect(page.locator(".selection-actions")).toBeVisible();
+    }
+    await page.locator('[data-action="move-up"]:visible').click();
+    await expect(frame.locator("p").first()).toContainText("The public site is regenerated");
+    await frame.locator("p").first().click();
+    if (mobile) {
+      await page.locator('[data-action="details"]:visible').click();
+    }
+    const count = await frame.locator("p").count();
+    await page.locator('[data-action="duplicate"]:visible').click();
+    await expect(frame.locator("p")).toHaveCount(count + 1);
+  });
+
   test("opens source history from the editor", async ({ page }) => {
     await openEditor(page);
     const history = page.locator('[data-action="history"]:visible').first();

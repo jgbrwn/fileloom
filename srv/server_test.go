@@ -87,6 +87,7 @@ func TestEditorAPIGetAndJSONSaveContract(t *testing.T) {
 		HTML         string `json:"html"`
 		SourceSHA256 string `json:"source_sha256"`
 		PublicURL    string `json:"public_url"`
+		PreviewAPI   string `json:"preview_api"`
 		Editor       struct {
 			Selected string `json:"selected"`
 		} `json:"editor"`
@@ -99,6 +100,9 @@ func TestEditorAPIGetAndJSONSaveContract(t *testing.T) {
 	}
 	if opened.PublicURL != "/about/" {
 		t.Fatalf("unexpected public URL: %q", opened.PublicURL)
+	}
+	if opened.PreviewAPI != "/_cms/api/editor-preview" {
+		t.Fatalf("unexpected preview API: %q", opened.PreviewAPI)
 	}
 	deckflowReq := httptest.NewRequest(http.MethodGet, "/_cms/api/editor?path=pages%2Fabout.html&engine=deckflow", nil)
 	deckflowReq.Header.Set("X-ExeDev-Email", "owner@example.com")

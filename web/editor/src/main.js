@@ -192,7 +192,35 @@ function sourceSelectionInfo(source, selection, closestSelector = "") {
   const occurrence = selectedIndex < 0
     ? Math.max(0, Number(target.selectorIndex || 0))
     : candidates.slice(0, selectedIndex).filter((candidate) => cleanSelectedHTML(candidate) === selectedHTML).length;
-  return { element, selectedHTML, occurrence };
+  return { parsed, element, selectedHTML, occurrence };
+}
+
+function sourceRangeFromHTML(source, selectedHTML, occurrence) {
+  let cursor = 0;
+  let index = -1;
+  for (let count = 0; count <= occurrence; count += 1) {
+    index = source.indexOf(selectedHTML, cursor);
+    if (index < 0) return null;
+    cursor = index + selectedHTML.length;
+  }
+  return { start: index, end: index + selectedHTML.length, html: selectedHTML };
+}
+
+function sourceElementRange(source, parsed, element) {
+  if (!parsed || !element) return null;
+  const selectedHTML = cleanSelectedHTML(element);
+  if (!selectedHTML || ["BODY", "HTML"].includes(element.tagName)) return null;
+  const candidates = [...parsed.querySelectorAll("*")].filter((candidate) => cleanSelectedHTML(candidate) === selectedHTML);
+  const occurrence = candidates.indexOf(element);
+  if (occurrence < 0) return null;
+  return sourceRangeFromHTML(source, selectedHTML, occurrence);
+}
+
+function sourceSelectionRange(source, selection, closestSelector = "") {
+  const info = sourceSelectionInfo(source, selection, closestSelector);
+  if (!info) return null;
+  const range = sourceRangeFromHTML(source, info.selectedHTML, info.occurrence);
+  return range ? { ...info, ...range } : null;
 }
 
 function sourceSelectionElement(source, selection) {
@@ -200,31 +228,16 @@ function sourceSelectionElement(source, selection) {
 }
 
 function insertAfterSelection(source, fragment, selection) {
-  const info = sourceSelectionInfo(source, selection);
+  const info = sourceSelectionRange(source, selection);
   if (!info) return insertIntoBody(source, fragment);
-  let cursor = 0;
-  let index = -1;
-  for (let count = 0; count <= info.occurrence; count += 1) {
-    index = source.indexOf(info.selectedHTML, cursor);
-    if (index < 0) break;
-    cursor = index + info.selectedHTML.length;
-  }
-  if (index < 0) return insertIntoBody(source, fragment);
-  const end = index + info.selectedHTML.length;
+  const end = info.end;
   return `${source.slice(0, end)}\n${fragment}\n${source.slice(end)}`;
 }
 
 function replaceSelection(source, replacement, selection, closestSelector = "") {
-  const info = sourceSelectionInfo(source, selection, closestSelector);
+  const info = sourceSelectionRange(source, selection, closestSelector);
   if (!info) return source;
-  let cursor = 0;
-  let index = -1;
-  for (let count = 0; count <= info.occurrence; count += 1) {
-    index = source.indexOf(info.selectedHTML, cursor);
-    if (index < 0) return source;
-    cursor = index + info.selectedHTML.length;
-  }
-  return `${source.slice(0, index)}${replacement}${source.slice(index + info.selectedHTML.length)}`;
+  return `${source.slice(0, info.start)}${replacement}${source.slice(info.end)}`;
 }
 
 async function applyEditorHTML(next, { recordHistory = true } = {}) {
@@ -304,6 +317,90 @@ function selectedCodeBlock() {
   return element?.closest?.("pre.fileloom-code-block, pre[data-fileloom-code]") || null;
 }
 
+function selectedImageBlock() {
+  const element = state.selected?.element;
+  const candidate = element?.closest?.("figure.fileloom-image, img");
+  if (!candidate) return null;
+  if (candidate.tagName === "FIGURE" && !candidate.querySelector("img")) return null;
+  return candidate;
+}
+
+function selectedStructuralElement() {
+  return selectedCodeBlock() || selectedImageBlock() || state.selected?.element || null;
+}
+
+function structuralSelectionInfo(source) {
+  const selector = selectedCodeBlock()
+    ? "pre.fileloom-code-block, pre[data-fileloom-code]"
+    : selectedImageBlock()
+      ? "figure.fileloom-image, img"
+      : "";
+  return sourceSelectionRange(source, state.selected, selector);
+}
+
+function selectionOperationsHTML() {
+  const element = selectedStructuralElement();
+  if (!element || ["BODY", "HTML"].includes(element.tagName)) return "";
+  const previous = element.previousElementSibling;
+  const next = element.nextElementSibling;
+  const imageAction = selectedImageBlock() ? '<button class="secondary-button" data-action="media">Replace image</button>' : "";
+  return `<div class="selection-actions"><span class="eyebrow">Element actions</span><div class="selection-action-grid">${imageAction}<button class="secondary-button" data-action="duplicate">Duplicate</button><button class="secondary-button" data-action="move-up" ${previous ? "" : "disabled"}>Move up</button><button class="secondary-button" data-action="move-down" ${next ? "" : "disabled"}>Move down</button><button class="secondary-button danger-button" data-action="delete-selection">Delete</button></div></div>`;
+}
+
+function duplicateWithoutIDs(element) {
+  const clone = element.cloneNode(true);
+  clone.removeAttribute?.("id");
+  clone.querySelectorAll?.("[id]").forEach((node) => node.removeAttribute("id"));
+  return cleanSelectedHTML(clone);
+}
+
+async function duplicateSelection() {
+  const source = state.editor?.getHtml() || "";
+  const info = structuralSelectionInfo(source);
+  if (!info) return;
+  const duplicate = duplicateWithoutIDs(info.element);
+  if (!duplicate) return;
+  const next = `${source.slice(0, info.end)}\n${duplicate}\n${source.slice(info.end)}`;
+  await applyEditorHTML(next);
+  closeSheet();
+  setStatus("Element duplicated", "dirty");
+}
+
+async function deleteSelection() {
+  const source = state.editor?.getHtml() || "";
+  const info = structuralSelectionInfo(source);
+  if (!info) return;
+  await applyEditorHTML(`${source.slice(0, info.start)}${source.slice(info.end)}`);
+  closeSheet();
+  setStatus("Element deleted", "dirty");
+}
+
+async function moveSelection(direction) {
+  const source = state.editor?.getHtml() || "";
+  const info = structuralSelectionInfo(source);
+  const sibling = direction < 0 ? info?.element?.previousElementSibling : info?.element?.nextElementSibling;
+  if (!info || !sibling) {
+    setStatus(direction < 0 ? "Already at the top" : "Already at the bottom", "neutral");
+    return;
+  }
+  const siblingRange = sourceElementRange(source, info.parsed, sibling);
+  if (!siblingRange) {
+    setStatus("Could not resolve the neighboring element", "error");
+    return;
+  }
+  let next;
+  if (direction < 0 && siblingRange.start < info.start) {
+    next = `${source.slice(0, siblingRange.start)}${info.html}${source.slice(siblingRange.end, info.start)}${siblingRange.html}${source.slice(info.end)}`;
+  } else if (direction > 0 && info.start < siblingRange.start) {
+    next = `${source.slice(0, info.start)}${siblingRange.html}${source.slice(info.end, siblingRange.start)}${info.html}${source.slice(siblingRange.end)}`;
+  } else {
+    setStatus("Could not move the selected element", "error");
+    return;
+  }
+  await applyEditorHTML(next);
+  closeSheet();
+  setStatus(direction < 0 ? "Element moved up" : "Element moved down", "dirty");
+}
 function codeBlockValues() {
   const block = selectedCodeBlock();
   const code = block?.querySelector("code");
@@ -416,6 +513,7 @@ async function uploadMediaFiles(files) {
 }
 
 async function openMediaSheet() {
+  const replacingImage = Boolean(selectedImageBlock());
   openSheet("media");
   const content = document.querySelector("#sheet-content");
   content.innerHTML = '<div class="sheet-loading">Loading media…</div>';
@@ -423,7 +521,7 @@ async function openMediaSheet() {
     const tree = await fetchJSON("/_cms/api/media");
     const files = flattenMedia(tree).filter((file) => /\.(avif|gif|jpe?g|png|svg|webp)$/i.test(file.name || ""));
     content.innerHTML = `
-      <div class="sheet-heading"><div><span class="eyebrow">Media library</span><h2>Choose an image</h2></div><label class="upload-button">Upload<input id="media-upload" type="file" accept="image/*" multiple></label></div>
+      <div class="sheet-heading"><div><span class="eyebrow">Media library</span><h2>${replacingImage ? "Replace selected image" : "Choose an image"}</h2></div><label class="upload-button">Upload<input id="media-upload" type="file" accept="image/*" multiple></label></div>
       <div id="media-dropzone" class="media-dropzone" tabindex="0"><strong>Drop images here</strong><span>or tap to choose files</span></div>
       <div class="media-grid">${files.length ? files.map((file) => `<button class="media-card" data-media-url="${escapeHTML(mediaURL(file))}" data-media-name="${escapeHTML(file.name)}"><img src="${escapeHTML(mediaURL(file))}" alt=""><span>${escapeHTML(file.name)}</span></button>`).join("") : '<p class="empty-state">No images yet.</p>'}</div>`;
     const input = content.querySelector("#media-upload");
@@ -443,12 +541,20 @@ async function openMediaSheet() {
 }
 
 async function insertImage(url, name) {
+  const replacingImage = Boolean(selectedImageBlock());
   const hadSelection = Boolean(state.selected);
   const fragment = `<figure class="fileloom-image"><img src="${escapeHTML(url)}" alt="${escapeHTML(name)}"><figcaption>${escapeHTML(name)}</figcaption></figure>`;
-  const next = insertAfterSelection(state.editor.getHtml(), fragment, state.selected);
+  const source = state.editor.getHtml();
+  const next = replacingImage
+    ? replaceSelection(source, fragment, state.selected, "figure.fileloom-image, img")
+    : insertAfterSelection(source, fragment, state.selected);
+  if (next === source && replacingImage) {
+    setStatus("Could not resolve the selected image", "error");
+    return;
+  }
   await applyEditorHTML(next);
   closeSheet();
-  setStatus(hadSelection ? "Image added after selection" : "Image added", "dirty");
+  setStatus(replacingImage ? "Image replaced" : hadSelection ? "Image added after selection" : "Image added", "dirty");
 }
 
 function openSheet(kind) {
@@ -491,7 +597,7 @@ function detailsSheetHTML() {
   const metadata = metadataPayload();
   const scheduled = metadata.status === "scheduled";
   const codeAction = selectedCodeBlock() ? '<button type="button" class="secondary-button" data-action="edit-code">Edit code</button>' : "";
-  return `<div class="sheet-heading"><div><span class="eyebrow">Page details</span><h2>Metadata & status</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
+  return `<div class="sheet-heading"><div><span class="eyebrow">Page details</span><h2>Metadata & status</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>${selectionOperationsHTML()}
     <form id="details-form" class="details-form">
       <label class="form-field"><span>Title</span><input data-metadata="title" value="${escapeHTML(metadata.title)}" required></label>
       <div class="details-grid"><label class="form-field"><span>Date</span><input data-metadata="date" type="date" value="${escapeHTML(metadata.date)}"></label><label class="form-field"><span>Status</span><select data-metadata="status"><option value="draft" ${metadata.status === "draft" ? "selected" : ""}>Draft</option><option value="private" ${metadata.status === "private" ? "selected" : ""}>Private</option><option value="published" ${metadata.status === "published" ? "selected" : ""}>Published</option><option value="scheduled" ${metadata.status === "scheduled" ? "selected" : ""}>Scheduled</option></select></label></div>
@@ -702,7 +808,7 @@ function updateSelection(selection) {
   }
   const label = selection.element?.tagName?.toLowerCase() || "element";
   const codeAction = selectedCodeBlock() ? '<button class="secondary-button selection-code-action" data-action="edit-code">Edit code block</button>' : "";
-  info.innerHTML = `<span class="eyebrow">Selected element</span><strong>&lt;${escapeHTML(label)}&gt;</strong><p>${escapeHTML(selection.textContent || "Empty element")}</p>${codeAction}`;
+  info.innerHTML = `<span class="eyebrow">Selected element</span><strong>&lt;${escapeHTML(label)}&gt;</strong><p>${escapeHTML(selection.textContent || "Empty element")}</p>${codeAction}${selectionOperationsHTML()}`;
 }
 
 async function saveDocument() {
@@ -818,6 +924,18 @@ async function handleAction(action) {
       break;
     case "edit-code":
       await openCodeSheet("update");
+      break;
+    case "duplicate":
+      await duplicateSelection();
+      break;
+    case "move-up":
+      await moveSelection(-1);
+      break;
+    case "move-down":
+      await moveSelection(1);
+      break;
+    case "delete-selection":
+      await deleteSelection();
       break;
     case "style":
       openSheet("style");

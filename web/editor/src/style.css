@@ -104,6 +104,11 @@ button:focus-visible, input:focus-visible { outline: 3px solid #9e8cff; outline-
 .code-form textarea { min-height: 240px; resize: vertical; color: #e8edf7; background: #101522; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; tab-size: 2; }
 .code-help { margin: 0; color: #8993a5; font-size: 11px; line-height: 1.45; }
 .selection-code-action { width: 100%; margin-top: 10px; }
+.selection-actions { display: grid; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid #eef0f4; }
+.selection-action-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.selection-action-grid .secondary-button { min-width: 0; padding-inline: 7px; font-size: 11px; }
+.danger-button { color: var(--red); }
+.danger-button:hover { color: #9e2839; border-color: #efb7c0; background: #fff6f7; }
 .details-form small { color: #929bac; font-size: 10px; font-weight: 500; }
 .details-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .details-source { margin-top: 18px; }
