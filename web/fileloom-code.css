@@ -1,18 +1,19 @@
 :root {
-  --fileloom-code-bg: #101522;
-  --fileloom-code-fg: #e8edf7;
-  --fileloom-code-muted: #8792a6;
-  --fileloom-code-keyword: #c792ea;
-  --fileloom-code-string: #addb67;
-  --fileloom-code-number: #f78c6c;
-  --fileloom-code-comment: #7f8c9f;
-  --fileloom-code-tag: #82aaff;
+  --fileloom-code-bg: var(--fileloom-theme-code-bg, #101522);
+  --fileloom-code-fg: var(--fileloom-theme-code-fg, #e8edf7);
+  --fileloom-code-muted: var(--fileloom-theme-code-muted, #8792a6);
+  --fileloom-code-keyword: var(--fileloom-theme-code-keyword, #c792ea);
+  --fileloom-code-string: var(--fileloom-theme-code-string, #addb67);
+  --fileloom-code-number: var(--fileloom-theme-code-number, #f78c6c);
+  --fileloom-code-comment: var(--fileloom-theme-code-comment, #7f8c9f);
+  --fileloom-code-tag: var(--fileloom-theme-code-tag, #82aaff);
+  --fileloom-code-border: var(--fileloom-theme-code-border, color-mix(in srgb, var(--fileloom-code-fg) 16%, transparent));
 }
 .fileloom-code-block {
   margin: 1.5rem 0;
   padding: 1rem 1.15rem;
   overflow-x: auto;
-  border: 1px solid color-mix(in srgb, var(--fileloom-code-fg) 16%, transparent);
+  border: 1px solid var(--fileloom-code-border);
   border-radius: .7rem;
   background: var(--fileloom-code-bg);
   color: var(--fileloom-code-fg);
@@ -30,15 +31,3 @@
 .fileloom-code-block .fileloom-token-number { color: var(--fileloom-code-number); }
 .fileloom-code-block .fileloom-token-comment { color: var(--fileloom-code-comment); font-style: italic; }
 .fileloom-code-block .fileloom-token-tag { color: var(--fileloom-code-tag); }
-@media (prefers-color-scheme: light) {
-  :root {
-    --fileloom-code-bg: #f4f6fa;
-    --fileloom-code-fg: #263044;
-    --fileloom-code-muted: #69758a;
-    --fileloom-code-keyword: #8b3dbd;
-    --fileloom-code-string: #277a43;
-    --fileloom-code-number: #b54d27;
-    --fileloom-code-comment: #6a7588;
-    --fileloom-code-tag: #315fa8;
-  }
-}

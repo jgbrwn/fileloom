@@ -32,6 +32,7 @@ const state = {
   editorKeyboardCleanup: null,
   conflict: null,
   selected: null,
+  codeEdit: null,
   sheet: null,
 };
 
@@ -526,6 +527,83 @@ function languageClass(value) {
   return `language-${String(value || "plaintext").toLowerCase().replace(/[^a-z0-9_-]/g, "-")}`;
 }
 
+function codeBlockOccurrence(block) {
+  if (!block?.ownerDocument) return -1;
+  return [...block.ownerDocument.querySelectorAll("pre.fileloom-code-block, pre[data-fileloom-code]")].indexOf(block);
+}
+
+function isCodeBlockOpeningTag(tag) {
+  if (/\bdata-fileloom-code(?:\s|=|\/?>)/i.test(tag)) return true;
+  const classValue = tag.match(/\bclass\s*=\s*(["'])(.*?)\1/i)?.[2] || "";
+  return classValue.split(/\s+/).includes("fileloom-code-block");
+}
+
+function matchingElementEnd(source, start, openingEnd, tagName) {
+  let depth = 1;
+  let cursor = openingEnd;
+  const normalizedTag = String(tagName || "").toLowerCase();
+  while (cursor < source.length) {
+    const tagStart = source.indexOf("<", cursor);
+    if (tagStart < 0) return -1;
+    if (source.startsWith("<!--", tagStart)) {
+      const commentEnd = source.indexOf("-->", tagStart + 4);
+      cursor = commentEnd < 0 ? source.length : commentEnd + 3;
+      continue;
+    }
+    const closing = source[tagStart + 1] === "/";
+    const nameMatch = source.slice(tagStart).match(/^<\/?\s*([A-Za-z][A-Za-z0-9:-]*)\b/);
+    if (!nameMatch || nameMatch[1].toLowerCase() !== normalizedTag) {
+      cursor = tagStart + 1;
+      continue;
+    }
+    const tagEnd = scanOpeningTagEnd(source, tagStart);
+    if (tagEnd < 0) return -1;
+    if (closing) depth -= 1;
+    else if (!/\/\s*>$/.test(source.slice(tagStart, tagEnd))) depth += 1;
+    if (depth === 0) return tagEnd;
+    cursor = tagEnd;
+  }
+  return -1;
+}
+
+function codeBlockSourceRange(source, occurrence) {
+  let cursor = 0;
+  let found = 0;
+  while (cursor < source.length) {
+    const start = source.indexOf("<", cursor);
+    if (start < 0) return null;
+    if (source.startsWith("<!--", start)) {
+      const commentEnd = source.indexOf("-->", start + 4);
+      cursor = commentEnd < 0 ? source.length : commentEnd + 3;
+      continue;
+    }
+    const nameMatch = source.slice(start).match(/^<\s*([A-Za-z][A-Za-z0-9:-]*)\b/);
+    if (!nameMatch || nameMatch[1].toLowerCase() !== "pre" || source[start + 1] === "/") {
+      cursor = start + 1;
+      continue;
+    }
+    const openingEnd = scanOpeningTagEnd(source, start);
+    if (openingEnd < 0) return null;
+    const openingTag = source.slice(start, openingEnd);
+    if (isCodeBlockOpeningTag(openingTag)) {
+      if (found === occurrence) {
+        const end = matchingElementEnd(source, start, openingEnd, "pre");
+        return end < 0 ? null : { start, end };
+      }
+      found += 1;
+    }
+    cursor = openingEnd;
+  }
+  return null;
+}
+
+function replaceCodeBlockSource(source, block, replacement) {
+  const occurrence = codeBlockOccurrence(block);
+  const range = occurrence < 0 ? null : codeBlockSourceRange(source, occurrence);
+  if (!range) return source;
+  return `${source.slice(0, range.start)}${replacement}${source.slice(range.end)}`;
+}
+
 function codeBlockFragment(language = "plaintext", code = "Paste code here") {
   const normalized = String(language || "plaintext").toLowerCase();
   const className = languageClass(normalized);
@@ -767,18 +845,30 @@ function codeBlockValues() {
 function codeSheetHTML(mode = "insert") {
   const values = mode === "update" ? codeBlockValues() : { language: "plaintext", code: "" };
   const options = codeLanguages.map(([value, label]) => `<option value="${value}" ${value === values.language ? "selected" : ""}>${label}</option>`).join("");
-  return `<div class="sheet-heading"><div><span class="eyebrow">${mode === "update" ? "Edit element" : "Insert"}</span><h2>Code block</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
+  const lines = values.code ? values.code.split("\n").length : 0;
+  const summary = `${lines} ${lines === 1 ? "line" : "lines"} · ${values.code.length} characters`;
+  return `<div class="sheet-heading"><div><span class="eyebrow">${mode === "update" ? "Edit element" : "Insert"}</span><h2>Code block</h2><p class="sheet-subtitle">Write code with its language and formatting intact.</p></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
     <form id="code-form" class="code-form" data-code-mode="${mode}">
-      <label class="form-field"><span>Language</span><select name="language">${options}</select></label>
-      <label class="form-field"><span>Code</span><textarea name="code" rows="13" spellcheck="false" autocapitalize="off" autocomplete="off">${escapeHTML(values.code)}</textarea></label>
-      <p class="code-help">Code stays plain in the HTML source. Fileloom applies syntax highlighting in the public/theme preview.</p>
+      <div class="code-form-toolbar"><label class="form-field"><span>Language</span><select name="language" aria-label="Code language">${options}</select></label><span class="code-editor-summary" data-code-summary>${summary}</span></div>
+      <label class="form-field code-editor-field"><span class="code-editor-label"><strong>Code</strong><small>Indentation and line breaks are preserved</small></span><textarea name="code" rows="18" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" aria-label="Code" placeholder="Paste or type code here…">${escapeHTML(values.code)}</textarea></label>
+      <p class="code-help"><strong>Preview styling follows the active theme.</strong> Code is saved as plain <code>&lt;pre&gt;&lt;code&gt;</code> HTML and highlighted when the page is published.</p>
       <div class="details-actions"><button type="button" class="secondary-button" data-action="close-sheet">Cancel</button><button type="submit" class="primary-button">${mode === "update" ? "Update code" : "Insert code"}</button></div>
     </form>`;
 }
 
 async function openCodeSheet(mode = "insert") {
+  state.codeEdit = mode === "update" ? { block: selectedCodeBlock(), occurrence: codeBlockOccurrence(selectedCodeBlock()) } : null;
   openSheet("code");
   document.querySelector("#sheet-content").innerHTML = codeSheetHTML(mode);
+  updateCodeSummary(document.querySelector("#code-form"));
+}
+
+function updateCodeSummary(form) {
+  const summary = form?.querySelector("[data-code-summary]");
+  const code = form?.elements?.code?.value || "";
+  if (!summary) return;
+  const lines = code ? code.split("\n").length : 0;
+  summary.textContent = `${lines} ${lines === 1 ? "line" : "lines"} · ${code.length} characters`;
 }
 
 async function submitCodeForm(form) {
@@ -786,8 +876,11 @@ async function submitCodeForm(form) {
   const code = form.elements.code.value;
   const mode = form.dataset.codeMode;
   if (mode === "update") {
-    const next = replaceSelection(state.editor.getHtml(), codeBlockFragment(language, code), state.selected, "pre.fileloom-code-block, pre[data-fileloom-code]");
-    if (next === state.editor.getHtml()) {
+    await state.editor.flush();
+    const source = state.editor.getHtml();
+    const block = state.codeEdit?.block || selectedCodeBlock();
+    const next = replaceCodeBlockSource(source, block, codeBlockFragment(language, code));
+    if (next === source) {
       setStatus("Could not resolve the selected code block", "error");
       return;
     }
@@ -801,6 +894,49 @@ async function submitCodeForm(form) {
   await applyEditorHTML(next);
   closeSheet();
   setStatus(hadSelection ? "Code block added after selection" : "Code block added", "dirty");
+}
+
+function replaceEditorBodyHTML(source, bodyHTML) {
+  const input = String(source || "");
+  const opening = /<body\b[^>]*>/i.exec(input);
+  if (!opening) return String(bodyHTML || "");
+  const bodyStart = opening.index + opening[0].length;
+  const bodyEnd = input.toLowerCase().lastIndexOf("</body>");
+  if (bodyEnd < bodyStart) return String(bodyHTML || "");
+  return `${input.slice(0, bodyStart)}${bodyHTML || ""}${input.slice(bodyEnd)}`;
+}
+
+function sourceSheetHTML(source) {
+  return `<div class="sheet-heading"><div><span class="eyebrow">Advanced editing</span><h2>HTML source</h2><p class="sheet-subtitle">Edit the body HTML for <strong>${escapeHTML(state.record?.path || "this page")}</strong>.</p></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
+    <form id="source-form" class="source-form">
+      <label class="form-field"><span class="code-editor-label"><strong>Body HTML</strong><small>Front matter and page metadata stay protected</small></span><textarea name="html" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" aria-label="HTML source" placeholder="<p>Write HTML here…">${escapeHTML(source)}</textarea></label>
+      <p class="source-warning"><strong>Use this for precise HTML changes.</strong> Visual edits, code blocks, comments, and custom attributes remain source-backed; the next visual edit will use this HTML.</p>
+      <div class="details-actions"><button type="button" class="secondary-button" data-action="close-sheet">Cancel</button><button type="submit" class="primary-button">Apply HTML</button></div>
+    </form>`;
+}
+
+async function openSourceSheet() {
+  if (isThemeResource()) {
+    setStatus("Theme layouts are edited from the CMS theme workflow", "neutral");
+    return;
+  }
+  await state.editor.flush();
+  const source = bodyHTMLFromEditorDocument(state.editor.getHtml());
+  openSheet("source");
+  document.querySelector("#sheet-content").innerHTML = sourceSheetHTML(source);
+}
+
+async function submitSourceForm(form) {
+  await state.editor.flush();
+  const source = state.editor.getHtml();
+  const next = replaceEditorBodyHTML(source, form.elements.html.value);
+  if (next === source) {
+    setStatus("No HTML changes", "neutral");
+    return;
+  }
+  await applyEditorHTML(next);
+  closeSheet();
+  setStatus("HTML source applied", "dirty");
 }
 
 function blockFragment(type) {
@@ -939,6 +1075,7 @@ function openSheet(kind) {
 
 function closeSheet() {
   state.sheet = null;
+  state.codeEdit = null;
   const backdrop = document.querySelector("#sheet-backdrop");
   const sheet = document.querySelector("#editor-sheet");
   if (backdrop) backdrop.hidden = true;
@@ -960,6 +1097,7 @@ function detailsSheetHTML() {
   const metadata = metadataPayload();
   const scheduled = metadata.status === "scheduled";
   const codeAction = selectedCodeBlock() ? '<button type="button" class="secondary-button" data-action="edit-code">Edit code</button>' : "";
+  const sourceAction = '<button type="button" class="secondary-button" data-action="source">HTML source</button>';
   return `<div class="sheet-heading"><div><span class="eyebrow">Page details</span><h2>Metadata & status</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>${selectionOperationsHTML()}
     <form id="details-form" class="details-form">
       <label class="form-field"><span>Title</span><input data-metadata="title" value="${escapeHTML(metadata.title)}" required></label>
@@ -967,7 +1105,7 @@ function detailsSheetHTML() {
       <label class="form-field" data-publish-at-field ${scheduled ? "" : "hidden"}><span>Publish at</span><input data-metadata="publish_at" type="datetime-local" value="${escapeHTML(localDateTimeValue(metadata.publish_at))}"><small>Stored in UTC after saving.</small></label>
       <div class="details-grid"><label class="form-field"><span>Tags</span><input data-metadata="tags" value="${escapeHTML(metadata.tags.join(", "))}" placeholder="design, notes"></label><label class="form-field"><span>Category</span><input data-metadata="category" value="${escapeHTML(metadata.category)}"></label></div>
       <label class="form-field"><span>Excerpt</span><textarea data-metadata="excerpt" rows="3">${escapeHTML(metadata.excerpt)}</textarea></label>
-      <div class="details-actions">${codeAction}<button type="button" class="secondary-button" data-action="history">History</button><button type="button" class="primary-button" data-action="save">Save details</button></div>
+      <div class="details-actions">${codeAction}${sourceAction}<button type="button" class="secondary-button" data-action="history">History</button><button type="button" class="primary-button" data-action="save">Save details</button></div>
     </form>
     <div class="info-card details-source"><span class="eyebrow">Source</span><strong>${escapeHTML(state.record?.path || "")}</strong><small>${escapeHTML(state.record?.theme || "default")} theme · slug ${escapeHTML(state.record?.document?.slug || "")}</small></div>`;
 }
@@ -1148,17 +1286,19 @@ function styleSheetHTML() {
 
 function renderShell(record) {
   const title = escapeHTML(record.document?.title || record.path);
+  const sourceAction = isThemeResource(record) ? "" : '<button class="secondary-button desktop-only" data-action="source" title="Edit the HTML source">HTML source</button>';
+  const inspectorSourceAction = isThemeResource(record) ? "" : '<button class="secondary-button" data-action="source">HTML source</button>';
   app.innerHTML = `
     <div class="editor-shell">
       <header class="editor-topbar">
         <div class="topbar-leading"><button class="back-button" data-action="back" aria-label="Back to CMS">←<span class="desktop-only"> CMS</span></button><div class="brand-lockup"><span class="brand-mark">F</span><span class="desktop-only">FILELOOM</span></div></div>
         <div class="document-heading"><span class="eyebrow">Visual editor</span><strong title="${title}">${title}</strong><span class="dirty-dot" data-dirty-indicator hidden></span></div>
-        <div class="topbar-actions"><span id="editor-status" data-kind="neutral">Ready</span><button class="icon-button desktop-only" data-action="undo" aria-label="Undo">↶</button><button class="icon-button desktop-only" data-action="redo" aria-label="Redo">↷</button><button class="secondary-button desktop-only" data-action="preview">Preview</button><button class="primary-button" data-action="save" disabled>Save</button><button class="icon-button mobile-only" data-action="more" aria-label="More">•••</button></div>
+        <div class="topbar-actions"><span id="editor-status" data-kind="neutral">Ready</span><button class="icon-button desktop-only" data-action="undo" aria-label="Undo">↶</button><button class="icon-button desktop-only" data-action="redo" aria-label="Redo">↷</button><button class="secondary-button desktop-only" data-action="preview">Preview</button>${sourceAction}<button class="primary-button" data-action="save" disabled>Save</button><button class="icon-button mobile-only" data-action="more" aria-label="More">•••</button></div>
       </header>
       <main class="editor-workspace">
         <aside class="desktop-panel desktop-blocks"><div class="panel-heading"><div><span class="eyebrow">Add</span><h2>Blocks</h2></div></div>${blockCatalogHTML()}</aside>
         <section class="canvas-region"><div id="deckflow-canvas" aria-label="Editable page canvas"></div><div class="canvas-hint">Tap text to edit · Select an element for controls</div></section>
-        <aside class="desktop-panel desktop-inspector"><div class="panel-heading"><div><span class="eyebrow">Inspect</span><h2>Selection</h2></div></div><div id="selection-info" class="selection-info"><strong>Nothing selected</strong><p>Choose an element in the canvas to edit it.</p></div><div class="inspector-divider"></div><div class="quick-actions inspector-actions"><button class="secondary-button" data-action="details">Details</button><button class="secondary-button" data-action="history">History</button></div><div class="info-card"><span class="eyebrow">Source</span><strong>${escapeHTML(record.path)}</strong><small data-document-summary>${escapeHTML(record.theme || "default")} theme · ${escapeHTML(record.document?.status || "published")} · HTML-first</small></div></aside>
+        <aside class="desktop-panel desktop-inspector"><div class="panel-heading"><div><span class="eyebrow">Inspect</span><h2>Selection</h2></div></div><div id="selection-info" class="selection-info"><strong>Nothing selected</strong><p>Choose an element in the canvas to edit it.</p></div><div class="inspector-divider"></div><div class="quick-actions inspector-actions"><button class="secondary-button" data-action="details">Details</button>${inspectorSourceAction}<button class="secondary-button" data-action="history">History</button></div><div class="info-card"><span class="eyebrow">Source</span><strong>${escapeHTML(record.path)}</strong><small data-document-summary>${escapeHTML(record.theme || "default")} theme · ${escapeHTML(record.document?.status || "published")} · HTML-first</small></div></aside>
       </main>
       <nav class="mobile-nav" aria-label="Editor tools"><button data-action="blocks"><span>＋</span><small>Blocks</small></button><button data-action="media"><span>▧</span><small>Media</small></button><button data-action="details"><span>≡</span><small>Details</small></button><button data-action="style"><span>◌</span><small>Style</small></button><button data-action="preview"><span>◉</span><small>Preview</small></button><button data-action="save"><span>↑</span><small>Save</small></button></nav>
       <div id="sheet-backdrop" class="sheet-backdrop" hidden data-action="close-sheet"></div><section id="editor-sheet" class="editor-sheet" hidden aria-label="Editor panel"><div id="sheet-grabber"></div><div id="sheet-content"></div></section>
@@ -1326,6 +1466,9 @@ async function handleAction(action) {
     case "style":
       openSheet("style");
       break;
+    case "source":
+      await openSourceSheet();
+      break;
     case "more":
       openSheet("details");
       break;
@@ -1390,6 +1533,7 @@ app.addEventListener("click", async (event) => {
 app.addEventListener("input", (event) => {
   const field = event.target.closest("#details-form [data-metadata]");
   if (field) updateMetadataDraft(field);
+  if (event.target.closest("#code-form [name=code]")) updateCodeSummary(event.target.form);
 });
 
 app.addEventListener("change", (event) => {
@@ -1397,12 +1541,31 @@ app.addEventListener("change", (event) => {
   if (field) updateMetadataDraft(field);
 });
 
+app.addEventListener("keydown", (event) => {
+  const textarea = event.target.closest("#code-form textarea[name=code]");
+  if (!textarea) return;
+  if (event.key === "Tab" && !event.shiftKey) {
+    event.preventDefault();
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    textarea.setRangeText("  ", start, end, "end");
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    return;
+  }
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    textarea.form?.requestSubmit();
+  }
+});
+
 app.addEventListener("submit", async (event) => {
   const codeForm = event.target.closest("#code-form");
+  const sourceForm = event.target.closest("#source-form");
   const inspectorForm = event.target.closest("#element-inspector-form");
-  if (!codeForm && !inspectorForm) return;
+  if (!codeForm && !sourceForm && !inspectorForm) return;
   event.preventDefault();
   if (codeForm) await submitCodeForm(codeForm);
+  else if (sourceForm) await submitSourceForm(sourceForm);
   else await submitElementInspector(inspectorForm);
 });
 

@@ -221,6 +221,58 @@ test.describe("Deckflow Fileloom editor", () => {
     await expect(page.frameLocator("iframe.deckflow-html-editor__preview").locator('pre[data-fileloom-code] code')).toContainText("package main");
   });
 
+  test("edits code block content and language across the responsive editor", async ({ page }) => {
+    await openEditor(page);
+    const mobile = await page.locator(".mobile-nav").isVisible();
+    if (mobile) await page.locator('[data-action="blocks"]:visible').click();
+    const catalog = page.locator(mobile ? '#sheet-content .block-grid [data-block="code"]' : '.desktop-blocks .block-grid [data-block="code"]');
+    await catalog.click();
+    await page.locator('#code-form [name="language"]').selectOption("python");
+    await page.locator('#code-form [name="code"]').fill("def old():\n    return 1");
+    const editorHeight = await page.locator('#code-form textarea[name="code"]').evaluate((textarea) => textarea.getBoundingClientRect().height);
+    expect(editorHeight).toBeGreaterThan(mobile ? 260 : 340);
+    await page.locator('#code-form button[type="submit"]').click();
+
+    const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+    const block = frame.locator("pre[data-fileloom-code]");
+    await block.click();
+    if (mobile) {
+      await page.locator('[data-action="details"]:visible').click();
+      await expect(page.locator('#sheet-content [data-action="edit-code"]')).toBeVisible();
+    } else {
+      await expect(page.locator('.selection-code-action')).toBeVisible();
+    }
+    await page.locator('[data-action="edit-code"]:visible').click();
+    await expect(page.locator("#code-form")).toBeVisible();
+    await page.locator('#code-form [name="language"]').selectOption("javascript");
+    await page.locator('#code-form [name="code"]').fill('const value = "<tag>&";\n  return value;');
+    await page.locator('#code-form button[type="submit"]').click();
+
+    await expect(page.locator("#editor-status")).toHaveText("Code block updated");
+    await expect(block).toHaveAttribute("data-language", "javascript");
+    await expect(block.locator("code")).toHaveClass(/language-javascript/);
+    await expect(block.locator("code")).toContainText('<tag>&');
+  });
+
+  test("opens and applies the body HTML source editor", async ({ page }) => {
+    await openEditor(page);
+    const mobile = await page.locator(".mobile-nav").isVisible();
+    if (mobile) {
+      await page.locator('[data-action="details"]:visible').click();
+      await page.locator('#sheet-content [data-action="source"]').click();
+    } else {
+      await page.locator('.topbar-actions [data-action="source"]:visible').click();
+    }
+    await expect(page.locator("#source-form")).toBeVisible();
+    await expect(page.locator('#source-form [name="html"]')).toHaveValue(/ordinary HTML file/);
+    await page.locator('#source-form [name="html"]').fill('<p data-source-edit="yes">Edited directly in HTML.</p>\n<pre class="fileloom-code-block" data-fileloom-code data-language="javascript"><code class="language-javascript" data-language="javascript">const source = true;</code></pre>');
+    await page.locator('#source-form button[type="submit"]').click();
+    const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+    await expect(page.locator("#editor-status")).toHaveText("HTML source applied");
+    await expect(frame.locator('p[data-source-edit="yes"]')).toHaveText("Edited directly in HTML.");
+    await expect(frame.locator('pre[data-fileloom-code]')).toHaveAttribute("data-language", "javascript");
+  });
+
   test("opens the actual theme-applied preview", async ({ page }) => {
     await openEditor(page);
     const mobile = await page.locator(".mobile-nav").isVisible();
@@ -239,6 +291,12 @@ test.describe("Deckflow Fileloom editor", () => {
     await expect(popup.locator(".article-body")).toContainText("ordinary HTML file");
     await expect(popup.locator("pre.fileloom-code-block")).toHaveAttribute("data-language", "javascript");
     await expect(popup.locator("pre.fileloom-code-block code")).toHaveClass(/fileloom-code-highlighted/);
+    const codeColors = await popup.locator("pre.fileloom-code-block").evaluate((element) => ({
+      background: getComputedStyle(element).backgroundColor,
+      keyword: getComputedStyle(element.querySelector(".fileloom-token-keyword")).color,
+    }));
+    expect(codeColors.background).toBe("rgb(17, 17, 17)");
+    expect(codeColors.keyword).toBe("rgb(234, 255, 0)");
     await popup.close();
   });
 

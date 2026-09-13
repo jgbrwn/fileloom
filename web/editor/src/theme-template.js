@@ -124,7 +124,8 @@ export function unshieldThemeTemplate(projected, tokens) {
 export function injectThemePreviewStyles(source, css) {
   const themeStyle = `<style data-fileloom-theme-preview>${String(css || "").replace(/<\/style/gi, "<\\/style")}</style>`;
   const slotStyle = `<style data-fileloom-theme-slots>.fileloom-template-slot{display:inline-block;padding:.08em .35em;border:1px dashed #6347ee;border-radius:.35em;color:#5037c9;background:#f0edff;font:600 .78em/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:none;white-space:nowrap}.fileloom-template-slot::before{content:"Template slot ";opacity:.62}</style>`;
-  const style = themeStyle + slotStyle;
+  const codeStyle = `<link rel="stylesheet" href="/_cms/assets/fileloom-code.css" data-fileloom-editor-code>`;
+  const style = codeStyle + themeStyle + slotStyle;
   const lower = String(source || "").toLowerCase();
   const headEnd = lower.indexOf("</head>");
   if (headEnd >= 0) return `${source.slice(0, headEnd)}${style}${source.slice(headEnd)}`;
@@ -132,5 +133,7 @@ export function injectThemePreviewStyles(source, css) {
 }
 
 export function stripThemePreviewStyles(source) {
-  return String(source || "").replace(/<style\b[^>]*data-fileloom-theme-(?:preview|slots)[^>]*>[\s\S]*?<\/style>\s*/gi, "");
+  return String(source || "")
+    .replace(/<link\b[^>]*data-fileloom-editor-code[^>]*>\s*/gi, "")
+    .replace(/<style\b[^>]*data-fileloom-theme-(?:preview|slots)[^>]*>[\s\S]*?<\/style>\s*/gi, "");
 }

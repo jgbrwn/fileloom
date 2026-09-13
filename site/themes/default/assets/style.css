@@ -1,3 +1,4 @@
+:root { --fileloom-theme-code-bg: #202839; --fileloom-theme-code-fg: #f6f8fb; --fileloom-theme-code-muted: #aeb9c9; --fileloom-theme-code-keyword: #bba7ff; --fileloom-theme-code-string: #a9e6b4; --fileloom-theme-code-number: #ffb38a; --fileloom-theme-code-comment: #91a0b5; --fileloom-theme-code-tag: #90b8ff; --fileloom-theme-code-border: #3a465a; }
 :root {
   color-scheme: light;
   --ink: #18212b;

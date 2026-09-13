@@ -2422,7 +2422,10 @@ func codeAssetsAvailable(path string) bool {
 func ensureCodeAssets(source string) string {
 	if !strings.Contains(source, "/theme/fileloom-code.css") {
 		link := `<link rel="stylesheet" href="/theme/fileloom-code.css">`
-		if index := strings.Index(strings.ToLower(source), "</head>"); index >= 0 {
+		lower := strings.ToLower(source)
+		if themeIndex := strings.Index(lower, `<link rel="stylesheet" href="/theme/style.css`); themeIndex >= 0 {
+			source = source[:themeIndex] + link + source[themeIndex:]
+		} else if index := strings.Index(lower, "</head>"); index >= 0 {
 			source = source[:index] + link + source[index:]
 		} else {
 			source = link + source
@@ -3318,7 +3321,7 @@ func (s *Server) renderThemeLayoutPreview(themeName, layout string) (string, err
 	} else {
 		output = `<style data-fileloom-preview>` + cssText + `</style>` + output
 	}
-	return output, nil
+	return ensureCodeAssets(output), nil
 }
 func (s *Server) handleEditorPreviewAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

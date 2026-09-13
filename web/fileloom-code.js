@@ -134,7 +134,12 @@
       code.innerHTML = highlight(code.textContent, language);
       code.dataset.fileloomHighlighted = "1";
       code.classList.add("fileloom-code-highlighted");
-      if (element.tagName.toLowerCase() === "pre") element.dataset.language = language;
+      const block = element.tagName.toLowerCase() === "pre" ? element : code.parentElement?.tagName.toLowerCase() === "pre" ? code.parentElement : null;
+      if (block) {
+        block.dataset.language = language;
+        block.dataset.fileloomCode = "";
+        block.classList.add("fileloom-code-block");
+      }
     });
   }
 

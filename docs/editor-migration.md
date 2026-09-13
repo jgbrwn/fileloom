@@ -10,10 +10,10 @@ Fileloom keeps the Go server, filesystem source model, static build, themes, Exe
 | Checked-in Deckflow static bundle | Done |
 | Desktop/mobile shell and basic HTML editing | Done |
 | Selection-aware insertion, duplicate/delete/move controls, property inspector, local insertion undo/redo, media drag/drop | Initial browser/backend coverage done; broader HTML cases remain |
-| Code blocks with language selector and public syntax highlighting | Initial Deckflow slice done; source remains plain HTML |
+| Code blocks with language selector and public syntax highlighting | Responsive editor, reliable source-preserving updates, theme-driven styling, and public highlighting |
 | Metadata/status/revision controls inside new editor | Initial save/conflict/restore coverage now includes API and browser paths |
 | Theme layout/token editing | Done with protected-slot Deckflow theme mode and separate Style tokens workflow |
-| Browser/device regression suite | 66 Playwright tests across desktop, tablet, and Android-sized Chromium; full gate passed |
+| Browser/device regression suite | 72 Playwright tests across desktop, tablet, and Android-sized Chromium; full gate passed |
 | Legacy editor removal | Done |
 | Comments engine | Design-only; see `docs/comments-plan.md` |
 
@@ -25,6 +25,7 @@ The frontend source lives under `web/editor`; run `make editor-build` after chan
 - `GET /_cms/api/editor?path=...` returns the content body fragment, document metadata, full-source SHA, theme CSS, preview URL, and available engines; `GET /_cms/api/editor?theme=...` returns a protected-slot theme-layout resource.
 - `POST /_cms/api/editor-save` accepts content and protected-slot theme-layout JSON resources with source preconditions and refreshed `source_sha256`/`ETag` responses. Metadata updates preserve unknown front matter and validate status/scheduling before rebuilding affected public output.
 - `POST /_cms/api/editor-preview` renders the current unsaved content body or protected-slot theme layout through the active theme in memory. It does not write source or `site/public`; the Deckflow Preview action opens this actual theme-applied render.
+- The content editor's **HTML source** action opens the body HTML directly without exposing or rewriting front matter or metadata. Apply HTML returns to the same Deckflow canvas; Save still uses the source-preserving SHA-guarded boundary.
 
 ## Editor boundary
 
@@ -35,13 +36,13 @@ The editor shell owns mobile and desktop UX:
 - mobile: tap-to-add blocks, bottom sheets, keyboard-safe layout, large controls;
 - desktop: side panels, keyboard shortcuts, metadata/status/history controls, optional drag/resize interactions;
 - both: explicit save, preview, media, status, conflict handling, and source-preserving reload;
-- code blocks: language-aware semantic insertion/editing with public/preview syntax highlighting.
+- code blocks: language-aware semantic insertion/editing with a responsive code sheet, plain-source persistence, theme-driven public/preview styling, and syntax highlighting.
 
 Deckflow supplies source-aware selection, text editing, structural edits, and undo/redo. Fileloom supplies block insertion, media, themes, metadata, publishing, revisions, and persistence.
 
 ## Current limitations
 
-- The new shell now has a 66-test Playwright regression matrix (`web/editor/e2e`) for desktop, tablet, and Android-sized Chromium viewports. By default Playwright copies the checked-in site into a temporary workspace and starts a disposable Go server, so save/upload tests do not mutate the developer's site; `FILELOOM_E2E_URL` opts into an existing server. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts.
+- The new shell now has a 72-test Playwright regression matrix (`web/editor/e2e`) for desktop, tablet, and Android-sized Chromium viewports. By default Playwright copies the checked-in site into a temporary workspace and starts a disposable Go server, so save/upload tests do not mutate the developer's site; `FILELOOM_E2E_URL` opts into an existing server. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts.
 - Save conflicts now show escaped local/remote body summaries, metadata conflict fields, explicit remote/local overwrite choices, and a safe merge path when the changed sides do not overlap. This is not a character-level diff/merge editor.
 - Fileloom block insertion and initial duplicate/delete/sibling movement controls are selection-aware when the selected source element can be resolved, with a body-end fallback; link/image properties now patch only the selected opening tag and reject unsafe URLs/classes, but this is not yet a block data model.
 - Inline text editing preserves mixed child markup, supports range formatting, rejects structure-changing contenteditable edits, and now has desktop/tablet/Android-sized keyboard regression coverage. Native touch/soft-keyboard behavior still deserves device testing beyond Chromium emulation.
@@ -54,4 +55,4 @@ Deckflow supplies source-aware selection, text editing, structural edits, and un
 
 Puck is not the canonical model for existing HTML pages. If a structured block-page format is added later, it should be opt-in for new content and have an explicit React/Node rendering strategy. Plumix is a UX and host-editor reference, not a dependency. Theme templates remain a separate workflow from content-body editing.
 
-**Gate status: passed.** The suite covers 66 browser cases across desktop, tablet, and Android-sized Chromium plus API coverage for content/theme save/reload/public output, stale conflicts, revisions, real media uploads, theme/public preview parity, preview non-mutation, keyboard editing, ordered undo/redo, and single-surface canvas scrolling. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts. Go tests, race tests, the production build, source-fidelity checks, and attribution review all pass.
+**Gate status: passed.** The suite covers 72 browser cases across desktop, tablet, and Android-sized Chromium plus API coverage for content/theme save/reload/public output, stale conflicts, revisions, real media uploads, theme/public preview parity, preview non-mutation, keyboard editing, ordered undo/redo, HTML source editing, reliable code-block editing, theme-driven code styling, and single-surface canvas scrolling. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts. Go tests, race tests, the production build, source-fidelity checks, and attribution review all pass.
