@@ -13,9 +13,9 @@ Fileloom keeps the Go server, filesystem source model, static build, themes, Exe
 | Code blocks with language selector and public syntax highlighting | Responsive editor, reliable source-preserving updates, theme-driven styling, and public highlighting |
 | Metadata/status/revision controls inside new editor | Initial save/conflict/restore coverage now includes API and browser paths |
 | Theme layout/token editing | Done with protected-slot Deckflow theme mode and separate Style tokens workflow |
-| Browser/device regression suite | 78 Playwright tests across desktop, tablet, and Android-sized Chromium; full gate passed |
+| Browser/device regression suite | 81 Playwright tests across desktop, tablet, and Android-sized Chromium; full gate passed |
 | Legacy editor removal | Done |
-| Comments engine | Opt-in Artalk integration with site-level enablement, per-page/post opt-out, stable document IDs, local theme-aware client assets, and external-service security boundary; see `docs/comments-plan.md` |
+| Comments engine | Opt-in Artalk integration with local sidecar or external server modes, same-origin local proxy, site-level enablement, per-page/post opt-out, stable document IDs, local theme-aware client assets, and external-service security boundary; see `docs/comments-plan.md` and `docs/local-artalk.md` |
 
 ## Current transition
 
@@ -42,7 +42,7 @@ Deckflow supplies source-aware selection, text editing, structural edits, and un
 
 ## Current limitations
 
-- The new shell now has a 78-test Playwright regression matrix (`web/editor/e2e`) for desktop, tablet, and Android-sized Chromium viewports. By default Playwright copies the checked-in site into a temporary workspace and starts a disposable Go server, so save/upload tests do not mutate the developer's site; `FILELOOM_E2E_URL` opts into an existing server. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts.
+- The new shell now has an 81-test Playwright regression matrix (`web/editor/e2e`) for desktop, tablet, and Android-sized Chromium viewports. By default Playwright copies the checked-in site into a temporary workspace and starts a disposable Go server, so save/upload tests do not mutate the developer's site; `FILELOOM_E2E_URL` opts into an existing server. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts.
 - Save conflicts now show escaped local/remote body summaries, metadata conflict fields, explicit remote/local overwrite choices, and a safe merge path when the changed sides do not overlap. This is not a character-level diff/merge editor.
 - Fileloom block insertion and initial duplicate/delete/sibling movement controls are selection-aware when the selected source element can be resolved, with a body-end fallback; link/image properties now patch only the selected opening tag and reject unsafe URLs/classes, but this is not yet a block data model.
 - Inline text editing preserves mixed child markup, supports range formatting, rejects structure-changing contenteditable edits, and now has desktop/tablet/Android-sized keyboard regression coverage. Native touch/soft-keyboard behavior still deserves device testing beyond Chromium emulation.
@@ -55,4 +55,4 @@ Deckflow supplies source-aware selection, text editing, structural edits, and un
 
 Puck is not the canonical model for existing HTML pages. If a structured block-page format is added later, it should be opt-in for new content and have an explicit React/Node rendering strategy. Plumix is a UX and host-editor reference, not a dependency. Theme templates remain a separate workflow from content-body editing.
 
-**Gate status: passed.** The suite covers 78 browser cases across desktop, tablet, and Android-sized Chromium plus API coverage for content/theme save/reload/public output, stale conflicts, revisions, real media uploads, theme/public preview parity, preview non-mutation, keyboard editing, ordered undo/redo, HTML source editing, reliable code-block editing, theme-driven code styling, opt-in Artalk rendering/disablement, and single-surface canvas scrolling. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts. Go tests, race tests, the production build, source-fidelity checks, and attribution review all pass.
+**Gate status: passed.** The suite covers 81 browser cases across desktop, tablet, and Android-sized Chromium plus API coverage for content/theme save/reload/public output, stale conflicts, revisions, real media uploads, theme/public preview parity, preview non-mutation, keyboard editing, ordered undo/redo, HTML source editing, reliable code-block editing, theme-driven code styling, opt-in Artalk rendering/disablement, local Artalk setup instructions, and single-surface canvas scrolling. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts. Go tests, race tests, the production build, source-fidelity checks, and attribution review all pass.

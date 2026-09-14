@@ -92,8 +92,8 @@
         <div class="panel-heading compact-heading"><div><p class="kicker">Community</p><h2>Comments</h2></div><span id="comments-status-pill" class="status draft">Off</span></div>
         <div class="comments-body">
           <p id="comments-summary">Comments are disabled. No comments widget or comment data is part of this site.</p>
-          <dl class="comments-facts"><div><dt>Provider</dt><dd id="comments-provider">Artalk</dd></div><div><dt>Site key</dt><dd id="comments-site-key">—</dd></div></dl>
-          <div class="comments-actions"><button id="comments-configure" class="button button-quiet button-small">Configure comments</button></div>
+          <dl class="comments-facts"><div><dt>Provider</dt><dd id="comments-provider">Artalk</dd></div><div><dt>Site key</dt><dd id="comments-site-key">—</dd></div><div><dt>Connection</dt><dd id="comments-connection">Checking…</dd></div></dl>
+          <div class="comments-actions"><button id="comments-configure" class="button button-quiet button-small">Configure comments</button><button id="comments-local-setup" class="button button-quiet button-small">Install local Artalk</button></div>
         </div>
       </section>
     </section>
@@ -111,11 +111,22 @@
     <dialog id="comments-dialog" class="comments-dialog">
       <form method="dialog" id="comments-config-form" class="comments-config-form">
         <div class="dialog-heading"><div><p class="kicker">Comments setup</p><h2>Configure Artalk</h2></div><button type="button" id="comments-close" class="dialog-close" aria-label="Close">×</button></div>
-        <p class="dialog-help">Comments are an external dynamic service. Fileloom only publishes the widget configuration; Artalk owns identities, moderation, rate limits, and comment storage. The default is off.</p>
+        <p class="dialog-help">Comments are an external dynamic service. Fileloom can connect to a local Artalk sidecar through its same-origin proxy or to an external Artalk URL; Artalk owns identities, moderation, rate limits, and comment storage. The default is off.</p>
         <label class="check-row"><input id="comments-enabled" name="enabled" type="checkbox"><span><strong>Enable comments for this site</strong><small>Pages and posts allow comments by default; each item can opt out from its editor Details panel.</small></span></label>
-        <div class="dialog-grid"><label>Artalk server URL<input id="comments-server" name="server" placeholder="https://comments.example.com" autocomplete="url" inputmode="url"><small class="field-help">Use the public Artalk server URL. Configure its trusted domain/CORS list with this site origin.</small></label><label>Artalk site key<input id="comments-site" name="site" placeholder="my-fileloom-site" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" title="Use 1-64 letters, numbers, dots, underscores, or hyphens."><small class="field-help">Stable identifier for this Fileloom site inside Artalk.</small></label></div>
+        <div class="dialog-grid"><label>Connection<select id="comments-mode" name="mode"><option value="local">Local Artalk sidecar on this VM</option><option value="external">External Artalk server</option></select><small class="field-help">Local mode keeps Artalk on loopback and uses a same-origin Fileloom proxy; never put 127.0.0.1 in a public page.</small></label><label>Artalk site key<input id="comments-site" name="site" placeholder="my-fileloom-site" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" title="Use 1-64 letters, numbers, dots, underscores, or hyphens."><small class="field-help">Stable identifier for this Fileloom site inside Artalk.</small></label></div>
+        <div class="dialog-grid"><label id="comments-server-field">Artalk server URL<input id="comments-server" name="server" placeholder="https://comments.example.com" autocomplete="url" inputmode="url"><small class="field-help">External mode only. Local mode uses <code>/_fileloom/artalk</code> publicly and forwards to loopback.</small></label><label id="comments-local-port-field">Local Artalk port<input id="comments-local-port" name="local_port" type="number" min="1024" max="65535" value="23366" inputmode="numeric"><small class="field-help">Default installer port: 23366.</small></label></div>
         <p class="comments-origin-note">Public site origin: <code id="comments-origin">—</code></p>
+        <p class="comments-origin-note" id="comments-local-warning" hidden></p>
         <div class="dialog-actions"><button type="button" id="comments-cancel" class="button button-quiet">Cancel</button><button type="submit" id="comments-save" class="button button-primary">Save comments settings</button></div>
+      </form>
+    </dialog>
+    <dialog id="comments-install-dialog" class="comments-dialog">
+      <form method="dialog" class="comments-config-form">
+        <div class="dialog-heading"><div><p class="kicker">Local Artalk</p><h2>Install the sidecar</h2></div><button type="button" id="comments-install-close" class="dialog-close" aria-label="Close">×</button></div>
+        <p class="dialog-help">Fileloom will not run sudo, download binaries, or create system services from a browser request. Run this idempotent command in the Fileloom repository, then return here and choose local mode.</p>
+        <pre class="comments-install-command"><code id="comments-install-command">sudo ./scripts/install-artalk.sh</code></pre>
+        <p class="comments-origin-note" id="comments-install-detail"></p>
+        <div class="dialog-actions"><button type="button" id="comments-install-copy" class="button button-quiet">Copy command</button><button type="button" id="comments-install-done" class="button button-primary">Done</button></div>
       </form>
     </dialog>
     <dialog id="discard-dialog" class="confirm-dialog">
@@ -130,6 +141,6 @@
     </dialog>
     <p class="toast" id="toast" role="status" aria-live="polite"></p>
   </main>
-  <script src="/_cms/assets/admin.js?v=8"></script>
+  <script src="/_cms/assets/admin.js?v=9"></script>
 </body>
 </html>

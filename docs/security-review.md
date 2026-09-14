@@ -1,6 +1,6 @@
 # Fileloom security review
 
-Review date: September 11, 2026
+Review date: September 14, 2026
 
 ## Current protections
 
@@ -16,21 +16,21 @@ Review date: September 11, 2026
 - Revisions are filesystem snapshots with atomic writes, checksums, per-path retention of 100 snapshots, and a 128 MiB workspace budget.
 - CMS mutations emit structured `slog` audit events with actor, action, route, status, and result without request bodies or credentials.
 - Git is constrained to a real `site/.git` repository, uses non-interactive time-bounded commands, rejects unsafe configured URLs, and validates effective push URLs including configured `pushurl`/rewrite results before automatic pushes.
-- Comments are an explicit opt-in external boundary. Fileloom validates the Artalk URL, never server-side fetches or proxies it, publishes no comment data into source/public/export/Git, disables Artalk image uploads and remote emoticons in its bootstrap, and adds the configured Artalk origin only to public `connect-src` when enabled.
+- Comments are an explicit opt-in external boundary. Fileloom validates external Artalk URLs, keeps local Artalk loopback-only, proxies only local `/api/` requests through a fixed same-origin path, publishes no comment data into source/public/export/Git, disables Artalk image uploads and remote emoticons in its bootstrap, and adds an external Artalk origin only to public `connect-src` when external mode is enabled.
 - Site-level comments configuration changes remain owner-authenticated CMS mutations with same-origin checks, bounded bodies, rollback-on-build-failure, and audit logging. Per-document `comments: false` is source-preserved and cannot enable comments while the site switch is off.
 - Generated comment markup uses escaped data attributes and a local pinned Artalk client; no inline executable configuration or third-party CDN is required.
 
 ## Comments deployment notes
 
-Artalk is a separate public service and therefore a separate security/operations boundary. Before enabling it:
+Artalk can run as a local sidecar or a separate public service. For local mode, run `scripts/install-artalk.sh` as an operator, keep the service bound to `127.0.0.1`, keep its data under `/var/lib/fileloom-artalk/`, and use Fileloom's fixed same-origin API proxy. Before enabling it:
 
-- configure the exact Fileloom public origin in Artalk's trusted-domain/CORS settings; never use a wildcard for a public deployment;
+- configure the exact Fileloom public origin in Artalk's trusted-domain/CORS settings (the local installer does this through `ATK_TRUSTED_DOMAINS`); never use a wildcard for a public deployment;
 - configure Artalk authentication, moderation, CAPTCHA/spam controls, rate limits, notification/email behavior, and backups in Artalk;
 - update the site's privacy notice for provider-processed commenter identity, email, IP, User-Agent, and notification data;
 - keep the Fileloom public CSP profile compatible with the Artalk API origin and any explicitly enabled Artalk integrations; and
 - back up Artalk independently because Fileloom exports and Git intentionally exclude comment records.
 
-The first integration uses local vendored Artalk `2.10.0` client assets and disables client image uploads, remote emoticons, and editor preview. Review those choices before enabling richer Artalk plugins or social/OIDC login.
+The first integration uses local vendored Artalk `2.10.0` client assets. The local installer pins the matching Artalk server release, disables client and server image uploads by default, and leaves Artalk administration outside Fileloom. Review those choices before enabling richer Artalk plugins or social/OIDC login.
 
 ### 1. Verify the proxy boundary before public release
 

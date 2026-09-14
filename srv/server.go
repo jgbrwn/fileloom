@@ -83,10 +83,11 @@ type SiteConfig struct {
 }
 
 type CommentsConfig struct {
-	Enabled  bool   `json:"enabled"`
-	Provider string `json:"provider"`
-	Server   string `json:"server,omitempty"`
-	Site     string `json:"site,omitempty"`
+	Enabled  bool                 `json:"enabled"`
+	Provider string               `json:"provider"`
+	Server   string               `json:"server,omitempty"`
+	Site     string               `json:"site,omitempty"`
+	Local    *CommentsLocalConfig `json:"local,omitempty"`
 }
 
 type GitConfig struct {
@@ -935,17 +936,26 @@ func normalizeCommentsConfig(config CommentsConfig) (CommentsConfig, error) {
 	if config.Provider != "artalk" {
 		return config, errors.New("only the Artalk comments provider is supported")
 	}
-	server, err := normalizeCommentServerURL(config.Server)
+	local, err := normalizeCommentsLocalConfig(config.Local)
 	if err != nil {
 		return config, err
 	}
-	config.Server = server
+	config.Local = local
+	if config.Local != nil {
+		config.Server = localCommentsProxyPath
+	} else {
+		server, err := normalizeCommentServerURL(config.Server)
+		if err != nil {
+			return config, err
+		}
+		config.Server = server
+	}
 	config.Site = strings.TrimSpace(config.Site)
 	if config.Site != "" && !commentsSitePattern.MatchString(config.Site) {
 		return config, errors.New("Artalk site identifier must use 1-64 letters, numbers, dots, underscores, or hyphens")
 	}
 	if config.Enabled {
-		if config.Server == "" {
+		if config.Local == nil && config.Server == "" {
 			return config, errors.New("Artalk server is required when comments are enabled")
 		}
 		if config.Site == "" {
@@ -2387,7 +2397,8 @@ func commentsWidgetHTML(config SiteConfig, doc Document) string {
 	if !commentsEnabledForDocument(config, doc) {
 		return ""
 	}
-	return `<section class="fileloom-comments" data-fileloom-comments data-server="` + html.EscapeString(config.Comments.Server) + `" data-site="` + html.EscapeString(config.Comments.Site) + `" data-page-key="fileloom/` + html.EscapeString(doc.ID) + `" data-page-title="` + html.EscapeString(doc.Title) + `" data-theme="` + html.EscapeString(config.Theme) + `"><div class="artalk"></div><noscript>Comments require JavaScript.</noscript></section>`
+	server := commentsBrowserServer(config.Comments)
+	return `<section class="fileloom-comments" data-fileloom-comments data-server="` + html.EscapeString(server) + `" data-site="` + html.EscapeString(config.Comments.Site) + `" data-page-key="fileloom/` + html.EscapeString(doc.ID) + `" data-page-title="` + html.EscapeString(doc.Title) + `" data-theme="` + html.EscapeString(config.Theme) + `"><div class="artalk"></div><noscript>Comments require JavaScript.</noscript></section>`
 }
 
 func renderDocumentBody(templateSource string, values map[string]string, comments string) string {
@@ -3008,6 +3019,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.routeCMS(w, r)
 		return
 	}
+	if isLocalCommentsPath(r.URL.Path) {
+		s.handleLocalCommentsProxy(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/media/") {
 		s.serveFile(w, r, filepath.Join(s.SiteDir, "media"), "/media/")
 		return
@@ -3454,6 +3469,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleExportAPI(w, r)
 	case "/_cms/api/comments/config":
 		s.handleCommentsConfigAPI(w, r)
+	case "/_cms/api/comments/status":
+		s.handleCommentsStatusAPI(w, r)
 	case "/_cms/api/git":
 		s.handleGitAPI(w, r)
 	case "/_cms/api/git/config":
@@ -5535,10 +5552,15 @@ func (s *Server) gitChangeIfConfigured(message string) error {
 }
 
 type commentsConfigInput struct {
-	Enabled  bool   `json:"enabled"`
-	Provider string `json:"provider"`
-	Server   string `json:"server"`
-	Site     string `json:"site"`
+	Enabled      bool                 `json:"enabled"`
+	Provider     string               `json:"provider"`
+	Mode         string               `json:"mode"`
+	Server       string               `json:"server"`
+	Site         string               `json:"site"`
+	Local        *CommentsLocalConfig `json:"local"`
+	LocalHost    string               `json:"local_host"`
+	LocalPort    int                  `json:"local_port"`
+	LocalService string               `json:"local_service"`
 }
 
 func (s *Server) handleCommentsConfigAPI(w http.ResponseWriter, r *http.Request) {
@@ -5564,13 +5586,45 @@ func (s *Server) handleCommentsConfigAPI(w http.ResponseWriter, r *http.Request)
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		localPort := 0
+		if rawPort := strings.TrimSpace(r.FormValue("local_port")); rawPort != "" {
+			parsedPort, err := strconv.Atoi(rawPort)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "local Artalk port must be a number")
+				return
+			}
+			localPort = parsedPort
+		}
 		input = commentsConfigInput{
-			Enabled: formBool(r, "enabled"), Provider: r.FormValue("provider"),
-			Server: r.FormValue("server"), Site: r.FormValue("site"),
+			Enabled: formBool(r, "enabled"), Provider: r.FormValue("provider"), Mode: r.FormValue("mode"),
+			Server: r.FormValue("server"), Site: r.FormValue("site"), LocalHost: r.FormValue("local_host"),
+			LocalPort: localPort, LocalService: r.FormValue("local_service"),
 		}
 	}
+	mode := strings.ToLower(strings.TrimSpace(input.Mode))
+	if mode == "" {
+		if input.Local != nil || strings.HasPrefix(strings.TrimSpace(input.Server), localCommentsProxyPath) {
+			mode = "local"
+		} else {
+			mode = "external"
+		}
+	}
+	var local *CommentsLocalConfig
+	server := strings.TrimSpace(input.Server)
+	switch mode {
+	case "local":
+		local = input.Local
+		if local == nil {
+			local = &CommentsLocalConfig{Host: input.LocalHost, Port: input.LocalPort, Service: input.LocalService}
+		}
+		server = localCommentsProxyPath
+	case "external":
+	default:
+		writeJSONError(w, http.StatusBadRequest, "comments mode must be local or external")
+		return
+	}
 	comments, err := normalizeCommentsConfig(CommentsConfig{
-		Enabled: input.Enabled, Provider: input.Provider, Server: input.Server, Site: input.Site,
+		Enabled: input.Enabled, Provider: input.Provider, Server: server, Site: input.Site, Local: local,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())

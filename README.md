@@ -162,7 +162,18 @@ No CSP is enabled by default, preserving existing editor and theme behavior. To 
 
 ## Comments
 
-Comments are disabled by default. To enable them, open the dashboard's **Community → Comments** panel and provide a public Artalk server URL plus a stable Artalk site key:
+Comments are disabled by default. Fileloom supports a local Artalk sidecar on the same VM or an external Artalk server. Open the dashboard's **Community → Comments** panel to choose the connection and enable comments explicitly.
+
+For the recommended one-VM setup, run the idempotent installer from the repository:
+
+```bash
+sudo ./scripts/install-artalk.sh \
+  --site-key "my-fileloom-site"
+```
+
+The installer runs the pinned Artalk Go binary as `fileloom-artalk.service` on `127.0.0.1:23366`, stores its SQLite data outside the site workspace, and verifies the release checksum. Fileloom detects the running sidecar and preselects local mode. Public pages use the same-origin `/_fileloom/artalk` proxy; never configure `http://127.0.0.1:23366` as a browser-facing server URL. Installing the sidecar does not enable comments or create an Artalk admin account. See [docs/local-artalk.md](docs/local-artalk.md) for administrator setup, SSH access, upgrades, backups, and external mode.
+
+External mode stores a public Artalk URL:
 
 ```json
 "comments": {
@@ -173,9 +184,9 @@ Comments are disabled by default. To enable them, open the dashboard's **Communi
 }
 ```
 
-Fileloom publishes a local, pinned Artalk client bundle (`2.10.0`) and a theme-aware bootstrap; it does not proxy the Artalk API or store comments. Configure Artalk's trusted-domain/CORS, moderation, spam/rate limits, identity, email, privacy, and backup settings in Artalk itself. Pages and posts allow comments by default when the site switch is on, and the editor Details panel can opt individual documents out. Drafts, private items, not-yet-due scheduled items, archive pages, tag/category pages, and index pages do not receive a widget.
+Fileloom publishes a local, pinned Artalk client bundle (`2.10.0`) and a theme-aware bootstrap; it does not store comment data. Configure Artalk's trusted-domain/CORS, moderation, spam/rate limits, identity, email, privacy, and backup settings in Artalk itself. Pages and posts allow comments by default when the site switch is on, and the editor Details panel can opt individual documents out. Drafts, private items, not-yet-due scheduled items, archive pages, tag/category pages, and index pages do not receive a widget.
 
-Themes can override `--fileloom-theme-comments-*` CSS variables to match colors, borders, typography, radius, and shadows. Artalk client image uploads and remote emoticons are disabled by Fileloom's bootstrap by default. See [docs/comments-plan.md](docs/comments-plan.md) for the boundary, deployment checklist, and security considerations.
+Themes can override `--fileloom-theme-comments-*` CSS variables to match colors, borders, typography, radius, and shadows. Artalk client image uploads and remote emoticons are disabled by Fileloom's bootstrap by default. See [docs/comments-plan.md](docs/comments-plan.md) for the architecture and security boundary.
 
 
 The visual editor includes a **Code block** helper that creates a semantic `<pre><code>` pair with selectable languages. Deckflow now exposes a language/code sheet for insertion and editing; generated pages and in-memory theme previews use the dependency-free highlighter and theme-integrated CSS. Themes can override `--fileloom-code-*` variables in their stylesheet.
@@ -191,6 +202,7 @@ Project development is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 - [Mobile dashboard](docs/screenshots/dashboard-mobile-clean.png)
 - [Comments panel](docs/screenshots/dashboard-comments-off.png)
+- [Local Artalk installer dialog](docs/screenshots/dashboard-artalk-install.png)
 - [Theme-token editor](docs/screenshots/theme-tokens-mobile.png)
 - [Desktop HTML source editor](docs/screenshots/editor-desktop-source.png)
 - [Mobile code editor](docs/screenshots/editor-mobile-code.png)

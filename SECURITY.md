@@ -25,11 +25,12 @@ Include the affected route or feature, impact, reproduction steps, and any relev
 ### Comments integration
 
 - Comments are disabled by default and can only be enabled by the authenticated CMS owner.
-- Fileloom integrates with a separately hosted Artalk service; it does not proxy public comment requests or store comment data in the site workspace, export archive, revisions, or Git scope.
-- Configure Artalk with the exact Fileloom public origin in its trusted-domain/CORS settings. Do not use `*` for a public deployment.
+- Fileloom supports an optional local Artalk sidecar bound to loopback and proxied only through the explicit `/_fileloom/artalk/api/` public API path; external Artalk mode remains unproxied. Fileloom never stores comment data in the site workspace, export archive, revisions, or Git scope.
+- For local Artalk, keep the sidecar bound to `127.0.0.1`, use the checked-in idempotent installer, keep its database under `/var/lib/fileloom-artalk/`, and never expose its listener directly. Fileloom's public proxy strips the local prefix, forwards only `/api/` requests, overwrites forwarding headers, and removes the CMS identity header.
+- For external Artalk, configure the exact Fileloom public origin in Artalk's trusted-domain/CORS settings. Do not use `*` for a public deployment.
 - Configure Artalk's own moderation, CAPTCHA/spam controls, rate limits, identity, email, privacy, and backup policies before enabling public comments.
 - Fileloom validates the configured Artalk URL, uses a local pinned client bundle, escapes widget data attributes, and disables client image uploads and remote emoticons by default.
-- If a public CSP is enabled, allow the configured Artalk origin in `connect-src`; social login or other optional Artalk integrations may require additional explicit CSP sources.
+- If a public CSP is enabled, allow the configured external Artalk origin in `connect-src`; local mode is same-origin and only needs `connect-src 'self'`. Social login or other optional Artalk integrations may require additional explicit CSP sources.
 - Update the site's privacy notice because the external provider may process commenter identity, email, IP, User-Agent, and notification data.
 
 - SVG uploads are sanitized with an XML/element/attribute allowlist. Scripts, event handlers, foreign content, directives, external references, and unsafe CSS attributes are removed or rejected.

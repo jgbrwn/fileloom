@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1587,5 +1588,122 @@ func TestCommentsConfigValidation(t *testing.T) {
 	server.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "without credentials") {
 		t.Fatalf("unsafe comments config = %d: %s", res.Code, res.Body)
+	}
+}
+
+func TestLocalCommentsStatusAndProxy(t *testing.T) {
+	var forwardedOwner string
+	artalk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "<title>Artalk</title>")
+			return
+		}
+		if r.URL.Path == "/api/v2" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"msg":"Cannot GET /api/v2"}`)
+			return
+		}
+		forwardedOwner = r.Header.Get("X-ExeDev-Email")
+		if r.URL.Path != "/api/v2/comments" || r.URL.Query().Get("site") != "fileloom-demo" {
+			http.Error(w, "unexpected proxy request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer artalk.Close()
+	parsed, err := url.Parse(artalk.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	server.PublicCSP = defaultPublicCSP
+	config, err := server.loadSiteConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Comments = CommentsConfig{
+		Enabled: true, Provider: "artalk", Site: "fileloom-demo",
+		Local: &CommentsLocalConfig{Host: "127.0.0.1", Port: port},
+	}
+	if err := server.saveSiteConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Build(); err != nil {
+		t.Fatal(err)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/_cms/api/comments/status", nil)
+	statusReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	statusRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(statusRes, statusReq)
+	if statusRes.Code != http.StatusOK || !strings.Contains(statusRes.Body.String(), `"recognized":true`) || !strings.Contains(statusRes.Body.String(), `"suggested_server":"/_fileloom/artalk"`) {
+		t.Fatalf("local Artalk status = %d: %s", statusRes.Code, statusRes.Body)
+	}
+
+	generated, err := os.ReadFile(filepath.Join(siteDir, "public", "about", "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(generated), `data-server="/_fileloom/artalk"`) {
+		t.Fatalf("local comments page did not use same-origin proxy: %s", generated)
+	}
+	publicReq := httptest.NewRequest(http.MethodGet, "/about/", nil)
+	publicRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(publicRes, publicReq)
+	if csp := publicRes.Header().Get("Content-Security-Policy"); strings.Contains(csp, "127.0.0.1") || !strings.Contains(csp, "connect-src 'self'") {
+		t.Fatalf("local comments CSP was not same-origin: %q", csp)
+	}
+
+	proxyReq := httptest.NewRequest(http.MethodGet, "/_fileloom/artalk/api/v2/comments?site=fileloom-demo", nil)
+	proxyReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	proxyRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(proxyRes, proxyReq)
+	if proxyRes.Code != http.StatusOK || proxyRes.Body.String() != `{"ok":true}` {
+		t.Fatalf("local comments proxy = %d: %s", proxyRes.Code, proxyRes.Body)
+	}
+	if forwardedOwner != "" {
+		t.Fatalf("owner identity leaked to Artalk: %q", forwardedOwner)
+	}
+
+	config.Comments.Enabled = false
+	if err := server.saveSiteConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	disabledReq := httptest.NewRequest(http.MethodGet, "/_fileloom/artalk/api/v2/comments", nil)
+	disabledRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(disabledRes, disabledReq)
+	if disabledRes.Code != http.StatusNotFound {
+		t.Fatalf("disabled local proxy status = %d, want 404", disabledRes.Code)
+	}
+}
+
+func TestLocalCommentsConfigRejectsNonLoopback(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{
+		"enabled": {"false"}, "provider": {"artalk"}, "mode": {"local"},
+		"local_host": {"192.0.2.1"}, "local_port": {"23366"}, "site": {"demo"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/comments/config", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "loopback") {
+		t.Fatalf("non-loopback local Artalk config = %d: %s", res.Code, res.Body)
 	}
 }

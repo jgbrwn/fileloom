@@ -1,0 +1,23 @@
+[Unit]
+Description=Fileloom local Artalk comments
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=artalk
+Group=artalk
+WorkingDirectory=/var/lib/fileloom-artalk
+EnvironmentFile=-/etc/fileloom-artalk/artalk.env
+ExecStart=/usr/local/libexec/fileloom-artalk/artalk -w /var/lib/fileloom-artalk -c /etc/fileloom-artalk/artalk.yml server
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/fileloom-artalk
+
+[Install]
+WantedBy=multi-user.target

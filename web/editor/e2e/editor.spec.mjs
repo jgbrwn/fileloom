@@ -166,6 +166,20 @@ test.describe("Deckflow Fileloom editor", () => {
     await expect(page.locator("#sheet-content")).toContainText("Enable Artalk comments in the CMS site settings first");
   });
 
+  test("explains local Artalk setup without putting loopback in the public server field", async ({ page }) => {
+    await page.goto("/_cms/");
+    await page.locator("#comments-local-setup").click();
+    await expect(page.locator("#comments-install-dialog")).toBeVisible();
+    await expect(page.locator("#comments-install-command")).toContainText("scripts/install-artalk.sh");
+    await page.locator("#comments-install-done").click();
+    await page.locator("#comments-configure").click();
+    await page.locator("#comments-mode").selectOption("local");
+    await expect(page.locator("#comments-server")).toHaveValue("/_fileloom/artalk");
+    await expect(page.locator("#comments-server")).toBeDisabled();
+    await expect(page.locator("#comments-local-port")).toHaveValue("23366");
+    await page.locator("#comments-cancel").click();
+  });
+
   test("renders Artalk only after site opt-in and removes it when disabled", async ({ page }) => {
     await page.route("https://comments.example.test/**", (route) => route.abort());
     const enabled = await cmsJSON(page, "/_cms/api/comments/config", {

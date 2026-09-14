@@ -1,4 +1,4 @@
-const state = { items: [], filter: "all", themes: [], checks: [], gitDirty: false, commentsDirty: false, tokenTheme: "", tokenSHA: "" };
+const state = { items: [], filter: "all", themes: [], checks: [], gitDirty: false, commentsDirty: false, commentsStatus: null, commentsExternalServer: "", tokenTheme: "", tokenSHA: "" };
 const $ = (selector) => document.querySelector(selector);
 
 function escapeHTML(value) {
@@ -39,7 +39,7 @@ function renderSite(data) {
   $("#check-count").textContent = checks.length ? `${checks.length} check${checks.length === 1 ? "" : "s"}` : "No check issues";
   renderThemes(data.themes || []);
   renderGit(data.git || {});
-  renderComments(site);
+  renderComments(site, state.commentsStatus);
 }
 
 function renderThemes(themes) {
@@ -102,25 +102,51 @@ function renderGit(data) {
 
 function syncCommentsDependencies() {
   const enabled = $("#comments-enabled").checked;
-  $("#comments-server").required = enabled;
-  $("#comments-site").required = enabled;
+  const local = $("#comments-mode").value === "local";
+  const server = $("#comments-server");
+  const port = $("#comments-local-port");
+  server.required = enabled && !local;
+  server.disabled = local;
+  port.disabled = !local;
+  if (local) {
+    if (server.value && server.value !== "/_fileloom/artalk") state.commentsExternalServer = server.value;
+    server.value = "/_fileloom/artalk";
+  } else if (state.commentsExternalServer && server.value === "/_fileloom/artalk") {
+    server.value = state.commentsExternalServer;
+  }
 }
 
-function renderComments(site) {
+function renderComments(site, status) {
   const config = site?.comments || site || {};
   const enabled = !!config.enabled;
+  const localConfigured = !!config.local;
+  const localDetected = !!status?.recognized;
+  const mode = localConfigured ? "local" : (config.server ? "external" : (localDetected ? "local" : "external"));
   const pill = $("#comments-status-pill");
   pill.textContent = enabled ? "Enabled" : "Off";
   pill.className = `status ${enabled ? "" : "draft"}`;
   $("#comments-provider").textContent = config.provider || "Artalk";
-  $("#comments-site-key").textContent = config.site || "—";
+  $("#comments-site-key").textContent = config.site || (mode === "local" ? status?.suggested_site || "—" : "—");
+  const connection = $("#comments-connection");
+  if (status?.recognized) connection.textContent = `Local · ${status.host}:${status.port}`;
+  else if (status?.reachable) connection.textContent = `Port ${status.port} is in use`;
+  else if (mode === "external") connection.textContent = "External";
+  else connection.textContent = "Local setup needed";
   $("#comments-summary").textContent = enabled
-    ? "Artalk is enabled for this site. Pages and posts can opt out individually from the editor Details panel."
-    : "Comments are disabled. No comments widget or comment data is part of this site.";
+    ? (mode === "local" && !status?.recognized ? "Comments are enabled, but the local Artalk service is not responding yet." : "Artalk is enabled for this site. Pages and posts can opt out individually from the editor Details panel.")
+    : (localDetected ? "A local Artalk service was detected. Comments remain disabled until you explicitly enable them." : "Comments are disabled. No comments widget or comment data is part of this site.");
   $("#comments-enabled").checked = enabled;
-  $("#comments-server").value = config.server || "";
-  $("#comments-site").value = config.site || "";
-  $("#comments-origin").textContent = config.base_url || window.location.origin;
+  $("#comments-mode").value = mode;
+  state.commentsExternalServer = config.local ? "" : (config.server || "");
+  $("#comments-server").value = config.local ? "/_fileloom/artalk" : (config.server || (localDetected ? "/_fileloom/artalk" : ""));
+  $("#comments-site").value = config.site || (mode === "local" ? status?.suggested_site || "" : "");
+  $("#comments-local-port").value = config.local?.port || status?.port || 23366;
+  $("#comments-origin").textContent = site.base_url || window.location.origin;
+  const warning = $("#comments-local-warning");
+  warning.textContent = status?.base_url_warning || "";
+  warning.hidden = !status?.base_url_warning;
+  $("#comments-local-setup").textContent = status?.recognized ? "Use local Artalk" : "Install local Artalk";
+  state.commentsStatus = status || null;
   state.commentsDirty = false;
   syncCommentsDependencies();
 }
@@ -183,8 +209,9 @@ async function changeStatus(path, status, publishAt) {
 
 async function loadDashboard() {
   try {
-    const [site, items] = await Promise.all([getJSON("/_cms/api/site"), getJSON("/_cms/api/items")]);
+    const [site, items, commentsStatus] = await Promise.all([getJSON("/_cms/api/site"), getJSON("/_cms/api/items"), getJSON("/_cms/api/comments/status")]);
     state.items = items.items || [];
+    state.commentsStatus = commentsStatus;
     renderSite(site);
     renderItems();
   } catch (error) { showToast(error.message, true); }
@@ -255,6 +282,26 @@ function openCommentsDialog() {
   $("#comments-dialog")?.showModal();
   syncCommentsDependencies();
 }
+function openCommentsInstallDialog() {
+  const status = state.commentsStatus || {};
+  $("#comments-install-command").textContent = status.install_command || "sudo ./scripts/install-artalk.sh";
+  $("#comments-install-detail").textContent = status.base_url_warning || "This installs Artalk on loopback at the detected/default port and leaves Fileloom comments disabled until you save the local connection.";
+  $("#comments-install-dialog")?.showModal();
+}
+function openLocalCommentsDialog() {
+  const status = state.commentsStatus || {};
+  if (!status.recognized) {
+    openCommentsInstallDialog();
+    return;
+  }
+  state.commentsDirty = false;
+  $("#comments-dialog")?.showModal();
+  $("#comments-mode").value = "local";
+  $("#comments-server").value = "/_fileloom/artalk";
+  $("#comments-local-port").value = status.port || 23366;
+  if (!$("#comments-site").value) $("#comments-site").value = status.suggested_site || "";
+  syncCommentsDependencies();
+}
 function requestCommentsClose() {
   if (!state.commentsDirty || window.confirm("Discard unsaved comments settings?")) {
     state.commentsDirty = false;
@@ -267,6 +314,17 @@ function requestGitClose() {
 }
 
 $("#comments-configure")?.addEventListener("click", openCommentsDialog);
+$("#comments-local-setup")?.addEventListener("click", openLocalCommentsDialog);
+$("#comments-install-close")?.addEventListener("click", () => $("#comments-install-dialog")?.close());
+$("#comments-install-done")?.addEventListener("click", () => { $("#comments-install-dialog")?.close(); loadDashboard(); });
+$("#comments-install-copy")?.addEventListener("click", async () => {
+  const command = $("#comments-install-command").textContent;
+  try {
+    await navigator.clipboard.writeText(command);
+    showToast("Install command copied.");
+  } catch { showToast("Copy failed; select the command manually.", true); }
+});
+$("#comments-mode")?.addEventListener("change", () => { state.commentsDirty = true; syncCommentsDependencies(); });
 $("#comments-close")?.addEventListener("click", requestCommentsClose);
 $("#comments-cancel")?.addEventListener("click", requestCommentsClose);
 $("#comments-dialog")?.addEventListener("cancel", (event) => { event.preventDefault(); requestCommentsClose(); });
@@ -276,8 +334,9 @@ $("#comments-config-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   if (!form.reportValidity()) return;
+  const mode = form.elements.mode.value;
   const server = form.elements.server.value.trim();
-  if (form.elements.enabled.checked) {
+  if (mode === "external" && form.elements.enabled.checked) {
     try {
       const parsed = new URL(server);
       if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error();
@@ -291,15 +350,17 @@ $("#comments-config-form")?.addEventListener("submit", async (event) => {
   const payload = new URLSearchParams({
     enabled: form.elements.enabled.checked ? "true" : "false",
     provider: "artalk",
-    server,
+    mode,
+    server: mode === "local" ? "/_fileloom/artalk" : server,
     site: form.elements.site.value.trim(),
+    local_port: form.elements.local_port.value,
   });
   const button = $("#comments-save"); button.disabled = true;
   try {
     await getJSON("/_cms/api/comments/config", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: payload.toString() });
     state.commentsDirty = false;
     $("#comments-dialog").close();
-    showToast(form.elements.enabled.checked ? "Comments enabled." : "Comments disabled.");
+    showToast(form.elements.enabled.checked ? "Comments enabled." : "Comments settings saved.");
     await loadDashboard();
   } catch (error) { showToast(error.message, true); }
   finally { button.disabled = false; }
