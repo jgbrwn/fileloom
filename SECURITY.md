@@ -22,7 +22,15 @@ Include the affected route or feature, impact, reproduction steps, and any relev
 - Keep automatic push disabled until the remote and effective push URL are verified.
 - Treat site HTML, theme templates, and uploaded media as owner-controlled content.
 
-## Uploads and generated output
+### Comments integration
+
+- Comments are disabled by default and can only be enabled by the authenticated CMS owner.
+- Fileloom integrates with a separately hosted Artalk service; it does not proxy public comment requests or store comment data in the site workspace, export archive, revisions, or Git scope.
+- Configure Artalk with the exact Fileloom public origin in its trusted-domain/CORS settings. Do not use `*` for a public deployment.
+- Configure Artalk's own moderation, CAPTCHA/spam controls, rate limits, identity, email, privacy, and backup policies before enabling public comments.
+- Fileloom validates the configured Artalk URL, uses a local pinned client bundle, escapes widget data attributes, and disables client image uploads and remote emoticons by default.
+- If a public CSP is enabled, allow the configured Artalk origin in `connect-src`; social login or other optional Artalk integrations may require additional explicit CSP sources.
+- Update the site's privacy notice because the external provider may process commenter identity, email, IP, User-Agent, and notification data.
 
 - SVG uploads are sanitized with an XML/element/attribute allowlist. Scripts, event handlers, foreign content, directives, external references, and unsafe CSS attributes are removed or rejected.
 - Other allowed media formats are preserved as bytes; the upload body remains bounded at 16 MiB and writes use a temporary file followed by an atomic rename.

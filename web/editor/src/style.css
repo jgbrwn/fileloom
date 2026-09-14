@@ -125,7 +125,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .selection-action-grid .secondary-button { min-width: 0; padding-inline: 7px; font-size: 11px; }
 .danger-button { color: var(--red); }
 .danger-button:hover { color: #9e2839; border-color: #efb7c0; background: #fff6f7; }
-.details-form small { color: #929bac; font-size: 10px; font-weight: 500; }
+.comments-toggle { display: flex; align-items: flex-start; gap: 10px; padding: 11px 12px; border: 1px solid #e5e8ef; border-radius: 11px; color: #4b5668; background: #fbfcfe; cursor: pointer; }
+.comments-toggle input { flex: 0 0 auto; width: auto; margin: 2px 0 0; accent-color: var(--purple); }
+.comments-toggle span { display: grid; gap: 3px; }
+.comments-toggle strong { font-size: 12px; }
+.comments-toggle small { color: #8c96a6; font-size: 10px; font-weight: 500; line-height: 1.4; }
+.comments-toggle:has(input:disabled) { cursor: not-allowed; opacity: .62; }
 .details-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .details-source { margin-top: 18px; }
 .revision-list { display: grid; gap: 9px; }

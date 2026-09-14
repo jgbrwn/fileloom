@@ -36,9 +36,10 @@ const state = {
   sheet: null,
 };
 
-const metadataFields = ["title", "date", "tags", "category", "excerpt", "status", "publish_at"];
+const metadataFields = ["title", "date", "tags", "category", "excerpt", "status", "publish_at", "comments"];
 
 function metadataFromDocument(document) {
+  const hasComments = document && Object.prototype.hasOwnProperty.call(document, "comments");
   return {
     title: String(document?.title || ""),
     date: String(document?.date || ""),
@@ -47,6 +48,7 @@ function metadataFromDocument(document) {
     excerpt: String(document?.excerpt || ""),
     status: String(document?.status || "published"),
     publish_at: String(document?.publish_at || ""),
+    comments: hasComments ? document.comments === true : null,
   };
 }
 
@@ -1096,13 +1098,17 @@ function detailsSheetHTML() {
   if (isThemeResource()) return themeDetailsSheetHTML();
   const metadata = metadataPayload();
   const scheduled = metadata.status === "scheduled";
+  const commentsSiteEnabled = Boolean(state.record?.comments?.enabled);
   const codeAction = selectedCodeBlock() ? '<button type="button" class="secondary-button" data-action="edit-code">Edit code</button>' : "";
   const sourceAction = '<button type="button" class="secondary-button" data-action="source">HTML source</button>';
+  const pageCommentsEnabled = metadata.comments !== false;
+  const commentsField = `<label class="comments-toggle"><input data-metadata="comments" type="checkbox" ${commentsSiteEnabled && pageCommentsEnabled ? "checked" : ""} ${commentsSiteEnabled ? "" : "disabled"}><span><strong>Allow comments on this page</strong><small>${commentsSiteEnabled ? "Visitors can discuss this page through Artalk." : "Enable Artalk comments in the CMS site settings first."}</small></span></label>`;
   return `<div class="sheet-heading"><div><span class="eyebrow">Page details</span><h2>Metadata & status</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>${selectionOperationsHTML()}
     <form id="details-form" class="details-form">
       <label class="form-field"><span>Title</span><input data-metadata="title" value="${escapeHTML(metadata.title)}" required></label>
       <div class="details-grid"><label class="form-field"><span>Date</span><input data-metadata="date" type="date" value="${escapeHTML(metadata.date)}"></label><label class="form-field"><span>Status</span><select data-metadata="status"><option value="draft" ${metadata.status === "draft" ? "selected" : ""}>Draft</option><option value="private" ${metadata.status === "private" ? "selected" : ""}>Private</option><option value="published" ${metadata.status === "published" ? "selected" : ""}>Published</option><option value="scheduled" ${metadata.status === "scheduled" ? "selected" : ""}>Scheduled</option></select></label></div>
       <label class="form-field" data-publish-at-field ${scheduled ? "" : "hidden"}><span>Publish at</span><input data-metadata="publish_at" type="datetime-local" value="${escapeHTML(localDateTimeValue(metadata.publish_at))}"><small>Stored in UTC after saving.</small></label>
+      ${commentsField}
       <div class="details-grid"><label class="form-field"><span>Tags</span><input data-metadata="tags" value="${escapeHTML(metadata.tags.join(", "))}" placeholder="design, notes"></label><label class="form-field"><span>Category</span><input data-metadata="category" value="${escapeHTML(metadata.category)}"></label></div>
       <label class="form-field"><span>Excerpt</span><textarea data-metadata="excerpt" rows="3">${escapeHTML(metadata.excerpt)}</textarea></label>
       <div class="details-actions">${codeAction}${sourceAction}<button type="button" class="secondary-button" data-action="history">History</button><button type="button" class="primary-button" data-action="save">Save details</button></div>
@@ -1132,7 +1138,7 @@ function updateMetadataDraft(field) {
   if (!state.metadata) state.metadata = metadataFromDocument(state.record?.document || {});
   const name = field.dataset.metadata;
   if (!metadataFields.includes(name)) return;
-  state.metadata[name] = name === "tags" ? parseTagsInput(field.value) : field.value;
+  state.metadata[name] = name === "tags" ? parseTagsInput(field.value) : field.type === "checkbox" ? field.checked : field.value;
   state.changeVersion += 1;
   if (name === "status") syncPublishAtField();
   setDirty(true);

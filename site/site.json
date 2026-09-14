@@ -5,6 +5,10 @@
   "theme": "brutalist",
   "editor_engine": "deckflow",
   "footer": "Made with Fileloom.",
+  "comments": {
+    "enabled": false,
+    "provider": "artalk"
+  },
   "git": {
     "enabled": false,
     "auto_commit": false,

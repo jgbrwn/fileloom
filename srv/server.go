@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -71,13 +72,21 @@ type Server struct {
 }
 
 type SiteConfig struct {
-	Title        string    `json:"title"`
-	Description  string    `json:"description"`
-	BaseURL      string    `json:"base_url"`
-	Theme        string    `json:"theme"`
-	EditorEngine string    `json:"editor_engine,omitempty"`
-	Footer       string    `json:"footer"`
-	Git          GitConfig `json:"git"`
+	Title        string         `json:"title"`
+	Description  string         `json:"description"`
+	BaseURL      string         `json:"base_url"`
+	Theme        string         `json:"theme"`
+	EditorEngine string         `json:"editor_engine,omitempty"`
+	Footer       string         `json:"footer"`
+	Comments     CommentsConfig `json:"comments"`
+	Git          GitConfig      `json:"git"`
+}
+
+type CommentsConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Provider string `json:"provider"`
+	Server   string `json:"server,omitempty"`
+	Site     string `json:"site,omitempty"`
 }
 
 type GitConfig struct {
@@ -118,6 +127,7 @@ type GitStatus struct {
 }
 
 type Document struct {
+	ID        string   `json:"id,omitempty"`
 	Path      string   `json:"path"`
 	Type      string   `json:"type"`
 	Title     string   `json:"title"`
@@ -128,6 +138,7 @@ type Document struct {
 	Excerpt   string   `json:"excerpt"`
 	Category  string   `json:"category,omitempty"`
 	PublishAt string   `json:"publish_at,omitempty"`
+	Comments  *bool    `json:"comments,omitempty"`
 	HTML      string   `json:"html,omitempty"`
 	URL       string   `json:"url"`
 }
@@ -171,6 +182,10 @@ type documentMeta struct {
 
 var tokenPattern = regexp.MustCompile(`\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}`)
 var themeTokenPattern = regexp.MustCompile(`\{\{[^{}]*\}\}`)
+var documentIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+var commentsSitePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+const artalkClientVersion = "2.10.0"
 
 const defaultCMSCSP = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-src 'self' blob:; worker-src 'self' blob:; form-action 'self'"
 const defaultPublicCSP = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'"
@@ -181,6 +196,10 @@ const defaultSiteJSON = `{
 	"theme": "default",
   "editor_engine": "deckflow",
   "footer": "Made with Fileloom.",
+  "comments": {
+    "enabled": false,
+    "provider": "artalk"
+  },
   "git": {
     "enabled": false,
     "auto_commit": false,
@@ -227,6 +246,7 @@ const defaultPostTemplate = `<article class="article">
   <h1>{{title}}</h1>
   {{if-excerpt}}
   <div class="article-body">{{content}}</div>
+  {{comments}}
 </article>
 `
 
@@ -234,6 +254,7 @@ const defaultPageTemplate = `<article class="article page">
   <p class="eyebrow">Page</p>
   <h1>{{title}}</h1>
   <div class="article-body">{{content}}</div>
+  {{comments}}
 </article>
 `
 
@@ -342,6 +363,9 @@ func NewWithOptions(siteDir, webDir, ownerEmail, baseURL string) (*Server, error
 	}
 	if err := s.ensureSite(); err != nil {
 		return nil, err
+	}
+	if _, err := s.backfillDocumentIDs(); err != nil {
+		return nil, fmt.Errorf("document IDs: %w", err)
 	}
 	if _, err := s.Build(); err != nil {
 		return nil, fmt.Errorf("initial build: %w", err)
@@ -473,6 +497,7 @@ func (s *Server) loadSiteConfig() (SiteConfig, error) {
 		Theme:        "default",
 		EditorEngine: "deckflow",
 		Footer:       "Made with Fileloom.",
+		Comments:     CommentsConfig{Provider: "artalk"},
 		Git:          GitConfig{CommitOn: "build", Remote: "origin"},
 	}
 	path, info, err := safeResolvedPath(s.SiteDir, "site.json")
@@ -511,6 +536,12 @@ func (s *Server) loadSiteConfig() (SiteConfig, error) {
 	}
 	if config.Git.Remote == "" {
 		config.Git.Remote = "origin"
+	}
+	if config.Comments.Provider == "" {
+		config.Comments.Provider = "artalk"
+	}
+	if config.Comments, err = normalizeCommentsConfig(config.Comments); err != nil {
+		return config, fmt.Errorf("invalid comments configuration: %w", err)
 	}
 	if override := strings.TrimSpace(s.BaseURLOverride); override != "" {
 		config.BaseURL = normalizeBaseURL(override)
@@ -574,6 +605,48 @@ func (s *Server) listDocuments() ([]Document, error) {
 	return docs, nil
 }
 
+func (s *Server) backfillDocumentIDs() (int, error) {
+	docs, err := s.listDocuments()
+	if err != nil {
+		return 0, err
+	}
+	seen := make(map[string]string, len(docs))
+	assigned := 0
+	for _, doc := range docs {
+		id := strings.ToLower(strings.TrimSpace(doc.ID))
+		if id != "" && !validDocumentID(id) {
+			return assigned, fmt.Errorf("%s has an invalid document id; expected a UUID", doc.Path)
+		}
+		if id != "" {
+			if previous, ok := seen[id]; ok {
+				return assigned, fmt.Errorf("documents %s and %s share document id %s; IDs must be unique", previous, doc.Path, id)
+			}
+			seen[id] = doc.Path
+			continue
+		}
+		source, err := s.loadSourceDocument(doc.Path)
+		if err != nil {
+			return assigned, err
+		}
+		id, err = newDocumentID()
+		if err != nil {
+			return assigned, err
+		}
+		updated := patchFrontMatter(source.Source, map[string]string{"id": id})
+		filePath, err := safeWorkspacePath(filepath.Join(s.SiteDir, "content"), doc.Path)
+		if err != nil {
+			return assigned, err
+		}
+		if err := writeAtomicFile(filePath, updated); err != nil {
+			return assigned, fmt.Errorf("assign document id to %s: %w", doc.Path, err)
+		}
+		slog.Info("assigned stable Fileloom document id", "path", doc.Path, "id", id)
+		seen[id] = doc.Path
+		assigned++
+	}
+	return assigned, nil
+}
+
 func parseDocument(rel string, data []byte, modified time.Time) (Document, error) {
 	source, err := parseSourceDocument(rel, data, modified)
 	if err != nil {
@@ -584,7 +657,12 @@ func parseDocument(rel string, data []byte, modified time.Time) (Document, error
 
 func parseSourceDocument(rel string, data []byte, modified time.Time) (sourceDocument, error) {
 	meta, body, bodyStart, positions, hasFrontMatter := parseFrontMatterSource(string(data))
+	comments, err := parseOptionalBool(meta["comments"])
+	if err != nil {
+		return sourceDocument{}, fmt.Errorf("comments metadata: %w", err)
+	}
 	doc := Document{
+		ID:        strings.TrimSpace(meta["id"]),
 		Path:      filepath.ToSlash(rel),
 		Type:      documentType(rel),
 		Title:     strings.TrimSpace(meta["title"]),
@@ -595,6 +673,7 @@ func parseSourceDocument(rel string, data []byte, modified time.Time) (sourceDoc
 		Category:  strings.TrimSpace(meta["category"]),
 		PublishAt: strings.TrimSpace(meta["publish_at"]),
 		Excerpt:   strings.TrimSpace(meta["excerpt"]),
+		Comments:  comments,
 		HTML:      strings.TrimSpace(body),
 	}
 	if doc.Title == "" {
@@ -703,6 +782,14 @@ func (s *Server) writeDocument(doc Document) error {
 	if doc.Status == "" {
 		doc.Status = "draft"
 	}
+	if doc.ID == "" {
+		doc.ID, err = newDocumentID()
+		if err != nil {
+			return err
+		}
+	} else if !validDocumentID(doc.ID) {
+		return errors.New("document id must be a UUID")
+	}
 	if doc.Excerpt == "" {
 		doc.Excerpt = excerptFromHTML(doc.HTML)
 	}
@@ -723,6 +810,7 @@ func (s *Server) writeDocument(doc Document) error {
 func serializeDocument(doc Document) string {
 	var b strings.Builder
 	b.WriteString("---\n")
+	fmt.Fprintf(&b, "id: %s\n", strings.TrimSpace(doc.ID))
 	fmt.Fprintf(&b, "title: %s\n", strings.TrimSpace(doc.Title))
 	fmt.Fprintf(&b, "slug: %s\n", strings.TrimSpace(doc.Slug))
 	fmt.Fprintf(&b, "date: %s\n", strings.TrimSpace(doc.Date))
@@ -738,6 +826,9 @@ func serializeDocument(doc Document) string {
 	}
 	if strings.TrimSpace(doc.Excerpt) != "" {
 		fmt.Fprintf(&b, "excerpt: %s\n", strings.TrimSpace(doc.Excerpt))
+	}
+	if doc.Comments != nil {
+		fmt.Fprintf(&b, "comments: %t\n", *doc.Comments)
 	}
 	b.WriteString("---\n\n")
 	b.WriteString(strings.TrimSpace(doc.HTML))
@@ -816,6 +907,92 @@ func normalizeBaseURL(value string) string {
 		return value
 	}
 	return "https://" + value
+}
+
+func normalizeCommentServerURL(value string) (string, error) {
+	value = strings.TrimSpace(strings.TrimRight(value, "/"))
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("Artalk server must be an absolute HTTP(S) URL without credentials, query, or fragment")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", errors.New("Artalk server must use http or https")
+	}
+	if strings.ContainsAny(parsed.Host, "\r\n") || strings.Contains(parsed.Path, "..") {
+		return "", errors.New("Artalk server contains an unsafe path")
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func normalizeCommentsConfig(config CommentsConfig) (CommentsConfig, error) {
+	if strings.TrimSpace(config.Provider) == "" {
+		config.Provider = "artalk"
+	}
+	config.Provider = strings.ToLower(strings.TrimSpace(config.Provider))
+	if config.Provider != "artalk" {
+		return config, errors.New("only the Artalk comments provider is supported")
+	}
+	server, err := normalizeCommentServerURL(config.Server)
+	if err != nil {
+		return config, err
+	}
+	config.Server = server
+	config.Site = strings.TrimSpace(config.Site)
+	if config.Site != "" && !commentsSitePattern.MatchString(config.Site) {
+		return config, errors.New("Artalk site identifier must use 1-64 letters, numbers, dots, underscores, or hyphens")
+	}
+	if config.Enabled {
+		if config.Server == "" {
+			return config, errors.New("Artalk server is required when comments are enabled")
+		}
+		if config.Site == "" {
+			return config, errors.New("Artalk site identifier is required when comments are enabled")
+		}
+	}
+	return config, nil
+}
+
+func commentServerOrigin(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func parseOptionalBool(value string) (*bool, error) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return nil, nil
+	}
+	var parsed bool
+	switch value {
+	case "true", "yes", "1":
+		parsed = true
+	case "false", "no", "0":
+		parsed = false
+	default:
+		return nil, errors.New("value must be true or false")
+	}
+	return &parsed, nil
+}
+
+func validDocumentID(value string) bool {
+	return documentIDPattern.MatchString(strings.ToLower(strings.TrimSpace(value)))
+}
+
+func newDocumentID() (string, error) {
+	var raw [16]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate document id: %w", err)
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16]), nil
 }
 
 func slugify(value string) string {
@@ -923,6 +1100,7 @@ type editorMetadataInput struct {
 	Excerpt   *string   `json:"excerpt,omitempty"`
 	Status    *string   `json:"status,omitempty"`
 	PublishAt *string   `json:"publish_at,omitempty"`
+	Comments  *bool     `json:"comments,omitempty"`
 }
 
 type editorSaveRequest struct {
@@ -949,6 +1127,7 @@ type editorDocumentResponse struct {
 	Resource      string         `json:"resource"`
 	Path          string         `json:"path"`
 	Document      Document       `json:"document"`
+	Comments      CommentsConfig `json:"comments"`
 	HTML          string         `json:"html"`
 	SourceSHA256  string         `json:"source_sha256"`
 	PreviewURL    string         `json:"preview_url"`
@@ -1002,6 +1181,9 @@ func editorMetadataUpdates(input *editorMetadataInput, current Document) (map[st
 	}
 	if input.Excerpt != nil {
 		updates["excerpt"] = strings.TrimSpace(*input.Excerpt)
+	}
+	if input.Comments != nil {
+		updates["comments"] = strconv.FormatBool(*input.Comments)
 	}
 
 	effectiveStatus := strings.ToLower(strings.TrimSpace(current.Status))
@@ -1058,6 +1240,11 @@ func applyEditorMetadata(doc Document, updates map[string]string) Document {
 	}
 	if value, ok := updates["publish_at"]; ok {
 		doc.PublishAt = strings.TrimSpace(value)
+	}
+	if value, ok := updates["comments"]; ok {
+		if parsed, err := parseOptionalBool(value); err == nil {
+			doc.Comments = parsed
+		}
 	}
 	doc.URL = documentURL(doc)
 	return doc
@@ -1560,6 +1747,11 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
+	if config.Comments.Enabled {
+		if _, err := s.backfillDocumentIDs(); err != nil {
+			return BuildResult{}, fmt.Errorf("comments document IDs: %w", err)
+		}
+	}
 	docs, err := s.listDocuments()
 	if err != nil {
 		return BuildResult{}, err
@@ -1613,6 +1805,22 @@ func (s *Server) buildLocked() (BuildResult, error) {
 			return BuildResult{}, err
 		}
 	}
+	if config.Comments.Enabled {
+		for _, asset := range []struct{ source, target string }{
+			{source: filepath.ToSlash(filepath.Join("artalk", "Artalk.css")), target: "fileloom-artalk.css"},
+			{source: filepath.ToSlash(filepath.Join("artalk", "Artalk.iife.js")), target: "fileloom-artalk.js"},
+			{source: "fileloom-comments.css", target: "fileloom-comments.css"},
+			{source: "fileloom-comments.js", target: "fileloom-comments.js"},
+		} {
+			data, assetErr := readWebAsset(s.WebDir, asset.source)
+			if assetErr != nil {
+				return BuildResult{}, fmt.Errorf("read comments asset %s: %w", asset.source, assetErr)
+			}
+			if err := writePublic(filepath.Join(outputDir, "theme", asset.target), string(data)); err != nil {
+				return BuildResult{}, err
+			}
+		}
+	}
 
 	layout, err := readThemeTemplateSafe(themeDir, "layout.html", defaultLayoutTemplate)
 	if err != nil {
@@ -1663,7 +1871,7 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		if doc.Type == "post" {
 			bodyTemplate = postTemplate
 		}
-		body := applyTokens(bodyTemplate, values)
+		body := renderDocumentBody(bodyTemplate, values, commentsWidgetHTML(config, doc))
 		values["content"] = body
 		output := applyTokens(layout, values)
 		outputPath := filepath.Join(outputDir, filepath.FromSlash(strings.TrimPrefix(doc.URL, "/")), "index.html")
@@ -2168,6 +2376,32 @@ func readThemeTemplateSafe(themeDir, name, fallback string) (string, error) {
 	return string(data), nil
 }
 
+func commentsEnabledForDocument(config SiteConfig, doc Document) bool {
+	if !config.Comments.Enabled || config.Comments.Provider != "artalk" || (doc.Type != "page" && doc.Type != "post") {
+		return false
+	}
+	return validDocumentID(doc.ID) && (doc.Comments == nil || *doc.Comments)
+}
+
+func commentsWidgetHTML(config SiteConfig, doc Document) string {
+	if !commentsEnabledForDocument(config, doc) {
+		return ""
+	}
+	return `<section class="fileloom-comments" data-fileloom-comments data-server="` + html.EscapeString(config.Comments.Server) + `" data-site="` + html.EscapeString(config.Comments.Site) + `" data-page-key="fileloom/` + html.EscapeString(doc.ID) + `" data-page-title="` + html.EscapeString(doc.Title) + `" data-theme="` + html.EscapeString(config.Theme) + `"><div class="artalk"></div><noscript>Comments require JavaScript.</noscript></section>`
+}
+
+func renderDocumentBody(templateSource string, values map[string]string, comments string) string {
+	values["comments"] = comments
+	rendered := applyTokens(templateSource, values)
+	if comments == "" || strings.Contains(templateSource, "{{comments}}") || strings.Contains(templateSource, "{{ comments }}") {
+		return rendered
+	}
+	if index := strings.LastIndex(strings.ToLower(rendered), "</article>"); index >= 0 {
+		return rendered[:index] + comments + rendered[index:]
+	}
+	return rendered + comments
+}
+
 func templateValues(doc Document, config SiteConfig, navigation, posts string) map[string]string {
 	tags := make([]string, 0, len(doc.Tags))
 	for _, tag := range doc.Tags {
@@ -2196,6 +2430,7 @@ func templateValues(doc Document, config SiteConfig, navigation, posts string) m
 		"theme.css":        "/theme/style.css",
 		"navigation":       navigation,
 		"posts":            posts,
+		"comments":         "",
 	}
 }
 
@@ -2279,7 +2514,7 @@ func (s *Server) renderEditorPreview(doc Document) (string, error) {
 		bodyTemplate = postTemplate
 	}
 	values["content"] = doc.HTML
-	values["content"] = applyTokens(bodyTemplate, values)
+	values["content"] = renderDocumentBody(bodyTemplate, values, "")
 	output := applyTokens(layout, values)
 	if fileExists(filepath.Join(s.WebDir, "fileloom-code.css")) && fileExists(filepath.Join(s.WebDir, "fileloom-code.js")) {
 		output = ensureCodeAssets(output)
@@ -2419,6 +2654,20 @@ func codeAssetsAvailable(path string) bool {
 	}
 	return false
 }
+func commentsAssetsAvailable(path string) bool {
+	directory := filepath.Dir(path)
+	for range 5 {
+		if fileExists(filepath.Join(directory, "theme", "fileloom-artalk.css")) && fileExists(filepath.Join(directory, "theme", "fileloom-artalk.js")) && fileExists(filepath.Join(directory, "theme", "fileloom-comments.css")) && fileExists(filepath.Join(directory, "theme", "fileloom-comments.js")) {
+			return true
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			break
+		}
+		directory = parent
+	}
+	return false
+}
 func ensureCodeAssets(source string) string {
 	if !strings.Contains(source, "/theme/fileloom-code.css") {
 		link := `<link rel="stylesheet" href="/theme/fileloom-code.css">`
@@ -2442,10 +2691,48 @@ func ensureCodeAssets(source string) string {
 	return source
 }
 
+func ensureCommentsAssets(source string) string {
+	if !strings.Contains(source, "data-fileloom-comments") {
+		return source
+	}
+	links := ""
+	if !strings.Contains(source, "/theme/fileloom-artalk.css") {
+		links += `<link rel="stylesheet" href="/theme/fileloom-artalk.css">`
+	}
+	if !strings.Contains(source, "/theme/fileloom-comments.css") {
+		links += `<link rel="stylesheet" href="/theme/fileloom-comments.css">`
+	}
+	if links != "" {
+		if index := strings.Index(strings.ToLower(source), "</head>"); index >= 0 {
+			source = source[:index] + links + source[index:]
+		} else {
+			source = links + source
+		}
+	}
+	scripts := ""
+	if !strings.Contains(source, "/theme/fileloom-artalk.js") {
+		scripts += `<script src="/theme/fileloom-artalk.js" defer></script>`
+	}
+	if !strings.Contains(source, "/theme/fileloom-comments.js") {
+		scripts += `<script src="/theme/fileloom-comments.js" defer></script>`
+	}
+	if scripts != "" {
+		if index := strings.Index(strings.ToLower(source), "</body>"); index >= 0 {
+			source = source[:index] + scripts + source[index:]
+		} else {
+			source += scripts
+		}
+	}
+	return source
+}
+
 func writePublic(path, contents string) error {
 	if strings.EqualFold(filepath.Ext(path), ".html") {
 		if codeAssetsAvailable(path) {
 			contents = ensureCodeAssets(contents)
+		}
+		if commentsAssetsAvailable(path) {
+			contents = ensureCommentsAssets(contents)
 		}
 		contents = ensureAttribution(contents)
 	}
@@ -2633,6 +2920,29 @@ func (s *Server) auditMutation(r *http.Request, status int) {
 	slog.LogAttrs(context.Background(), level, "cms mutation", slog.String("action", r.Method), slog.String("path", auditValue(r.URL.Path)), slog.String("actor", actor), slog.Int("status", status), slog.String("result", result))
 }
 
+func appendCSPSource(policy, directive, source string) string {
+	policy = strings.TrimSpace(policy)
+	source = strings.TrimSpace(source)
+	if policy == "" || directive == "" || source == "" {
+		return policy
+	}
+	parts := strings.Split(policy, ";")
+	for index, part := range parts {
+		fields := strings.Fields(strings.TrimSpace(part))
+		if len(fields) == 0 || fields[0] != directive {
+			continue
+		}
+		for _, existing := range fields[1:] {
+			if existing == source {
+				return policy
+			}
+		}
+		parts[index] = strings.TrimSpace(part) + " " + source
+		return strings.Join(parts, ";")
+	}
+	return strings.TrimRight(policy, " ;") + "; " + directive + " 'self' " + source
+}
+
 func (s *Server) applySecurityHeaders(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	if strings.HasPrefix(r.URL.Path, "/_cms") {
@@ -2645,7 +2955,11 @@ func (s *Server) applySecurityHeaders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.PublicCSP != "" {
-		w.Header().Set("Content-Security-Policy", s.PublicCSP)
+		policy := s.PublicCSP
+		if config, err := s.loadSiteConfig(); err == nil && config.Comments.Enabled {
+			policy = appendCSPSource(policy, "connect-src", commentServerOrigin(config.Comments.Server))
+		}
+		w.Header().Set("Content-Security-Policy", policy)
 	}
 }
 
@@ -3138,6 +3452,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleThemeTokensAPI(w, r)
 	case "/_cms/api/export":
 		s.handleExportAPI(w, r)
+	case "/_cms/api/comments/config":
+		s.handleCommentsConfigAPI(w, r)
 	case "/_cms/api/git":
 		s.handleGitAPI(w, r)
 	case "/_cms/api/git/config":
@@ -3212,6 +3528,7 @@ func (s *Server) handleEditorAPI(w http.ResponseWriter, r *http.Request) {
 		Resource:      "content",
 		Path:          source.Document.Path,
 		Document:      source.Document,
+		Comments:      config.Comments,
 		HTML:          source.Document.HTML,
 		SourceSHA256:  sha,
 		PreviewURL:    "/_cms/editor/frame?path=" + url.QueryEscape(source.Document.Path),
@@ -3444,6 +3761,7 @@ func (s *Server) handleItemsAPI(w http.ResponseWriter, r *http.Request) {
 		items := make([]map[string]any, 0, len(docs))
 		for _, doc := range docs {
 			items = append(items, map[string]any{
+				"id":         doc.ID,
 				"path":       doc.Path,
 				"type":       doc.Type,
 				"title":      doc.Title,
@@ -3453,6 +3771,7 @@ func (s *Server) handleItemsAPI(w http.ResponseWriter, r *http.Request) {
 				"tags":       doc.Tags,
 				"category":   doc.Category,
 				"excerpt":    doc.Excerpt,
+				"comments":   doc.Comments,
 				"url":        doc.URL,
 				"editor_url": "/_cms/editor?path=" + url.QueryEscape(doc.Path),
 			})
@@ -5213,6 +5532,82 @@ func (s *Server) gitChangeIfConfigured(message string) error {
 	}
 	_, err = s.gitCommitAndPush(config.Git, message, false)
 	return err
+}
+
+type commentsConfigInput struct {
+	Enabled  bool   `json:"enabled"`
+	Provider string `json:"provider"`
+	Server   string `json:"server"`
+	Site     string `json:"site"`
+}
+
+func (s *Server) handleCommentsConfigAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !rejectOversizedDeclaredBody(w, r, maxFormSize) {
+		return
+	}
+	limitRequestBody(w, r, maxFormSize)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	var input commentsConfigInput
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "application/json") {
+		if err := decodeJSONBody(r, &input); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+	} else {
+		if err := r.ParseForm(); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		input = commentsConfigInput{
+			Enabled: formBool(r, "enabled"), Provider: r.FormValue("provider"),
+			Server: r.FormValue("server"), Site: r.FormValue("site"),
+		}
+	}
+	comments, err := normalizeCommentsConfig(CommentsConfig{
+		Enabled: input.Enabled, Provider: input.Provider, Server: input.Server, Site: input.Site,
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	config, err := s.loadSiteConfig()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	original := config
+	if comments.Enabled {
+		if _, err := s.backfillDocumentIDs(); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "cannot enable comments: "+err.Error())
+			return
+		}
+	}
+	config.Comments = comments
+	if err := s.saveSiteConfig(config); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	build, err := s.Build()
+	if err != nil {
+		rollbackErr := s.saveSiteConfig(original)
+		message := "comments settings rolled back because build failed: " + err.Error()
+		if rollbackErr != nil {
+			message += "; rollback failed: " + rollbackErr.Error()
+		}
+		writeJSONError(w, http.StatusInternalServerError, message)
+		return
+	}
+	if err := s.gitChangeIfConfigured("Update comments settings"); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "comments": config.Comments, "build": build})
 }
 
 func (s *Server) handleGitAPI(w http.ResponseWriter, r *http.Request) {

@@ -1,4 +1,4 @@
-const state = { items: [], filter: "all", themes: [], checks: [], gitDirty: false, tokenTheme: "", tokenSHA: "" };
+const state = { items: [], filter: "all", themes: [], checks: [], gitDirty: false, commentsDirty: false, tokenTheme: "", tokenSHA: "" };
 const $ = (selector) => document.querySelector(selector);
 
 function escapeHTML(value) {
@@ -39,6 +39,7 @@ function renderSite(data) {
   $("#check-count").textContent = checks.length ? `${checks.length} check${checks.length === 1 ? "" : "s"}` : "No check issues";
   renderThemes(data.themes || []);
   renderGit(data.git || {});
+  renderComments(site);
 }
 
 function renderThemes(themes) {
@@ -97,6 +98,31 @@ function renderGit(data) {
   $("#git-remote-url").value = config.remote_url || status.remote || "";
   state.gitDirty = false;
   syncGitDependencies();
+}
+
+function syncCommentsDependencies() {
+  const enabled = $("#comments-enabled").checked;
+  $("#comments-server").required = enabled;
+  $("#comments-site").required = enabled;
+}
+
+function renderComments(site) {
+  const config = site?.comments || site || {};
+  const enabled = !!config.enabled;
+  const pill = $("#comments-status-pill");
+  pill.textContent = enabled ? "Enabled" : "Off";
+  pill.className = `status ${enabled ? "" : "draft"}`;
+  $("#comments-provider").textContent = config.provider || "Artalk";
+  $("#comments-site-key").textContent = config.site || "—";
+  $("#comments-summary").textContent = enabled
+    ? "Artalk is enabled for this site. Pages and posts can opt out individually from the editor Details panel."
+    : "Comments are disabled. No comments widget or comment data is part of this site.";
+  $("#comments-enabled").checked = enabled;
+  $("#comments-server").value = config.server || "";
+  $("#comments-site").value = config.site || "";
+  $("#comments-origin").textContent = config.base_url || window.location.origin;
+  state.commentsDirty = false;
+  syncCommentsDependencies();
 }
 
 function filteredItems() {
@@ -224,12 +250,61 @@ $("#export-button")?.addEventListener("click", async () => {
 });
 
 function openGitDialog() { state.gitDirty = false; $("#git-dialog")?.showModal(); syncGitDependencies(); }
+function openCommentsDialog() {
+  state.commentsDirty = false;
+  $("#comments-dialog")?.showModal();
+  syncCommentsDependencies();
+}
+function requestCommentsClose() {
+  if (!state.commentsDirty || window.confirm("Discard unsaved comments settings?")) {
+    state.commentsDirty = false;
+    $("#comments-dialog")?.close();
+  }
+}
 function requestGitClose() {
   if (!state.gitDirty) { $("#git-dialog")?.close(); return; }
   $("#discard-dialog")?.showModal();
 }
 
-$("#git-configure")?.addEventListener("click", openGitDialog);
+$("#comments-configure")?.addEventListener("click", openCommentsDialog);
+$("#comments-close")?.addEventListener("click", requestCommentsClose);
+$("#comments-cancel")?.addEventListener("click", requestCommentsClose);
+$("#comments-dialog")?.addEventListener("cancel", (event) => { event.preventDefault(); requestCommentsClose(); });
+$("#comments-config-form")?.addEventListener("input", () => { state.commentsDirty = true; });
+$("#comments-config-form")?.addEventListener("change", () => { state.commentsDirty = true; syncCommentsDependencies(); });
+$("#comments-config-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
+  const server = form.elements.server.value.trim();
+  if (form.elements.enabled.checked) {
+    try {
+      const parsed = new URL(server);
+      if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error();
+    } catch {
+      form.elements.server.setCustomValidity("Use an absolute http:// or https:// Artalk server URL without credentials, query, or fragment.");
+      form.elements.server.reportValidity();
+      form.elements.server.setCustomValidity("");
+      return;
+    }
+  }
+  const payload = new URLSearchParams({
+    enabled: form.elements.enabled.checked ? "true" : "false",
+    provider: "artalk",
+    server,
+    site: form.elements.site.value.trim(),
+  });
+  const button = $("#comments-save"); button.disabled = true;
+  try {
+    await getJSON("/_cms/api/comments/config", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: payload.toString() });
+    state.commentsDirty = false;
+    $("#comments-dialog").close();
+    showToast(form.elements.enabled.checked ? "Comments enabled." : "Comments disabled.");
+    await loadDashboard();
+  } catch (error) { showToast(error.message, true); }
+  finally { button.disabled = false; }
+});
+
 $("#git-close")?.addEventListener("click", requestGitClose);
 $("#git-cancel")?.addEventListener("click", requestGitClose);
 $("#git-dialog")?.addEventListener("cancel", (event) => { event.preventDefault(); requestGitClose(); });

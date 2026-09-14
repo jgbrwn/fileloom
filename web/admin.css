@@ -168,3 +168,18 @@ code { padding: 2px 5px; border-radius: 5px; background: rgba(0,0,0,.06); font-s
 button:disabled { cursor: not-allowed; opacity: .52; transform: none !important; }
 .git-actions { flex-wrap: wrap; }
 @media (max-width: 720px) { .token-field { grid-template-columns: 1fr; gap: 5px; } .git-actions .button { flex: 1 1 auto; } }
+
+.comments-body { padding: 22px 26px 25px; }
+.comments-body > p { margin: 0 0 19px; color: var(--muted); font-size: .82rem; }
+.comments-facts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 0 0 20px; }
+.comments-facts div { min-width: 0; padding: 10px; border-radius: 9px; background: var(--paper); }
+.comments-facts dt { color: var(--muted); font-size: .65rem; font-weight: 800; text-transform: uppercase; }
+.comments-facts dd { overflow: hidden; margin: 3px 0 0; font-size: .78rem; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+.comments-actions { display: flex; justify-content: flex-start; gap: 8px; }
+.comments-dialog { width: min(620px, calc(100% - 28px)); padding: 0; border: 0; border-radius: 16px; color: var(--ink); background: var(--card); box-shadow: 0 24px 80px rgba(0,0,0,.28); }
+.comments-dialog::backdrop { background: rgba(12,18,28,.52); backdrop-filter: blur(3px); }
+.comments-config-form { padding: 28px; }
+.comments-origin-note { margin: 0; color: var(--muted); font-size: .76rem; }
+.comments-origin-note code { overflow-wrap: anywhere; }
+.comments-config-form input:disabled { opacity: .55; }
+@media (max-width: 720px) { .comments-facts { grid-template-columns: 1fr; } }

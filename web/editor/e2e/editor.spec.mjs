@@ -152,6 +152,42 @@ async function selectTextRange(locator, start, end) {
 }
 
 test.describe("Deckflow Fileloom editor", () => {
+  test("keeps comments opt-in and disables the page control until site setup", async ({ page }) => {
+    await page.goto("/_cms/");
+    await expect(page.locator("#comments-status-pill")).toHaveText("Off");
+    await page.locator("#comments-configure").click();
+    await expect(page.locator("#comments-dialog")).toBeVisible();
+    await expect(page.locator("#comments-enabled")).not.toBeChecked();
+    await page.locator("#comments-cancel").click();
+
+    await openEditor(page);
+    await openDetails(page);
+    await expect(page.locator('[data-metadata="comments"]')).toBeDisabled();
+    await expect(page.locator("#sheet-content")).toContainText("Enable Artalk comments in the CMS site settings first");
+  });
+
+  test("renders Artalk only after site opt-in and removes it when disabled", async ({ page }) => {
+    await page.route("https://comments.example.test/**", (route) => route.abort());
+    const enabled = await cmsJSON(page, "/_cms/api/comments/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "enabled=true&provider=artalk&server=https%3A%2F%2Fcomments.example.test&site=fileloom-e2e",
+    });
+    expect(enabled.status, JSON.stringify(enabled.body)).toBe(200);
+    await page.goto("/2026/welcome-to-fileloom/");
+    await expect(page.locator("[data-fileloom-comments]")).toBeVisible();
+    await expect(page.locator(".fileloom-comments .artalk")).toBeVisible();
+
+    const disabled = await cmsJSON(page, "/_cms/api/comments/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "enabled=false&provider=artalk&server=https%3A%2F%2Fcomments.example.test&site=fileloom-e2e",
+    });
+    expect(disabled.status, JSON.stringify(disabled.body)).toBe(200);
+    await page.goto("/2026/welcome-to-fileloom/");
+    await expect(page.locator("[data-fileloom-comments]")).toHaveCount(0);
+  });
+
   test("loads the editor shell and keeps theme controls separate", async ({ page }) => {
     await openEditor(page);
     await expect(page.locator(".document-heading strong")).toHaveText("About");

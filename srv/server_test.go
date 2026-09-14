@@ -1466,3 +1466,126 @@ func TestPathValidation(t *testing.T) {
 		t.Fatalf("normalize content path = %q, %v", got, err)
 	}
 }
+
+func TestCommentsOptInBuildAndPerDocumentOptOut(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	server.PublicCSP = defaultPublicCSP
+
+	before, err := server.loadDocument("pages/about.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validDocumentID(before.ID) {
+		t.Fatalf("new site did not receive a stable document id: %q", before.ID)
+	}
+	if source, err := os.ReadFile(filepath.Join(siteDir, "content", "pages", "about.html")); err != nil || !strings.Contains(string(source), "id: "+before.ID) {
+		t.Fatalf("source is missing stable document id: err=%v source=%s", err, source)
+	}
+
+	form := url.Values{
+		"enabled": {"true"}, "provider": {"artalk"},
+		"server": {"https://comments.example.test"}, "site": {"fileloom-demo"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/comments/config", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("enable comments status = %d: %s", res.Code, res.Body)
+	}
+
+	generated, err := os.ReadFile(filepath.Join(siteDir, "public", "about", "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		`data-fileloom-comments`, `data-page-key="fileloom/` + before.ID,
+		`data-server="https://comments.example.test"`, `data-site="fileloom-demo"`,
+		`/theme/fileloom-artalk.css`, `/theme/fileloom-comments.css`,
+		`/theme/fileloom-artalk.js`, `/theme/fileloom-comments.js`,
+	} {
+		if !strings.Contains(string(generated), expected) {
+			t.Fatalf("generated comments page missing %q: %s", expected, generated)
+		}
+	}
+	for _, asset := range []string{"fileloom-artalk.css", "fileloom-artalk.js", "fileloom-comments.css", "fileloom-comments.js"} {
+		if _, err := os.Stat(filepath.Join(siteDir, "public", "theme", asset)); err != nil {
+			t.Fatalf("generated comments asset %s missing: %v", asset, err)
+		}
+	}
+
+	publicReq := httptest.NewRequest(http.MethodGet, "/about/", nil)
+	publicRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(publicRes, publicReq)
+	if publicRes.Code != http.StatusOK {
+		t.Fatalf("public comments page status = %d", publicRes.Code)
+	}
+	if csp := publicRes.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "connect-src 'self' https://comments.example.test") {
+		t.Fatalf("public CSP did not allow configured Artalk server: %q", csp)
+	}
+
+	if _, err := server.patchDocumentSource("pages/about.html", "", false, map[string]string{"comments": "false"}, "", "Opt out of comments"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Build(); err != nil {
+		t.Fatal(err)
+	}
+	optOut, err := os.ReadFile(filepath.Join(siteDir, "public", "about", "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(optOut), "data-fileloom-comments") {
+		t.Fatal("page-level comments opt-out still rendered the widget")
+	}
+
+	previewPayload, _ := json.Marshal(map[string]any{
+		"path": "pages/about.html", "html": "<p>Unsaved preview</p>",
+	})
+	previewReq := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-preview", bytes.NewReader(previewPayload))
+	previewReq.Header.Set("Content-Type", "application/json")
+	previewReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	previewRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(previewRes, previewReq)
+	if previewRes.Code != http.StatusOK || strings.Contains(previewRes.Body.String(), "data-fileloom-comments") {
+		t.Fatalf("editor preview rendered comments: %d %s", previewRes.Code, previewRes.Body)
+	}
+
+	disabledForm := url.Values{"enabled": {"false"}, "provider": {"artalk"}, "server": {"https://comments.example.test"}, "site": {"fileloom-demo"}}
+	disableReq := httptest.NewRequest(http.MethodPost, "/_cms/api/comments/config", strings.NewReader(disabledForm.Encode()))
+	disableReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	disableReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	disableRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(disableRes, disableReq)
+	if disableRes.Code != http.StatusOK {
+		t.Fatalf("disable comments status = %d: %s", disableRes.Code, disableRes.Body)
+	}
+	afterDisable, err := os.ReadFile(filepath.Join(siteDir, "public", "about", "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(afterDisable), "data-fileloom-comments") {
+		t.Fatal("site-level comments disable still rendered the widget")
+	}
+}
+
+func TestCommentsConfigValidation(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{"enabled": {"true"}, "provider": {"artalk"}, "server": {"http://user:pass@example.test"}, "site": {"demo"}}
+	req := httptest.NewRequest(http.MethodPost, "/_cms/api/comments/config", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-ExeDev-Email", "owner@example.com")
+	res := httptest.NewRecorder()
+	server.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "without credentials") {
+		t.Fatalf("unsafe comments config = %d: %s", res.Code, res.Body)
+	}
+}

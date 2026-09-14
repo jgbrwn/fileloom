@@ -16,9 +16,21 @@ Review date: September 11, 2026
 - Revisions are filesystem snapshots with atomic writes, checksums, per-path retention of 100 snapshots, and a 128 MiB workspace budget.
 - CMS mutations emit structured `slog` audit events with actor, action, route, status, and result without request bodies or credentials.
 - Git is constrained to a real `site/.git` repository, uses non-interactive time-bounded commands, rejects unsafe configured URLs, and validates effective push URLs including configured `pushurl`/rewrite results before automatic pushes.
-- CSP is deliberately opt-in through `FILELOOM_CMS_CSP` and `FILELOOM_PUBLIC_CSP` so the Deckflow editor and user themes are not broken by default.
+- Comments are an explicit opt-in external boundary. Fileloom validates the Artalk URL, never server-side fetches or proxies it, publishes no comment data into source/public/export/Git, disables Artalk image uploads and remote emoticons in its bootstrap, and adds the configured Artalk origin only to public `connect-src` when enabled.
+- Site-level comments configuration changes remain owner-authenticated CMS mutations with same-origin checks, bounded bodies, rollback-on-build-failure, and audit logging. Per-document `comments: false` is source-preserved and cannot enable comments while the site switch is off.
+- Generated comment markup uses escaped data attributes and a local pinned Artalk client; no inline executable configuration or third-party CDN is required.
 
-## Remaining verification and hardening
+## Comments deployment notes
+
+Artalk is a separate public service and therefore a separate security/operations boundary. Before enabling it:
+
+- configure the exact Fileloom public origin in Artalk's trusted-domain/CORS settings; never use a wildcard for a public deployment;
+- configure Artalk authentication, moderation, CAPTCHA/spam controls, rate limits, notification/email behavior, and backups in Artalk;
+- update the site's privacy notice for provider-processed commenter identity, email, IP, User-Agent, and notification data;
+- keep the Fileloom public CSP profile compatible with the Artalk API origin and any explicitly enabled Artalk integrations; and
+- back up Artalk independently because Fileloom exports and Git intentionally exclude comment records.
+
+The first integration uses local vendored Artalk `2.10.0` client assets and disables client image uploads, remote emoticons, and editor preview. Review those choices before enabling richer Artalk plugins or social/OIDC login.
 
 ### 1. Verify the proxy boundary before public release
 

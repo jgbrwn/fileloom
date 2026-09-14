@@ -1,0 +1,97 @@
+.fileloom-comments {
+  --fileloom-comments-bg: var(--fileloom-theme-comments-bg, var(--card, #fff));
+  --fileloom-comments-bg-soft: var(--fileloom-theme-comments-bg-soft, var(--paper, #fbfcfe));
+  --fileloom-comments-fg: var(--fileloom-theme-comments-fg, var(--ink, #18212b));
+  --fileloom-comments-muted: var(--fileloom-theme-comments-muted, var(--muted, #667384));
+  --fileloom-comments-border: var(--fileloom-theme-comments-border, var(--line, #dfe5ec));
+  --fileloom-comments-accent: var(--fileloom-theme-comments-accent, var(--accent, #7557ff));
+  --fileloom-comments-accent-contrast: var(--fileloom-theme-comments-accent-contrast, #fff);
+  --fileloom-comments-radius: var(--fileloom-theme-comments-radius, 14px);
+  --fileloom-comments-shadow: var(--fileloom-theme-comments-shadow, none);
+  margin: clamp(34px, 7vw, 72px) auto 0;
+  padding: clamp(18px, 3vw, 28px);
+  border: 1px solid var(--fileloom-comments-border);
+  border-radius: var(--fileloom-comments-radius);
+  color: var(--fileloom-comments-fg);
+  background: var(--fileloom-comments-bg);
+  box-shadow: var(--fileloom-comments-shadow);
+  font-family: var(--fileloom-theme-comments-font, inherit);
+}
+.fileloom-comments .artalk {
+  --at-color-font: var(--fileloom-comments-fg);
+  --at-color-deep: var(--fileloom-comments-fg);
+  --at-color-sub: var(--fileloom-comments-muted);
+  --at-color-grey: var(--fileloom-comments-muted);
+  --at-color-meta: var(--fileloom-comments-muted);
+  --at-color-border: var(--fileloom-comments-border);
+  --at-color-light: var(--fileloom-comments-accent);
+  --at-color-bg: var(--fileloom-comments-bg);
+  --at-color-bg-transl: var(--fileloom-comments-bg);
+  --at-color-bg-grey: var(--fileloom-comments-bg-soft);
+  --at-color-bg-grey-transl: var(--fileloom-comments-bg-soft);
+  --at-color-bg-light: var(--fileloom-theme-comments-bg-light, rgba(117, 87, 255, .12));
+  --at-color-main: var(--fileloom-comments-accent);
+  --at-color-gradient: linear-gradient(180deg, transparent, var(--fileloom-comments-bg));
+  color: var(--fileloom-comments-fg);
+  font-family: inherit;
+}
+.fileloom-comments .artalk .atk-main-editor,
+.fileloom-comments .artalk .atk-comment-wrap:hover,
+.fileloom-comments .artalk .atk-list-read-more .atk-list-read-more-inner:hover {
+  border-color: var(--fileloom-comments-border);
+  background: var(--fileloom-comments-bg-soft);
+}
+.fileloom-comments .artalk .atk-main-editor {
+  border-radius: var(--fileloom-comments-radius);
+  box-shadow: none;
+}
+.fileloom-comments .artalk .atk-main-editor > .atk-header input,
+.fileloom-comments .artalk .atk-main-editor > .atk-textarea-wrap > .atk-textarea {
+  color: var(--fileloom-comments-fg);
+  background: var(--fileloom-comments-bg);
+}
+.fileloom-comments .artalk .atk-main-editor > .atk-bottom .atk-send-btn {
+  color: var(--fileloom-comments-accent-contrast);
+  background: var(--fileloom-comments-accent);
+  border-radius: max(6px, calc(var(--fileloom-comments-radius) / 2));
+}
+.fileloom-comments .artalk .atk-comment {
+  padding-inline: 0;
+}
+.fileloom-comments .artalk .atk-comment > .atk-avatar img {
+  border-radius: max(6px, calc(var(--fileloom-comments-radius) / 3));
+}
+.fileloom-comments .artalk .atk-comment > .atk-main > .atk-header .atk-item.atk-nick,
+.fileloom-comments .artalk .atk-comment > .atk-main > .atk-header .atk-item.atk-nick a,
+.fileloom-comments .artalk a {
+  color: var(--fileloom-comments-accent);
+}
+.fileloom-comments .artalk .atk-comment > .atk-main > .atk-body > .atk-content,
+.fileloom-comments .artalk .atk-comment > .atk-main > .atk-body > .atk-reply-to,
+.fileloom-comments .artalk .atk-comment > .atk-main > .atk-body > .atk-collapsed {
+  color: var(--fileloom-comments-fg);
+}
+.fileloom-comments .artalk .atk-comment > .atk-main > .atk-body > .atk-reply-to {
+  border-left-color: var(--fileloom-comments-accent);
+}
+.fileloom-comments .artalk .atk-list > .atk-list-header {
+  padding-inline: 0;
+}
+.fileloom-comments .artalk .atk-list > .atk-list-footer .atk-copyright {
+  padding-right: 0;
+}
+.fileloom-comments noscript {
+  display: block;
+  color: var(--fileloom-comments-muted);
+  font-size: .86em;
+}
+.fileloom-comments[data-comments-error] .artalk {
+  min-height: 0;
+}
+@media (max-width: 640px) {
+  .fileloom-comments {
+    margin-top: 38px;
+    padding: 15px;
+    border-radius: max(10px, calc(var(--fileloom-comments-radius) * .8));
+  }
+}

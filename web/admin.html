@@ -88,6 +88,14 @@
           <div class="git-actions"><button id="git-configure" class="button button-quiet button-small">Configure</button><button id="git-init" class="button button-quiet button-small">Initialize site repo</button><button id="git-commit" class="button button-dark button-small">Commit source</button><button id="git-push" class="button button-quiet button-small">Push</button></div>
         </div>
       </section>
+      <section class="panel comments-panel">
+        <div class="panel-heading compact-heading"><div><p class="kicker">Community</p><h2>Comments</h2></div><span id="comments-status-pill" class="status draft">Off</span></div>
+        <div class="comments-body">
+          <p id="comments-summary">Comments are disabled. No comments widget or comment data is part of this site.</p>
+          <dl class="comments-facts"><div><dt>Provider</dt><dd id="comments-provider">Artalk</dd></div><div><dt>Site key</dt><dd id="comments-site-key">—</dd></div></dl>
+          <div class="comments-actions"><button id="comments-configure" class="button button-quiet button-small">Configure comments</button></div>
+        </div>
+      </section>
     </section>
     <dialog id="git-dialog" class="git-dialog">
       <form method="dialog" id="git-config-form" class="git-config-form">
@@ -98,6 +106,16 @@
         <div class="dialog-grid"><label>Commit trigger<select id="git-commit-on" name="commit_on"><option value="build">After successful build</option><option value="change">After each source change</option></select></label><label>Remote name<input id="git-remote-name" name="remote" value="origin" autocomplete="off" required pattern="[A-Za-z0-9._-]+" title="Use letters, numbers, dots, underscores, or hyphens."></label><label>Branch<input id="git-branch-name" name="branch" placeholder="current branch" autocomplete="off" pattern="[A-Za-z0-9._/@-]+" title="Use a valid Git branch name."></label><label>Remote URL<input id="git-remote-url" name="remote_url" placeholder="git@github.com:you/site.git" autocomplete="off" inputmode="url"><small class="field-help">Optional when the remote is already configured.</small></label></div>
         <label class="check-row"><input id="git-auto-push" name="auto_push" type="checkbox"><span><strong>Auto-push</strong><small>Push after an automatic commit. Configure credentials outside Fileloom.</small></span></label>
         <div class="dialog-actions"><button type="button" id="git-cancel" class="button button-quiet">Cancel</button><button type="submit" id="git-save" class="button button-primary">Save Git settings</button></div>
+      </form>
+    </dialog>
+    <dialog id="comments-dialog" class="comments-dialog">
+      <form method="dialog" id="comments-config-form" class="comments-config-form">
+        <div class="dialog-heading"><div><p class="kicker">Comments setup</p><h2>Configure Artalk</h2></div><button type="button" id="comments-close" class="dialog-close" aria-label="Close">×</button></div>
+        <p class="dialog-help">Comments are an external dynamic service. Fileloom only publishes the widget configuration; Artalk owns identities, moderation, rate limits, and comment storage. The default is off.</p>
+        <label class="check-row"><input id="comments-enabled" name="enabled" type="checkbox"><span><strong>Enable comments for this site</strong><small>Pages and posts allow comments by default; each item can opt out from its editor Details panel.</small></span></label>
+        <div class="dialog-grid"><label>Artalk server URL<input id="comments-server" name="server" placeholder="https://comments.example.com" autocomplete="url" inputmode="url"><small class="field-help">Use the public Artalk server URL. Configure its trusted domain/CORS list with this site origin.</small></label><label>Artalk site key<input id="comments-site" name="site" placeholder="my-fileloom-site" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" title="Use 1-64 letters, numbers, dots, underscores, or hyphens."><small class="field-help">Stable identifier for this Fileloom site inside Artalk.</small></label></div>
+        <p class="comments-origin-note">Public site origin: <code id="comments-origin">—</code></p>
+        <div class="dialog-actions"><button type="button" id="comments-cancel" class="button button-quiet">Cancel</button><button type="submit" id="comments-save" class="button button-primary">Save comments settings</button></div>
       </form>
     </dialog>
     <dialog id="discard-dialog" class="confirm-dialog">
