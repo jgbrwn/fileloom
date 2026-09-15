@@ -1,6 +1,8 @@
+[![Made for exe.dev](docs/assets/made-for-exe-dev.png)](https://exe.dev)
+
 # Fileloom
 
-Fileloom is an HTML-first, filesystem-backed static CMS inspired by ShellCMS.
+Fileloom is an HTML-first, filesystem-backed static CMS inspired by [ShellCMS](https://bkhome.org/shellcms/).
 
 > **The filesystem is the database. HTML is the content format. `public/` is the published site.**
 
@@ -43,6 +45,10 @@ For a browser-facing deployment, put Fileloom behind the exe.dev proxy or anothe
 
 ## Deploy on an exe.dev VM
 
+> **Experimental:** You can also use the button to start an exe.dev VM, clone this repository, and open the deployment instructions in Shelley.
+>
+> [![Deploy on exe.dev](https://raw.githubusercontent.com/boldsoftware/exe.dev/main/assets/buttons/deploy-on-exe-dev.png)](https://exe.dev/new?repo=https://github.com/jgbrwn/fileloom)
+
 1. Clone the repository into the VM.
 2. Copy `.env.example` to `.env` and set:
 
@@ -74,6 +80,34 @@ For a browser-facing deployment, put Fileloom behind the exe.dev proxy or anothe
    ```
 
 The service loads `.env` through systemd. The Go binary itself intentionally does not parse dotenv files. If `FILELOOM_OWNER_EMAIL` is missing, CMS access fails closed with a 404.
+
+## Comments (local Artalk sidecar installation)
+
+Comments are disabled by default. Fileloom supports a local Artalk sidecar on the same VM or an external Artalk server. Open the dashboard's **Community → Comments** panel to choose the connection and enable comments explicitly.
+
+For the recommended one-VM setup, run the idempotent installer from the repository:
+
+```bash
+sudo ./scripts/install-artalk.sh \
+  --site-key "my-fileloom-site"
+```
+
+The installer runs the pinned Artalk Go binary as `fileloom-artalk.service` on `127.0.0.1:23366`, stores its SQLite data outside the site workspace, and verifies the release checksum. Fileloom detects the running sidecar and preselects local mode. Public pages use the same-origin `/_fileloom/artalk` proxy; never configure `http://127.0.0.1:23366` as a browser-facing server URL. Installing the sidecar does not enable comments or create an Artalk admin account. See [docs/local-artalk.md](docs/local-artalk.md) for administrator setup, SSH access, upgrades, backups, and external mode.
+
+External mode stores a public Artalk URL:
+
+```json
+"comments": {
+  "enabled": true,
+  "provider": "artalk",
+  "server": "https://comments.example.com",
+  "site": "my-fileloom-site"
+}
+```
+
+Fileloom publishes a local, pinned Artalk client bundle (`2.10.0`) and a theme-aware bootstrap; it does not store comment data. Configure Artalk's trusted-domain/CORS, moderation, spam/rate limits, identity, email, privacy, and backup settings in Artalk itself. Pages and posts allow comments by default when the site switch is on, and the editor Details panel can opt individual documents out. Drafts, private items, not-yet-due scheduled items, archive pages, tag/category pages, and index pages do not receive a widget.
+
+Themes can override `--fileloom-theme-comments-*` CSS variables to match colors, borders, typography, radius, and shadows. Artalk client image uploads and remote emoticons are disabled by Fileloom's bootstrap by default. See [docs/comments-plan.md](docs/comments-plan.md) for the architecture and security boundary.
 
 ## Workspace layout
 
@@ -158,35 +192,6 @@ Remote credentials are never stored by Fileloom. Use SSH keys or a Git credentia
 ## Optional CSP profiles
 
 No CSP is enabled by default, preserving existing editor and theme behavior. To opt in, set `FILELOOM_CMS_CSP=default` for the CMS/editor profile and/or `FILELOOM_PUBLIC_CSP=default` for the generated-site profile. You can provide a complete policy value instead of `default`; public themes may require a customized policy for external assets or scripts. Direct SVG responses always receive a restrictive media policy.
-
-
-## Comments
-
-Comments are disabled by default. Fileloom supports a local Artalk sidecar on the same VM or an external Artalk server. Open the dashboard's **Community → Comments** panel to choose the connection and enable comments explicitly.
-
-For the recommended one-VM setup, run the idempotent installer from the repository:
-
-```bash
-sudo ./scripts/install-artalk.sh \
-  --site-key "my-fileloom-site"
-```
-
-The installer runs the pinned Artalk Go binary as `fileloom-artalk.service` on `127.0.0.1:23366`, stores its SQLite data outside the site workspace, and verifies the release checksum. Fileloom detects the running sidecar and preselects local mode. Public pages use the same-origin `/_fileloom/artalk` proxy; never configure `http://127.0.0.1:23366` as a browser-facing server URL. Installing the sidecar does not enable comments or create an Artalk admin account. See [docs/local-artalk.md](docs/local-artalk.md) for administrator setup, SSH access, upgrades, backups, and external mode.
-
-External mode stores a public Artalk URL:
-
-```json
-"comments": {
-  "enabled": true,
-  "provider": "artalk",
-  "server": "https://comments.example.com",
-  "site": "my-fileloom-site"
-}
-```
-
-Fileloom publishes a local, pinned Artalk client bundle (`2.10.0`) and a theme-aware bootstrap; it does not store comment data. Configure Artalk's trusted-domain/CORS, moderation, spam/rate limits, identity, email, privacy, and backup settings in Artalk itself. Pages and posts allow comments by default when the site switch is on, and the editor Details panel can opt individual documents out. Drafts, private items, not-yet-due scheduled items, archive pages, tag/category pages, and index pages do not receive a widget.
-
-Themes can override `--fileloom-theme-comments-*` CSS variables to match colors, borders, typography, radius, and shadows. Artalk client image uploads and remote emoticons are disabled by Fileloom's bootstrap by default. See [docs/comments-plan.md](docs/comments-plan.md) for the architecture and security boundary.
 
 
 The visual editor includes a **Code block** helper that creates a semantic `<pre><code>` pair with selectable languages. Deckflow now exposes a language/code sheet for insertion and editing; generated pages and in-memory theme previews use the dependency-free highlighter and theme-integrated CSS. Themes can override `--fileloom-code-*` variables in their stylesheet.
