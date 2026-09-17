@@ -2,7 +2,7 @@
 
 Fileloom keeps the Go server, filesystem source model, static build, themes, Exe.dev owner boundary, media API, revisions, and Git workflow. The editor is a replaceable browser client.
 
-> **Status — September 13, 2026:** The Deckflow migration is complete for content and theme-layout editing. New sites default to Deckflow, the checked-in browser suite covers desktop/tablet/Android-sized Chromium plus manual responsive smoke checks, and the legacy editor assets/routes have been removed.
+> **Status — September 17, 2026:** The Deckflow migration is complete for content and theme-layout editing. New sites default to Deckflow, the checked-in browser suite covers desktop/tablet/Android-sized Chromium plus manual responsive smoke checks, and the legacy editor assets/routes have been removed.
 
 | Migration slice | Status |
 | --- | --- |
@@ -13,7 +13,7 @@ Fileloom keeps the Go server, filesystem source model, static build, themes, Exe
 | Code blocks with language selector and public syntax highlighting | Responsive editor, reliable source-preserving updates, theme-driven styling, and public highlighting |
 | Metadata/status/revision controls inside new editor | Initial save/conflict/restore coverage now includes API and browser paths |
 | Theme layout/token editing | Done with protected-slot Deckflow theme mode and separate Style tokens workflow |
-| Browser/device regression suite | 81 Playwright tests across desktop, tablet, and Android-sized Chromium; full gate passed |
+| Browser/device regression suite | 93 Playwright cases across desktop, tablet, and Android-sized Chromium (90 pass; 3 optional CSP cases skip unless enabled) |
 | Legacy editor removal | Done |
 | Comments engine | Opt-in Artalk integration with local sidecar or external server modes, same-origin local proxy, site-level enablement, per-page/post opt-out, stable document IDs, local theme-aware client assets, and external-service security boundary; see `docs/comments-plan.md` and `docs/local-artalk.md` |
 
@@ -22,10 +22,10 @@ Fileloom keeps the Go server, filesystem source model, static build, themes, Exe
 The frontend source lives under `web/editor`; run `make editor-build` after changing it. The generated static bundle is checked into `web/editor-dist` so the Go service remains deployable without a Node runtime.
 
 - `site.json` selects `editor_engine: "deckflow"` for the active site.
-- `GET /_cms/api/editor?path=...` returns the content body fragment, document metadata, full-source SHA, theme CSS, preview URL, and available engines; `GET /_cms/api/editor?theme=...` returns a protected-slot theme-layout resource.
+- `GET /_cms/api/editor?path=...` returns the content body fragment, an exact raw `body_html` slice for source editing, document metadata, full-source SHA, theme CSS, preview URL, and available engines; `GET /_cms/api/editor?theme=...` returns a protected-slot theme-layout resource.
 - `POST /_cms/api/editor-save` accepts content and protected-slot theme-layout JSON resources with source preconditions and refreshed `source_sha256`/`ETag` responses. Metadata updates preserve unknown front matter and validate status/scheduling before rebuilding affected public output.
 - `POST /_cms/api/editor-preview` renders the current unsaved content body or protected-slot theme layout through the active theme in memory. It does not write source or `site/public`; the Deckflow Preview action opens this actual theme-applied render.
-- The content editor's **HTML source** action opens the body HTML directly without exposing or rewriting front matter or metadata. Apply HTML returns to the same Deckflow canvas; Save still uses the source-preserving SHA-guarded boundary.
+- The content editor's **HTML source** action opens the exact raw body HTML with CodeMirror HTML/mixed JavaScript/CSS highlighting, optional line wrapping, and no front matter or metadata exposure. Apply HTML returns to the same Deckflow canvas; Save still uses the source-preserving SHA-guarded boundary.
 
 ## Editor boundary
 
@@ -48,11 +48,11 @@ Deckflow supplies source-aware selection, text editing, structural edits, and un
 - Inline text editing preserves mixed child markup, supports range formatting, rejects structure-changing contenteditable edits, and now has desktop/tablet/Android-sized keyboard regression coverage. Native touch/soft-keyboard behavior still deserves device testing beyond Chromium emulation.
 - Theme-layout visual editing now uses the separate Deckflow theme-layout mode with protected template slots; CSS custom-property editing remains in the CMS Style tokens workflow.
 - Keyboard coverage exercises inline edit commit/cancel, mixed-markup structure rejection, keyboard save, ordered host undo/redo across inline and structural edits, duplicate/delete/clear-selection shortcuts, and desktop/mobile undo controls across all three browser profiles.
-- The media sheet handles images, file selection, drag/drop, selected-image replacement, and contextual placement. Generic JSON uploads, nested media paths, public serving, and generated asset coverage are now tested; batch/deferred builds and richer placement are next.
+- The media sheet handles images, MP4/WebM videos, file selection, playable metadata, drag/drop, selected-image/video replacement, URL-only validated YouTube insertion, contextual placement, and inert editor/preview markers. Generic JSON uploads, nested media paths, public serving, generated asset coverage, click-to-load behavior, and CSP gating are tested; batch/deferred builds and richer placement are next.
 - Deckflow does not edit front matter directly; Fileloom's Details sheet handles supported content metadata/status, while theme layouts and CSS tokens remain in the separate CMS workflow.
 - Preview renders the current body or protected-slot theme layout through the active theme in memory. Save/reload, conflict, revision restore, media, generated public output, theme preview, and preview non-mutation paths are covered by the regression suite.
 - No alternate editor engine query is supported; Deckflow is the only editor engine.
 
 Puck is not the canonical model for existing HTML pages. If a structured block-page format is added later, it should be opt-in for new content and have an explicit React/Node rendering strategy. Plumix is a UX and host-editor reference, not a dependency. Theme templates remain a separate workflow from content-body editing.
 
-**Gate status: passed.** The suite covers 81 browser cases across desktop, tablet, and Android-sized Chromium plus API coverage for content/theme save/reload/public output, stale conflicts, revisions, real media uploads, theme/public preview parity, preview non-mutation, keyboard editing, ordered undo/redo, HTML source editing, reliable code-block editing, theme-driven code styling, opt-in Artalk rendering/disablement, local Artalk setup instructions, and single-surface canvas scrolling. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts. Go tests, race tests, the production build, source-fidelity checks, and attribution review all pass.
+**Gate status: passed.** The suite covers 93 browser cases across desktop, tablet, and Android-sized Chromium (90 pass; the 3 opt-in CSP cases are skipped unless `FILELOOM_E2E_CSP` is enabled) plus API coverage for content/theme save/reload/public output, stale conflicts, revisions, real image/video media uploads, validated YouTube markers, click-to-load/no-preactivation behavior, theme/public preview parity, preview non-mutation, keyboard editing, ordered undo/redo, HTML source editing, reliable code-block editing, theme-driven code styling, opt-in Artalk rendering/disablement, local Artalk setup instructions, and single-surface canvas scrolling. Manual responsive smoke checks cover desktop, Pixel-sized Android, and iPhone-sized layouts. Go tests, race tests, the production build, source-fidelity checks, CSP behavior, and attribution review all pass.

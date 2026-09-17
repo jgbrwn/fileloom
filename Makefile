@@ -1,4 +1,4 @@
-.PHONY: build editor-build editor-test clean test run fmt
+.PHONY: build editor-build editor-test editor-test-csp editor-test-all clean test run fmt
 
 build:
 	go build -o fileloom ./cmd/fileloom
@@ -9,6 +9,11 @@ editor-build:
 
 editor-test:
 	npm run test:e2e --prefix web/editor
+
+editor-test-csp:
+	FILELOOM_E2E_CSP=default npm run test:e2e --prefix web/editor
+
+editor-test-all: editor-test editor-test-csp
 
 run:
 	go run ./cmd/fileloom

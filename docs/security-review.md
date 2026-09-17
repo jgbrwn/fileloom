@@ -1,6 +1,6 @@
 # Fileloom security review
 
-Review date: September 14, 2026
+Review date: September 17, 2026
 
 ## Current protections
 
@@ -11,7 +11,7 @@ Review date: September 14, 2026
 - HTTP server read-header/read/write/idle timeouts, bounded CMS mutation admission, and request-body limits prevent unbounded request accumulation.
 - Content, theme, media, revision, Git, and generated-asset paths reject symlinked components and non-regular files. Configured theme names are validated before use.
 - Builds use a staging directory and a publication lock, so readers do not observe an incomplete directory swap. Mutations that require a build roll back source/config/media changes when the build fails. Scheduled publishing restores scheduled sources when the resulting build fails.
-- SVG uploads are XML-sanitized with an allowlist, temporary-file staging, and a restrictive SVG/media response policy. Other allowed media formats remain byte-preserving.
+- SVG uploads are XML-sanitized with an allowlist, temporary-file staging, and a restrictive SVG/media response policy. Other allowed media formats remain byte-preserving. Local MP4/WebM video playback stays same-origin; YouTube insertion accepts only validated HTTPS IDs and renders a fixed `youtube-nocookie.com` click-to-load target without preactivation requests.
 - ZIP export is POST-only and bounded by file count, compressed size, uncompressed size, and per-file size; source, revisions, Git metadata, secrets, symlinks, and private metadata paths are excluded.
 - Revisions are filesystem snapshots with atomic writes, checksums, per-path retention of 100 snapshots, and a 128 MiB workspace budget.
 - CMS mutations emit structured `slog` audit events with actor, action, route, status, and result without request bodies or credentials.
@@ -53,11 +53,11 @@ Automatic push remains opt-in. Effective fetch and push URLs are validated, but 
 
 ### 4. Operational follow-up
 
-Build and Git operations are bounded where they invoke external Git commands and HTTP requests have server timeouts. A future pass can add explicit context cancellation through filesystem builds and move optional Git synchronization fully outside mutation/build locks; these changes should be tested carefully because Git automation is existing functionality.
+Build and Git operations are bounded where they invoke external Git commands and HTTP requests have server timeouts. Automatic Git commit/push is queued after successful builds or configured changes, serialized independently from mutation/build/publication locks, and coalesces changes that arrive during a run; a separate workspace coordination lock prevents it from committing transient mutation state. Manual Git actions remain synchronous. Pending and last-error state is exposed in Git status. Filesystem builds now accept cancellable contexts, observe cancellation during admission, filesystem I/O, rendering, and checks, and preserve the previous public output until the atomic publication swap begins.
 
 ### 5. CSP compatibility testing
 
-CSP profiles are opt-in. Test the CMS/editor profile with Deckflow, theme-layout editing, media upload, editor frames, and mobile controls. Test the public profile against each supported theme and document any external resources that require a custom policy. Do not enable a restrictive global CSP by default.
+CSP profiles are opt-in. `make editor-test-csp` runs the CMS/editor profile with Deckflow, theme-layout editing, media upload, editor frames, mobile controls, and all six built-in public themes while capturing browser CSP violations. `make editor-test-all` runs both the normal and CSP matrices. Fileloom adds only `https://www.youtube-nocookie.com` to public `frame-src` when a valid YouTube marker is present; no YouTube source is added to CMS CSP and no restrictive global CSP is enabled by default.
 
 ### 6. Deployment test matrix
 

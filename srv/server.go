@@ -53,6 +53,8 @@ const (
 	maxHTTPReadDuration        = 2 * time.Minute
 	maxHTTPWriteDuration       = 5 * time.Minute
 	maxHTTPIdleDuration        = 2 * time.Minute
+	buildIOChunkSize           = 64 << 10
+	maxBackgroundBuildDuration = 5 * time.Minute
 )
 
 type Server struct {
@@ -63,12 +65,29 @@ type Server struct {
 	CMSCSP          string
 	PublicCSP       string
 
-	mu            sync.RWMutex
-	publicMu      sync.RWMutex
-	writeMu       sync.Mutex
-	lastBuild     BuildResult
-	scheduler     sync.Once
-	mutationSlots chan struct{}
+	mu             sync.RWMutex
+	publicMu       sync.RWMutex
+	writeMu        sync.Mutex
+	gitMu          sync.Mutex
+	gitWorkspaceMu sync.RWMutex
+	gitQueueMu     sync.Mutex
+	lastBuild      BuildResult
+	scheduler      sync.Once
+	buildGate      chan struct{}
+	buildGateInit  sync.Once
+	// buildPhaseHook is an internal package-test seam for deterministic cancellation tests.
+	buildPhaseHookMu     sync.RWMutex
+	buildPhaseHook       func(string)
+	mutationSlots        chan struct{}
+	gitRunner            gitCommandRunner
+	gitSyncRunning       bool
+	gitSyncPending       bool
+	gitSyncMessage       string
+	gitSyncLastError     string
+	gitSyncLastErrorAt   time.Time
+	gitSyncLastSuccessAt time.Time
+	gitStatusCache       GitStatus
+	gitStatusCacheValid  bool
 }
 
 type SiteConfig struct {
@@ -117,14 +136,19 @@ type ThemeInfo struct {
 }
 
 type GitStatus struct {
-	Available  bool   `json:"available"`
-	Repo       string `json:"repo"`
-	Branch     string `json:"branch"`
-	Remote     string `json:"remote"`
-	RemoteName string `json:"remote_name"`
-	Clean      bool   `json:"clean"`
-	Changes    int    `json:"changes"`
-	Error      string `json:"error,omitempty"`
+	Available     bool   `json:"available"`
+	Repo          string `json:"repo"`
+	Branch        string `json:"branch"`
+	Remote        string `json:"remote"`
+	RemoteName    string `json:"remote_name"`
+	Clean         bool   `json:"clean"`
+	Changes       int    `json:"changes"`
+	Error         string `json:"error,omitempty"`
+	Pending       bool   `json:"pending"`
+	Running       bool   `json:"running"`
+	LastError     string `json:"last_error,omitempty"`
+	LastErrorAt   string `json:"last_error_at,omitempty"`
+	LastSuccessAt string `json:"last_success_at,omitempty"`
 }
 
 type Document struct {
@@ -171,6 +195,7 @@ type Revision struct {
 type sourceDocument struct {
 	Document
 	Source       []byte
+	BodyHTML     string
 	BodyStart    int
 	FrontMatter  bool
 	MetaValuePos map[string][2]int
@@ -360,6 +385,7 @@ func NewWithOptions(siteDir, webDir, ownerEmail, baseURL string) (*Server, error
 		BaseURLOverride: strings.TrimSpace(baseURL),
 		CMSCSP:          configuredCSP(os.Getenv("FILELOOM_CMS_CSP"), defaultCMSCSP),
 		PublicCSP:       configuredCSP(os.Getenv("FILELOOM_PUBLIC_CSP"), defaultPublicCSP),
+		buildGate:       make(chan struct{}, 1),
 		mutationSlots:   make(chan struct{}, maxConcurrentCMSMutations),
 	}
 	if err := s.ensureSite(); err != nil {
@@ -491,6 +517,13 @@ func writeIfMissing(path string, contents []byte) error {
 }
 
 func (s *Server) loadSiteConfig() (SiteConfig, error) {
+	return s.loadSiteConfigContext(context.Background())
+}
+
+func (s *Server) loadSiteConfigContext(ctx context.Context) (SiteConfig, error) {
+	if err := contextErr(ctx); err != nil {
+		return SiteConfig{}, err
+	}
 	config := SiteConfig{
 		Title:        "A Fileloom site",
 		Description:  "An HTML-first static site made with Fileloom.",
@@ -511,7 +544,7 @@ func (s *Server) loadSiteConfig() (SiteConfig, error) {
 	if !info.Mode().IsRegular() {
 		return config, errors.New("site.json must be a regular file")
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFileContext(ctx, path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return config, nil
@@ -553,16 +586,29 @@ func (s *Server) loadSiteConfig() (SiteConfig, error) {
 }
 
 func (s *Server) listDocuments() ([]Document, error) {
+	return s.listDocumentsContext(context.Background())
+}
+
+func (s *Server) listDocumentsContext(ctx context.Context) ([]Document, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	root := filepath.Join(s.SiteDir, "content")
 	rootInfo, err := os.Lstat(root)
 	if err != nil {
 		return nil, fmt.Errorf("content root is not accessible: %w", err)
+	}
+	if canceled := contextErr(ctx); canceled != nil {
+		return nil, canceled
 	}
 	if !rootInfo.IsDir() {
 		return nil, errors.New("content root must be a directory")
 	}
 	var docs []Document
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if canceled := contextErr(ctx); canceled != nil {
+			return canceled
+		}
 		if err != nil {
 			return err
 		}
@@ -579,12 +625,15 @@ func (s *Server) listDocuments() ([]Document, error) {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("non-regular content file is not allowed: %s", path)
 		}
-		data, err := os.ReadFile(path)
+		data, err := readFileContext(ctx, path)
 		if err != nil {
 			return err
 		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
+			return err
+		}
+		if err := contextErr(ctx); err != nil {
 			return err
 		}
 		doc, err := parseDocument(filepath.ToSlash(rel), data, info.ModTime())
@@ -597,55 +646,111 @@ func (s *Server) listDocuments() ([]Document, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list content: %w", err)
 	}
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	sort.SliceStable(docs, func(i, j int) bool {
 		if docs[i].Date == docs[j].Date {
 			return docs[i].Path < docs[j].Path
 		}
 		return docs[i].Date > docs[j].Date
 	})
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	return docs, nil
 }
 
+type sourceBackup struct {
+	path string
+	data []byte
+}
+
+func restoreSourceBackups(siteDir string, backups []sourceBackup) error {
+	var firstErr error
+	for index := len(backups) - 1; index >= 0; index-- {
+		backup := backups[index]
+		path, err := safeWorkspacePath(filepath.Join(siteDir, "content"), backup.path)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := writeAtomicFile(path, backup.data); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 func (s *Server) backfillDocumentIDs() (int, error) {
-	docs, err := s.listDocuments()
+	assigned, _, err := s.backfillDocumentIDsTransactionalContext(context.Background())
+	return assigned, err
+}
+
+func (s *Server) backfillDocumentIDsContext(ctx context.Context) (int, error) {
+	assigned, _, err := s.backfillDocumentIDsTransactionalContext(ctx)
+	return assigned, err
+}
+
+func (s *Server) backfillDocumentIDsTransactionalContext(ctx context.Context) (assigned int, backups []sourceBackup, err error) {
+	defer func() {
+		if err == nil || len(backups) == 0 {
+			return
+		}
+		if rollbackErr := restoreSourceBackups(s.SiteDir, backups); rollbackErr != nil {
+			err = fmt.Errorf("%w; document ID rollback failed: %v", err, rollbackErr)
+		}
+	}()
+	docs, err := s.listDocumentsContext(ctx)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	seen := make(map[string]string, len(docs))
-	assigned := 0
 	for _, doc := range docs {
+		if err := contextErr(ctx); err != nil {
+			return assigned, backups, err
+		}
 		id := strings.ToLower(strings.TrimSpace(doc.ID))
 		if id != "" && !validDocumentID(id) {
-			return assigned, fmt.Errorf("%s has an invalid document id; expected a UUID", doc.Path)
+			return assigned, backups, fmt.Errorf("%s has an invalid document id; expected a UUID", doc.Path)
 		}
 		if id != "" {
 			if previous, ok := seen[id]; ok {
-				return assigned, fmt.Errorf("documents %s and %s share document id %s; IDs must be unique", previous, doc.Path, id)
+				return assigned, backups, fmt.Errorf("documents %s and %s share document id %s; IDs must be unique", previous, doc.Path, id)
 			}
 			seen[id] = doc.Path
 			continue
 		}
-		source, err := s.loadSourceDocument(doc.Path)
+		source, err := s.loadSourceDocumentContext(ctx, doc.Path)
 		if err != nil {
-			return assigned, err
+			return assigned, backups, err
 		}
 		id, err = newDocumentID()
 		if err != nil {
-			return assigned, err
+			return assigned, backups, err
 		}
 		updated := patchFrontMatter(source.Source, map[string]string{"id": id})
 		filePath, err := safeWorkspacePath(filepath.Join(s.SiteDir, "content"), doc.Path)
 		if err != nil {
-			return assigned, err
+			return assigned, backups, err
 		}
-		if err := writeAtomicFile(filePath, updated); err != nil {
-			return assigned, fmt.Errorf("assign document id to %s: %w", doc.Path, err)
+		if err := contextErr(ctx); err != nil {
+			return assigned, backups, err
 		}
+		if err := writeAtomicFileContext(ctx, filePath, updated); err != nil {
+			return assigned, backups, fmt.Errorf("assign document id to %s: %w", doc.Path, err)
+		}
+		backups = append(backups, sourceBackup{path: doc.Path, data: append([]byte(nil), source.Source...)})
 		slog.Info("assigned stable Fileloom document id", "path", doc.Path, "id", id)
 		seen[id] = doc.Path
 		assigned++
 	}
-	return assigned, nil
+	if err := contextErr(ctx); err != nil {
+		return assigned, backups, err
+	}
+	return assigned, backups, nil
 }
 
 func parseDocument(rel string, data []byte, modified time.Time) (Document, error) {
@@ -693,7 +798,7 @@ func parseSourceDocument(rel string, data []byte, modified time.Time) (sourceDoc
 		doc.Excerpt = excerptFromHTML(doc.HTML)
 	}
 	doc.URL = documentURL(doc)
-	return sourceDocument{Document: doc, Source: append([]byte(nil), data...), BodyStart: bodyStart, FrontMatter: hasFrontMatter, MetaValuePos: positions}, nil
+	return sourceDocument{Document: doc, Source: append([]byte(nil), data...), BodyHTML: body, BodyStart: bodyStart, FrontMatter: hasFrontMatter, MetaValuePos: positions}, nil
 }
 
 func parseFrontMatter(source string) (map[string]string, string) {
@@ -1030,6 +1135,13 @@ func excerptFromHTML(source string) string {
 }
 
 func (s *Server) loadDocument(value string) (Document, error) {
+	return s.loadDocumentContext(context.Background(), value)
+}
+
+func (s *Server) loadDocumentContext(ctx context.Context, value string) (Document, error) {
+	if err := contextErr(ctx); err != nil {
+		return Document{}, err
+	}
 	rel, err := normalizeContentPath(value)
 	if err != nil {
 		return Document{}, err
@@ -1041,7 +1153,7 @@ func (s *Server) loadDocument(value string) (Document, error) {
 	if !info.Mode().IsRegular() {
 		return Document{}, errors.New("content file must be regular")
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFileContext(ctx, path)
 	if err != nil {
 		return Document{}, err
 	}
@@ -1049,10 +1161,20 @@ func (s *Server) loadDocument(value string) (Document, error) {
 	if err != nil {
 		return Document{}, err
 	}
+	if err := contextErr(ctx); err != nil {
+		return Document{}, err
+	}
 	return parseDocument(rel, data, info.ModTime())
 }
 
 func (s *Server) loadSourceDocument(value string) (sourceDocument, error) {
+	return s.loadSourceDocumentContext(context.Background(), value)
+}
+
+func (s *Server) loadSourceDocumentContext(ctx context.Context, value string) (sourceDocument, error) {
+	if err := contextErr(ctx); err != nil {
+		return sourceDocument{}, err
+	}
 	rel, err := normalizeContentPath(value)
 	if err != nil {
 		return sourceDocument{}, err
@@ -1064,12 +1186,15 @@ func (s *Server) loadSourceDocument(value string) (sourceDocument, error) {
 	if !info.Mode().IsRegular() {
 		return sourceDocument{}, errors.New("content file must be regular")
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFileContext(ctx, path)
 	if err != nil {
 		return sourceDocument{}, err
 	}
 	info, err = os.Stat(path)
 	if err != nil {
+		return sourceDocument{}, err
+	}
+	if err := contextErr(ctx); err != nil {
 		return sourceDocument{}, err
 	}
 	return parseSourceDocument(rel, data, info.ModTime())
@@ -1085,11 +1210,107 @@ func fileSHA256(filePath string) string {
 	if err != nil || !info.Mode().IsRegular() {
 		return ""
 	}
-	data, err := os.ReadFile(filePath)
+	data, err := readFileContext(context.Background(), filePath)
 	if err != nil {
 		return ""
 	}
 	return sourceSHA256(data)
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
+
+// readFileContext deliberately reads in bounded chunks so a long filesystem
+// read can observe cancellation without waiting for the whole file to be
+// buffered. The normal readFile callers use a background context and retain
+// the old behavior.
+func readFileContext(ctx context.Context, filePath string) ([]byte, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var contents bytes.Buffer
+	buffer := make([]byte, buildIOChunkSize)
+	for {
+		if err := contextErr(ctx); err != nil {
+			return nil, err
+		}
+		read, readErr := file.Read(buffer)
+		if read > 0 {
+			if err := contextErr(ctx); err != nil {
+				return nil, err
+			}
+			_, _ = contents.Write(buffer[:read])
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	return contents.Bytes(), nil
+}
+
+func writeFileContext(ctx context.Context, filePath string, contents []byte, mode os.FileMode) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+	}()
+	for offset := 0; offset < len(contents); {
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
+		end := offset + buildIOChunkSize
+		if end > len(contents) {
+			end = len(contents)
+		}
+		written, writeErr := file.Write(contents[offset:end])
+		if written > 0 {
+			offset += written
+		}
+		if writeErr != nil {
+			return writeErr
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		closed = true
+		return err
+	}
+	closed = true
+	return nil
 }
 
 type sourceConflictError struct {
@@ -1118,6 +1339,7 @@ type editorSaveRequest struct {
 	Path     string               `json:"path"`
 	File     string               `json:"file"`
 	HTML     string               `json:"html"`
+	BodyHTML *string              `json:"body_html,omitempty"`
 	BaseSHA  string               `json:"base_sha256"`
 	Engine   string               `json:"engine,omitempty"`
 	Theme    string               `json:"theme,omitempty"`
@@ -1129,6 +1351,7 @@ type editorPreviewRequest struct {
 	Path     string               `json:"path"`
 	Theme    string               `json:"theme,omitempty"`
 	HTML     string               `json:"html"`
+	BodyHTML *string              `json:"body_html,omitempty"`
 	Metadata *editorMetadataInput `json:"metadata,omitempty"`
 }
 
@@ -1139,6 +1362,7 @@ type editorDocumentResponse struct {
 	Document      Document       `json:"document"`
 	Comments      CommentsConfig `json:"comments"`
 	HTML          string         `json:"html"`
+	BodyHTML      string         `json:"body_html"`
 	SourceSHA256  string         `json:"source_sha256"`
 	PreviewURL    string         `json:"preview_url"`
 	PreviewAPI    string         `json:"preview_api"`
@@ -1281,6 +1505,13 @@ func requestPreconditionSHA(r *http.Request, field string) string {
 }
 
 func writeAtomicFile(path string, data []byte) error {
+	return writeAtomicFileContext(context.Background(), path, data)
+}
+
+func writeAtomicFileContext(ctx context.Context, path string, data []byte) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -1294,11 +1525,13 @@ func writeAtomicFile(path string, data []byte) error {
 		_ = tmp.Close()
 		return err
 	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
+	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := tmp.Close(); err != nil {
+	if err := writeFileContext(ctx, tmpName, data, 0o644); err != nil {
+		return err
+	}
+	if err := contextErr(ctx); err != nil {
 		return err
 	}
 	return os.Rename(tmpName, path)
@@ -1311,6 +1544,16 @@ func patchSourceBody(source []byte, bodyStart int, body string) []byte {
 	body = strings.TrimSpace(body)
 	if body != "" {
 		body += "\n"
+	}
+	patched := make([]byte, 0, bodyStart+len(body))
+	patched = append(patched, source[:bodyStart]...)
+	patched = append(patched, body...)
+	return patched
+}
+
+func patchSourceBodyExact(source []byte, bodyStart int, body string) []byte {
+	if bodyStart < 0 || bodyStart > len(source) {
+		return append([]byte(nil), source...)
 	}
 	patched := make([]byte, 0, bodyStart+len(body))
 	patched = append(patched, source[:bodyStart]...)
@@ -1396,6 +1639,14 @@ func parseFrontMatterSourceOffsets(source string) (int, int, int, map[string][2]
 }
 
 func (s *Server) patchDocumentSource(pathValue string, body string, patchBody bool, metadata map[string]string, baseSHA, reason string) (Document, error) {
+	return s.patchDocumentSourceWithMode(pathValue, body, patchBody, false, metadata, baseSHA, reason)
+}
+
+func (s *Server) patchDocumentSourceExact(pathValue string, body string, metadata map[string]string, baseSHA, reason string) (Document, error) {
+	return s.patchDocumentSourceWithMode(pathValue, body, true, true, metadata, baseSHA, reason)
+}
+
+func (s *Server) patchDocumentSourceWithMode(pathValue string, body string, patchBody, exactBody bool, metadata map[string]string, baseSHA, reason string) (Document, error) {
 	source, err := s.loadSourceDocument(pathValue)
 	if err != nil {
 		return Document{}, err
@@ -1409,7 +1660,11 @@ func (s *Server) patchDocumentSource(pathValue string, body string, patchBody bo
 	}
 	patched := source.Source
 	if patchBody {
-		patched = patchSourceBody(patched, source.BodyStart, body)
+		if exactBody {
+			patched = patchSourceBodyExact(patched, source.BodyStart, body)
+		} else {
+			patched = patchSourceBody(patched, source.BodyStart, body)
+		}
 	}
 	if len(metadata) > 0 {
 		patched = patchFrontMatter(patched, metadata)
@@ -1746,30 +2001,150 @@ func (s *Server) restoreRevision(rel, id string) (Document, error) {
 	}
 	return s.loadDocument(rel)
 }
+func (s *Server) ensureBuildGate() chan struct{} {
+	s.buildGateInit.Do(func() {
+		if s.buildGate == nil {
+			s.buildGate = make(chan struct{}, 1)
+		}
+	})
+	return s.buildGate
+}
+
+func (s *Server) setBuildPhaseHook(hook func(string)) {
+	s.buildPhaseHookMu.Lock()
+	s.buildPhaseHook = hook
+	s.buildPhaseHookMu.Unlock()
+}
+
+func (s *Server) checkBuildPhase(ctx context.Context, phase string) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	s.buildPhaseHookMu.RLock()
+	hook := s.buildPhaseHook
+	s.buildPhaseHookMu.RUnlock()
+	if hook != nil {
+		hook(phase)
+	}
+	return contextErr(ctx)
+}
+
+func (s *Server) acquireBuild(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case s.ensureBuildGate() <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) releaseBuild() {
+	gate := s.ensureBuildGate()
+	<-gate
+}
+
+func (s *Server) acquirePublicBuildLock(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
+		if s.publicMu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func (s *Server) Build() (BuildResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buildLocked()
+	return s.BuildContext(context.Background())
+}
+
+func (s *Server) BuildContext(ctx context.Context) (BuildResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.acquireWorkspaceReadContext(ctx); err != nil {
+		return BuildResult{}, err
+	}
+	defer s.gitWorkspaceMu.RUnlock()
+	return s.buildContextWithWorkspace(ctx)
+}
+
+func (s *Server) buildContextWithWorkspace(ctx context.Context) (BuildResult, error) {
+	if err := s.acquireBuild(ctx); err != nil {
+		return BuildResult{}, err
+	}
+	result, err := func() (BuildResult, error) {
+		defer s.releaseBuild()
+		return s.buildLockedContext(ctx)
+	}()
+	if err == nil {
+		// Queue only after the build lock is released. The worker performs all
+		// Git I/O independently of mutation, build, and publication locks.
+		s.gitBuildIfConfigured("Build Fileloom site")
+	}
+	return result, err
 }
 
 func (s *Server) buildLocked() (BuildResult, error) {
-	config, err := s.loadSiteConfig()
+	return s.BuildContext(context.Background())
+}
+
+func (s *Server) buildLockedContext(ctx context.Context) (BuildResult, error) {
+	if err := contextErr(ctx); err != nil {
+		return BuildResult{}, err
+	}
+	var documentIDBackups []sourceBackup
+	documentIDsCommitted := false
+	defer func() {
+		if documentIDsCommitted || len(documentIDBackups) == 0 {
+			return
+		}
+		if rollbackErr := restoreSourceBackups(s.SiteDir, documentIDBackups); rollbackErr != nil {
+			slog.Warn("document ID rollback failed after failed build", "error", rollbackErr)
+		}
+	}()
+	config, err := s.loadSiteConfigContext(ctx)
 	if err != nil {
 		return BuildResult{}, err
 	}
 	if config.Comments.Enabled {
-		if _, err := s.backfillDocumentIDs(); err != nil {
+		_, documentIDBackups, err = s.backfillDocumentIDsTransactionalContext(ctx)
+		if err != nil {
 			return BuildResult{}, fmt.Errorf("comments document IDs: %w", err)
 		}
 	}
-	docs, err := s.listDocuments()
+	docs, err := s.listDocumentsContext(ctx)
 	if err != nil {
+		return BuildResult{}, err
+	}
+	if err := contextErr(ctx); err != nil {
 		return BuildResult{}, err
 	}
 	now := time.Now().UTC()
 	published := make([]Document, 0, len(docs))
 	var pages, posts []Document
 	for _, doc := range docs {
+		if err := contextErr(ctx); err != nil {
+			return BuildResult{}, err
+		}
 		if !documentIsPublishable(doc, now) {
 			continue
 		}
@@ -1782,13 +2157,26 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	}
 	sort.SliceStable(posts, func(i, j int) bool { return posts[i].Date > posts[j].Date })
 	sort.SliceStable(pages, func(i, j int) bool { return pages[i].Path < pages[j].Path })
+	if err := contextErr(ctx); err != nil {
+		return BuildResult{}, err
+	}
 
 	publicDir := filepath.Join(s.SiteDir, "public")
 	outputDir, err := os.MkdirTemp(s.SiteDir, ".fileloom-build-*")
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("create build directory: %w", err)
 	}
-	defer os.RemoveAll(outputDir)
+	// Staging cleanup is deliberately not tied to ctx: a canceled build must
+	// remove every partial stage before returning, while the previous public
+	// directory remains untouched.
+	defer func() {
+		if cleanupErr := os.RemoveAll(outputDir); cleanupErr != nil {
+			slog.Warn("remove canceled build staging directory failed", "path", outputDir, "error", cleanupErr)
+		}
+	}()
+	if err := contextErr(ctx); err != nil {
+		return BuildResult{}, err
+	}
 	themeDir, themeInfo, err := safeResolvedPath(filepath.Join(s.SiteDir, "themes"), config.Theme)
 	if err != nil || !themeInfo.IsDir() {
 		if err != nil {
@@ -1796,22 +2184,34 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		}
 		return BuildResult{}, fmt.Errorf("theme %q is not a directory", config.Theme)
 	}
+	if err := contextErr(ctx); err != nil {
+		return BuildResult{}, err
+	}
 	themeStylesheetURL := fmt.Sprintf("/theme/style.css?v=%d", time.Now().UnixNano())
-	if err := copyDir(filepath.Join(themeDir, "assets"), filepath.Join(outputDir, "theme")); err != nil {
+	if err := copyDirContext(ctx, filepath.Join(themeDir, "assets"), filepath.Join(outputDir, "theme")); err != nil {
 		return BuildResult{}, fmt.Errorf("copy theme assets: %w", err)
 	}
-	if err := copyDir(filepath.Join(s.SiteDir, "media"), filepath.Join(outputDir, "media")); err != nil {
+	if err := copyDirContext(ctx, filepath.Join(s.SiteDir, "media"), filepath.Join(outputDir, "media")); err != nil {
 		return BuildResult{}, fmt.Errorf("copy media: %w", err)
 	}
-	for _, asset := range []string{"fileloom-code.css", "fileloom-code.js"} {
-		data, assetErr := readWebAsset(s.WebDir, asset)
+	if err := s.checkBuildPhase(ctx, "after-copy"); err != nil {
+		return BuildResult{}, err
+	}
+	for _, asset := range []string{"fileloom-code.css", "fileloom-code.js", "fileloom-media.css", "fileloom-media.js"} {
+		if err := contextErr(ctx); err != nil {
+			return BuildResult{}, err
+		}
+		data, assetErr := readWebAssetContext(ctx, s.WebDir, asset)
 		if errors.Is(assetErr, os.ErrNotExist) {
+			if canceled := contextErr(ctx); canceled != nil {
+				return BuildResult{}, canceled
+			}
 			continue
 		}
 		if assetErr != nil {
-			return BuildResult{}, fmt.Errorf("read Fileloom code asset %s: %w", asset, assetErr)
+			return BuildResult{}, fmt.Errorf("read Fileloom media/code asset %s: %w", asset, assetErr)
 		}
-		if err := writePublic(filepath.Join(outputDir, "theme", asset), string(data)); err != nil {
+		if err := writePublicContext(ctx, filepath.Join(outputDir, "theme", asset), string(data)); err != nil {
 			return BuildResult{}, err
 		}
 	}
@@ -1822,73 +2222,112 @@ func (s *Server) buildLocked() (BuildResult, error) {
 			{source: "fileloom-comments.css", target: "fileloom-comments.css"},
 			{source: "fileloom-comments.js", target: "fileloom-comments.js"},
 		} {
-			data, assetErr := readWebAsset(s.WebDir, asset.source)
+			if err := contextErr(ctx); err != nil {
+				return BuildResult{}, err
+			}
+			data, assetErr := readWebAssetContext(ctx, s.WebDir, asset.source)
 			if assetErr != nil {
 				return BuildResult{}, fmt.Errorf("read comments asset %s: %w", asset.source, assetErr)
 			}
-			if err := writePublic(filepath.Join(outputDir, "theme", asset.target), string(data)); err != nil {
+			if err := writePublicContext(ctx, filepath.Join(outputDir, "theme", asset.target), string(data)); err != nil {
 				return BuildResult{}, err
 			}
 		}
 	}
 
-	layout, err := readThemeTemplateSafe(themeDir, "layout.html", defaultLayoutTemplate)
+	layout, err := readThemeTemplateSafeContext(ctx, themeDir, "layout.html", defaultLayoutTemplate)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("read theme layout: %w", err)
 	}
-	indexTemplate, err := readThemeTemplateSafe(themeDir, "index.html", defaultIndexTemplate)
+	indexTemplate, err := readThemeTemplateSafeContext(ctx, themeDir, "index.html", defaultIndexTemplate)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("read theme index: %w", err)
 	}
-	postTemplate, err := readThemeTemplateSafe(themeDir, "post.html", defaultPostTemplate)
+	postTemplate, err := readThemeTemplateSafeContext(ctx, themeDir, "post.html", defaultPostTemplate)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("read theme post: %w", err)
 	}
-	pageTemplate, err := readThemeTemplateSafe(themeDir, "page.html", defaultPageTemplate)
+	pageTemplate, err := readThemeTemplateSafeContext(ctx, themeDir, "page.html", defaultPageTemplate)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("read theme page: %w", err)
 	}
-	tagTemplate, err := readThemeTemplateSafe(themeDir, "tag.html", defaultTagTemplate)
+	tagTemplate, err := readThemeTemplateSafeContext(ctx, themeDir, "tag.html", defaultTagTemplate)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("read theme tag: %w", err)
 	}
-	categoryTemplate, err := readThemeTemplateSafe(themeDir, "category.html", defaultCategoryTemplate)
+	categoryTemplate, err := readThemeTemplateSafeContext(ctx, themeDir, "category.html", defaultCategoryTemplate)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("read theme category: %w", err)
 	}
-	archiveTemplate, err := readThemeTemplateSafe(themeDir, "archive.html", defaultArchiveTemplate)
+	archiveTemplate, err := readThemeTemplateSafeContext(ctx, themeDir, "archive.html", defaultArchiveTemplate)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("read theme archive: %w", err)
 	}
-	navigation := navigationHTML(pages)
-	postCards := postCardsHTML(posts)
+	navigation, err := navigationHTMLContext(ctx, pages)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	postCards, err := postCardsHTMLContext(ctx, posts)
+	if err != nil {
+		return BuildResult{}, err
+	}
 
 	indexDoc := Document{Type: "page", Title: config.Title, Date: time.Now().Format(dateFormat), URL: "/"}
-	indexValues := templateValues(indexDoc, config, navigation, postCards)
+	indexValues, err := templateValuesContext(ctx, indexDoc, config, navigation, postCards)
+	if err != nil {
+		return BuildResult{}, err
+	}
 	indexValues["theme.css"] = themeStylesheetURL
-	indexValues["content"] = applyTokens(indexTemplate, indexValues)
-	indexOutput := applyTokens(layout, indexValues)
-	if err := writePublic(filepath.Join(outputDir, "index.html"), indexOutput); err != nil {
+	if err := contextErr(ctx); err != nil {
+		return BuildResult{}, err
+	}
+	indexValues["content"], err = applyTokensContext(ctx, indexTemplate, indexValues)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	indexOutput, err := applyTokensContext(ctx, layout, indexValues)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	if err := writePublicContext(ctx, filepath.Join(outputDir, "index.html"), indexOutput); err != nil {
 		return BuildResult{}, err
 	}
 
 	files := 1
 	for _, doc := range published {
-		values := templateValues(doc, config, navigation, postCards)
+		if err := contextErr(ctx); err != nil {
+			return BuildResult{}, err
+		}
+		values, err := templateValuesContext(ctx, doc, config, navigation, postCards)
+		if err != nil {
+			return BuildResult{}, err
+		}
 		values["theme.css"] = themeStylesheetURL
-		values["content"] = doc.HTML
+		values["content"], err = renderFileloomMediaContext(ctx, doc.HTML, fileloomMediaPublic)
+		if err != nil {
+			return BuildResult{}, err
+		}
 		bodyTemplate := pageTemplate
 		if doc.Type == "post" {
 			bodyTemplate = postTemplate
 		}
-		body := renderDocumentBody(bodyTemplate, values, commentsWidgetHTML(config, doc))
+		body, err := renderDocumentBodyContext(ctx, bodyTemplate, values, commentsWidgetHTML(config, doc))
+		if err != nil {
+			return BuildResult{}, err
+		}
 		values["content"] = body
-		output := applyTokens(layout, values)
+		if err := contextErr(ctx); err != nil {
+			return BuildResult{}, err
+		}
+		output, err := applyTokensContext(ctx, layout, values)
+		if err != nil {
+			return BuildResult{}, err
+		}
 		outputPath := filepath.Join(outputDir, filepath.FromSlash(strings.TrimPrefix(doc.URL, "/")), "index.html")
 		if doc.URL == "/" {
 			outputPath = filepath.Join(outputDir, "index.html")
 		}
-		if err := writePublic(outputPath, output); err != nil {
+		if err := writePublicContext(ctx, outputPath, output); err != nil {
 			return BuildResult{}, err
 		}
 		files++
@@ -1898,7 +2337,13 @@ func (s *Server) buildLocked() (BuildResult, error) {
 	categoryMap := map[string][]Document{}
 	yearMap := map[string][]Document{}
 	for _, post := range posts {
+		if err := contextErr(ctx); err != nil {
+			return BuildResult{}, err
+		}
 		for _, tag := range post.Tags {
+			if err := contextErr(ctx); err != nil {
+				return BuildResult{}, err
+			}
 			key := strings.ToLower(strings.TrimSpace(tag))
 			if key != "" {
 				tagMap[key] = append(tagMap[key], post)
@@ -1916,9 +2361,15 @@ func (s *Server) buildLocked() (BuildResult, error) {
 		}
 	}
 	for tag, tagPosts := range tagMap {
+		if err := contextErr(ctx); err != nil {
+			return BuildResult{}, err
+		}
 		tagName := tag
 		if len(tagPosts) > 0 {
 			for _, candidate := range tagPosts[0].Tags {
+				if err := contextErr(ctx); err != nil {
+					return BuildResult{}, err
+				}
 				if strings.EqualFold(candidate, tag) {
 					tagName = candidate
 					break
@@ -1926,74 +2377,140 @@ func (s *Server) buildLocked() (BuildResult, error) {
 			}
 		}
 		doc := Document{Type: "page", Title: tagName, Date: time.Now().Format(dateFormat), URL: "/tag/" + slugify(tagName) + "/"}
-		values := templateValues(doc, config, navigation, postCardsHTML(tagPosts))
+		cards, err := postCardsHTMLContext(ctx, tagPosts)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		values, err := templateValuesContext(ctx, doc, config, navigation, cards)
+		if err != nil {
+			return BuildResult{}, err
+		}
 		values["theme.css"] = themeStylesheetURL
 		values["tag"] = html.EscapeString(tagName)
-		values["content"] = applyTokens(tagTemplate, values)
-		output := applyTokens(layout, values)
-		if err := writePublic(filepath.Join(outputDir, "tag", slugify(tagName), "index.html"), output); err != nil {
+		values["content"], err = applyTokensContext(ctx, tagTemplate, values)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		output, err := applyTokensContext(ctx, layout, values)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		if err := writePublicContext(ctx, filepath.Join(outputDir, "tag", slugify(tagName), "index.html"), output); err != nil {
 			return BuildResult{}, err
 		}
 		files++
 	}
 
 	for category, categoryPosts := range categoryMap {
+		if err := contextErr(ctx); err != nil {
+			return BuildResult{}, err
+		}
 		categoryName := category
 		if len(categoryPosts) > 0 && categoryPosts[0].Category != "" {
 			categoryName = categoryPosts[0].Category
 		}
 		doc := Document{Type: "page", Title: categoryName, Date: time.Now().Format(dateFormat), URL: "/category/" + slugify(categoryName) + "/"}
-		values := templateValues(doc, config, navigation, postCardsHTML(categoryPosts))
+		cards, err := postCardsHTMLContext(ctx, categoryPosts)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		values, err := templateValuesContext(ctx, doc, config, navigation, cards)
+		if err != nil {
+			return BuildResult{}, err
+		}
 		values["theme.css"] = themeStylesheetURL
 		values["category"] = html.EscapeString(categoryName)
-		values["content"] = applyTokens(categoryTemplate, values)
-		output := applyTokens(layout, values)
-		if err := writePublic(filepath.Join(outputDir, "category", slugify(categoryName), "index.html"), output); err != nil {
+		values["content"], err = applyTokensContext(ctx, categoryTemplate, values)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		output, err := applyTokensContext(ctx, layout, values)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		if err := writePublicContext(ctx, filepath.Join(outputDir, "category", slugify(categoryName), "index.html"), output); err != nil {
 			return BuildResult{}, err
 		}
 		files++
 	}
 
 	for year, yearPosts := range yearMap {
+		if err := contextErr(ctx); err != nil {
+			return BuildResult{}, err
+		}
 		doc := Document{Type: "page", Title: year, Date: year, URL: "/archive/" + year + "/"}
-		values := templateValues(doc, config, navigation, postCardsHTML(yearPosts))
+		cards, err := postCardsHTMLContext(ctx, yearPosts)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		values, err := templateValuesContext(ctx, doc, config, navigation, cards)
+		if err != nil {
+			return BuildResult{}, err
+		}
 		values["theme.css"] = themeStylesheetURL
 		values["year"] = html.EscapeString(year)
-		values["content"] = applyTokens(archiveTemplate, values)
-		output := applyTokens(layout, values)
-		if err := writePublic(filepath.Join(outputDir, "archive", year, "index.html"), output); err != nil {
+		values["content"], err = applyTokensContext(ctx, archiveTemplate, values)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		output, err := applyTokensContext(ctx, layout, values)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		if err := writePublicContext(ctx, filepath.Join(outputDir, "archive", year, "index.html"), output); err != nil {
 			return BuildResult{}, err
 		}
 		files++
 	}
 
-	if err := writePublic(filepath.Join(outputDir, "rss.xml"), renderRSS(config, posts)); err != nil {
+	rss, err := renderRSSContext(ctx, config, posts)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	if err := writePublicContext(ctx, filepath.Join(outputDir, "rss.xml"), rss); err != nil {
 		return BuildResult{}, err
 	}
 	files++
-	if err := writePublic(filepath.Join(outputDir, "sitemap.xml"), renderSitemap(config, published, tagMap, categoryMap, yearMap)); err != nil {
+	sitemap, err := renderSitemapContext(ctx, config, published, tagMap, categoryMap, yearMap)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	if err := writePublicContext(ctx, filepath.Join(outputDir, "sitemap.xml"), sitemap); err != nil {
 		return BuildResult{}, err
 	}
 	files++
 
-	checks, err := checkBuildOutput(outputDir)
+	if err := s.checkBuildPhase(ctx, "before-checks"); err != nil {
+		return BuildResult{}, err
+	}
+	checks, err := checkBuildOutputContext(ctx, outputDir)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("run build checks: %w", err)
 	}
-	s.publicMu.Lock()
-	err = swapPublicDirectory(outputDir, publicDir)
+	if err := contextErr(ctx); err != nil {
+		return BuildResult{}, err
+	}
+	if err := s.checkBuildPhase(ctx, "before-swap"); err != nil {
+		return BuildResult{}, err
+	}
+	if err := s.acquirePublicBuildLock(ctx); err != nil {
+		return BuildResult{}, err
+	}
+	if err := contextErr(ctx); err != nil {
+		s.publicMu.Unlock()
+		return BuildResult{}, err
+	}
+	err = swapPublicDirectoryContext(ctx, outputDir, publicDir)
 	s.publicMu.Unlock()
 	if err != nil {
 		return BuildResult{}, err
 	}
 
 	result := BuildResult{GeneratedAt: time.Now().UTC().Format(time.RFC3339), Files: files, Published: len(published), Checks: checks}
+	s.mu.Lock()
 	s.lastBuild = result
-	if config.Git.Enabled && config.Git.AutoCommit && strings.ToLower(config.Git.CommitOn) == "build" {
-		if _, gitErr := s.gitCommitAndPush(config.Git, "Build Fileloom site", false); gitErr != nil {
-			slog.Warn("git sync after build failed", "error", gitErr)
-		}
-	}
+	s.mu.Unlock()
+	documentIDsCommitted = true
 	return result, nil
 }
 
@@ -2025,6 +2542,13 @@ func normalizePublishAt(value string) (string, error) {
 }
 
 func swapPublicDirectory(staged, publicDir string) error {
+	return swapPublicDirectoryContext(context.Background(), staged, publicDir)
+}
+
+func swapPublicDirectoryContext(ctx context.Context, staged, publicDir string) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	backup := publicDir + ".backup-" + fmt.Sprint(time.Now().UnixNano())
 	hadPublic := false
 	if _, err := os.Stat(publicDir); err == nil {
@@ -2047,40 +2571,80 @@ func swapPublicDirectory(staged, publicDir string) error {
 	return nil
 }
 
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(buffer []byte) (int, error) {
+	if err := contextErr(r.ctx); err != nil {
+		return 0, err
+	}
+	read, err := r.reader.Read(buffer)
+	if canceled := contextErr(r.ctx); canceled != nil {
+		return read, canceled
+	}
+	return read, err
+}
+
 func checkBuildOutput(root string) ([]CheckIssue, error) {
+	return checkBuildOutputContext(context.Background(), root)
+}
+
+func checkBuildOutputContext(ctx context.Context, root string) ([]CheckIssue, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	var issues []CheckIssue
 	err := filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if canceled := contextErr(ctx); canceled != nil {
+			return canceled
+		}
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".html") {
 			return nil
 		}
-		data, err := os.ReadFile(filePath)
+		data, err := readFileContext(ctx, filePath)
 		if err != nil {
 			return err
 		}
-		document, err := htmlnode.Parse(bytes.NewReader(data))
+		document, err := htmlnode.Parse(contextReader{ctx: ctx, reader: bytes.NewReader(data)})
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", filePath, err)
+		}
+		if err := contextErr(ctx); err != nil {
+			return err
 		}
 		rel, err := filepath.Rel(root, filePath)
 		if err != nil {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		checkHTMLAccessibility(document, rel, &issues)
-		checkHTMLLinks(root, rel, document, &issues)
+		if err := checkHTMLAccessibilityContext(ctx, document, rel, &issues); err != nil {
+			return err
+		}
+		if err := checkHTMLLinksContext(ctx, root, rel, document, &issues); err != nil {
+			return err
+		}
 		return nil
 	})
 	return issues, err
 }
 
 func checkHTMLAccessibility(document *htmlnode.Node, rel string, issues *[]CheckIssue) {
+	_ = checkHTMLAccessibilityContext(context.Background(), document, rel, issues)
+}
+
+func checkHTMLAccessibilityContext(ctx context.Context, document *htmlnode.Node, rel string, issues *[]CheckIssue) error {
 	var htmlElement, titleElement *htmlnode.Node
 	labels := map[string]bool{}
-	var walk func(*htmlnode.Node)
-	walk = func(node *htmlnode.Node) {
+	var walk func(*htmlnode.Node) error
+	walk = func(node *htmlnode.Node) error {
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
 		if node.Type == htmlnode.ElementNode {
 			switch strings.ToLower(node.Data) {
 			case "html":
@@ -2110,21 +2674,41 @@ func checkHTMLAccessibility(document *htmlnode.Node, rel string, issues *[]Check
 			}
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			walk(child)
+			if err := walk(child); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
-	walk(document)
+	if err := walk(document); err != nil {
+		return err
+	}
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	if htmlElement == nil || attrValue(htmlElement, "lang") == "" {
 		*issues = append(*issues, CheckIssue{Severity: "warning", Code: "html-lang", Path: rel, Message: "document is missing an html lang attribute"})
 	}
-	if titleElement == nil || strings.TrimSpace(nodeText(titleElement)) == "" {
+	titleText, err := nodeTextContext(ctx, titleElement)
+	if err != nil {
+		return err
+	}
+	if titleElement == nil || strings.TrimSpace(titleText) == "" {
 		*issues = append(*issues, CheckIssue{Severity: "warning", Code: "document-title", Path: rel, Message: "document is missing a non-empty title"})
 	}
+	return nil
 }
 
 func checkHTMLLinks(root, rel string, document *htmlnode.Node, issues *[]CheckIssue) {
-	var walk func(*htmlnode.Node)
-	walk = func(node *htmlnode.Node) {
+	_ = checkHTMLLinksContext(context.Background(), root, rel, document, issues)
+}
+
+func checkHTMLLinksContext(ctx context.Context, root, rel string, document *htmlnode.Node, issues *[]CheckIssue) error {
+	var walk func(*htmlnode.Node) error
+	walk = func(node *htmlnode.Node) error {
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
 		if node.Type == htmlnode.ElementNode {
 			var target string
 			switch strings.ToLower(node.Data) {
@@ -2135,16 +2719,25 @@ func checkHTMLLinks(root, rel string, document *htmlnode.Node, issues *[]CheckIs
 			}
 			if target != "" && isInternalTarget(target) {
 				parsed, err := url.Parse(target)
-				if err == nil && parsed.Path != "" && !publicTargetExists(root, rel, parsed.Path) {
-					*issues = append(*issues, CheckIssue{Severity: "warning", Code: "broken-link", Path: rel, Message: "internal link target does not exist: " + parsed.Path})
+				if err == nil && parsed.Path != "" {
+					exists, err := publicTargetExistsContext(ctx, root, rel, parsed.Path)
+					if err != nil {
+						return err
+					}
+					if !exists {
+						*issues = append(*issues, CheckIssue{Severity: "warning", Code: "broken-link", Path: rel, Message: "internal link target does not exist: " + parsed.Path})
+					}
 				}
 			}
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			walk(child)
+			if err := walk(child); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
-	walk(document)
+	return walk(document)
 }
 
 func attrValue(node *htmlnode.Node, key string) string {
@@ -2157,17 +2750,29 @@ func attrValue(node *htmlnode.Node, key string) string {
 }
 
 func nodeText(node *htmlnode.Node) string {
+	text, _ := nodeTextContext(context.Background(), node)
+	return text
+}
+
+func nodeTextContext(ctx context.Context, node *htmlnode.Node) (string, error) {
 	if node == nil {
-		return ""
+		return "", nil
+	}
+	if err := contextErr(ctx); err != nil {
+		return "", err
 	}
 	if node.Type == htmlnode.TextNode {
-		return node.Data
+		return node.Data, nil
 	}
 	var b strings.Builder
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
-		b.WriteString(nodeText(child))
+		text, err := nodeTextContext(ctx, child)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(text)
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 func isInternalTarget(target string) bool {
@@ -2176,13 +2781,21 @@ func isInternalTarget(target string) bool {
 }
 
 func publicTargetExists(root, currentRel, target string) bool {
+	exists, _ := publicTargetExistsContext(context.Background(), root, currentRel, target)
+	return exists
+}
+
+func publicTargetExistsContext(ctx context.Context, root, currentRel, target string) (bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return false, err
+	}
 	parsed, err := url.Parse(target)
 	if err != nil || parsed.Host != "" {
-		return true
+		return true, nil
 	}
 	requestPath := parsed.Path
 	if requestPath == "" {
-		return true
+		return true, nil
 	}
 	var base string
 	if strings.HasPrefix(requestPath, "/") {
@@ -2194,12 +2807,20 @@ func publicTargetExists(root, currentRel, target string) bool {
 	base = strings.TrimPrefix(base, "/")
 	candidates := []string{base, path.Join(base, "index.html"), base + ".html"}
 	for _, candidate := range candidates {
-		if info, err := os.Stat(filepath.Join(root, filepath.FromSlash(candidate))); err == nil && !info.IsDir() {
-			return true
+		if err := contextErr(ctx); err != nil {
+			return false, err
+		}
+		info, err := os.Stat(filepath.Join(root, filepath.FromSlash(candidate)))
+		if err == nil && !info.IsDir() {
+			return true, nil
 		}
 	}
-	return false
+	if err := contextErr(ctx); err != nil {
+		return false, err
+	}
+	return false, nil
 }
+
 func (s *Server) listThemes() ([]ThemeInfo, error) {
 	config, err := s.loadSiteConfig()
 	if err != nil {
@@ -2319,6 +2940,17 @@ func (s *Server) saveSiteConfig(config SiteConfig) error {
 }
 
 func (s *Server) activateTheme(name string) error {
+	return s.activateThemeContext(context.Background(), name)
+}
+
+func (s *Server) activateThemeContext(ctx context.Context, name string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.acquireWorkspaceReadContext(ctx); err != nil {
+		return err
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	name, err := normalizeThemeName(name)
 	if err != nil {
 		return err
@@ -2340,7 +2972,7 @@ func (s *Server) activateTheme(name string) error {
 	if err := s.saveSiteConfig(config); err != nil {
 		return err
 	}
-	_, err = s.Build()
+	_, err = s.buildContextWithWorkspace(ctx)
 	if err != nil {
 		rollbackErr := s.saveSiteConfig(originalConfig)
 		if rollbackErr != nil {
@@ -2351,6 +2983,13 @@ func (s *Server) activateTheme(name string) error {
 	return s.gitChangeIfConfigured("Activate theme " + name)
 }
 func readWebAsset(webDir, name string) ([]byte, error) {
+	return readWebAssetContext(context.Background(), webDir, name)
+}
+
+func readWebAssetContext(ctx context.Context, webDir, name string) ([]byte, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	path, info, err := safeResolvedPath(webDir, name)
 	if err != nil {
 		return nil, err
@@ -2358,7 +2997,7 @@ func readWebAsset(webDir, name string) ([]byte, error) {
 	if !info.Mode().IsRegular() {
 		return nil, errors.New("web asset must be a regular file")
 	}
-	return os.ReadFile(path)
+	return readFileContext(ctx, path)
 }
 func readThemeTemplate(themeDir, name, fallback string) string {
 	contents, err := readThemeTemplateSafe(themeDir, name, fallback)
@@ -2369,9 +3008,19 @@ func readThemeTemplate(themeDir, name, fallback string) string {
 }
 
 func readThemeTemplateSafe(themeDir, name, fallback string) (string, error) {
+	return readThemeTemplateSafeContext(context.Background(), themeDir, name, fallback)
+}
+
+func readThemeTemplateSafeContext(ctx context.Context, themeDir, name, fallback string) (string, error) {
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
 	path, info, err := safeResolvedPath(themeDir, name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			if canceled := contextErr(ctx); canceled != nil {
+				return "", canceled
+			}
 			return fallback, nil
 		}
 		return "", err
@@ -2379,7 +3028,7 @@ func readThemeTemplateSafe(themeDir, name, fallback string) (string, error) {
 	if !info.Mode().IsRegular() {
 		return "", errors.New("theme template must be a regular file")
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFileContext(ctx, path)
 	if err != nil {
 		return "", err
 	}
@@ -2413,10 +3062,43 @@ func renderDocumentBody(templateSource string, values map[string]string, comment
 	return rendered + comments
 }
 
+func renderDocumentBodyContext(ctx context.Context, templateSource string, values map[string]string, comments string) (string, error) {
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
+	values["comments"] = comments
+	rendered, err := applyTokensContext(ctx, templateSource, values)
+	if err != nil {
+		return "", err
+	}
+	if comments != "" && !strings.Contains(templateSource, "{{comments}}") && !strings.Contains(templateSource, "{{ comments }}") {
+		if index := strings.LastIndex(strings.ToLower(rendered), "</article>"); index >= 0 {
+			rendered = rendered[:index] + comments + rendered[index:]
+		} else {
+			rendered += comments
+		}
+	}
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
+	return rendered, nil
+}
+
 func templateValues(doc Document, config SiteConfig, navigation, posts string) map[string]string {
+	values, _ := templateValuesContext(context.Background(), doc, config, navigation, posts)
+	return values
+}
+
+func templateValuesContext(ctx context.Context, doc Document, config SiteConfig, navigation, posts string) (map[string]string, error) {
 	tags := make([]string, 0, len(doc.Tags))
 	for _, tag := range doc.Tags {
+		if err := contextErr(ctx); err != nil {
+			return nil, err
+		}
 		tags = append(tags, `<a href="/tag/`+url.PathEscape(slugify(tag))+`/">`+html.EscapeString(tag)+`</a>`)
+	}
+	if err := contextErr(ctx); err != nil {
+		return nil, err
 	}
 	year := doc.Date
 	if len(year) >= 4 {
@@ -2442,36 +3124,77 @@ func templateValues(doc Document, config SiteConfig, navigation, posts string) m
 		"navigation":       navigation,
 		"posts":            posts,
 		"comments":         "",
-	}
+	}, nil
 }
 
 func applyTokens(source string, values map[string]string) string {
-	return tokenPattern.ReplaceAllStringFunc(source, func(token string) string {
+	result, _ := applyTokensContext(context.Background(), source, values)
+	return result
+}
+
+func applyTokensContext(ctx context.Context, source string, values map[string]string) (string, error) {
+	matches := tokenPattern.FindAllStringIndex(source, -1)
+	if len(matches) == 0 {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
+		return source, nil
+	}
+	var result strings.Builder
+	result.Grow(len(source))
+	last := 0
+	for _, indexes := range matches {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
+		result.WriteString(source[last:indexes[0]])
+		token := source[indexes[0]:indexes[1]]
 		match := tokenPattern.FindStringSubmatch(token)
 		if len(match) == 2 {
-			return values[match[1]]
+			result.WriteString(values[match[1]])
 		}
-		return ""
-	})
+		last = indexes[1]
+	}
+	result.WriteString(source[last:])
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
+	return result.String(), nil
 }
 
 func navigationHTML(pages []Document) string {
+	value, _ := navigationHTMLContext(context.Background(), pages)
+	return value
+}
+
+func navigationHTMLContext(ctx context.Context, pages []Document) (string, error) {
 	items := []string{`<a href="/">Home</a>`}
 	for _, page := range pages {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
 		items = append(items, `<a href="`+html.EscapeString(page.URL)+`">`+html.EscapeString(page.Title)+`</a>`)
 	}
-	return strings.Join(items, "")
+	return strings.Join(items, ""), nil
 }
 
 func postCardsHTML(posts []Document) string {
+	value, _ := postCardsHTMLContext(context.Background(), posts)
+	return value
+}
+
+func postCardsHTMLContext(ctx context.Context, posts []Document) (string, error) {
 	if len(posts) == 0 {
-		return `<p class="empty-state">No published posts yet.</p>`
+		return `<p class="empty-state">No published posts yet.</p>`, nil
 	}
 	var b strings.Builder
 	for _, post := range posts {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
 		fmt.Fprintf(&b, `<article class="post-card"><p class="eyebrow">%s</p><h2><a href="%s">%s</a></h2><p>%s</p></article>`, html.EscapeString(post.Date), html.EscapeString(post.URL), html.EscapeString(post.Title), html.EscapeString(post.Excerpt))
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 func (s *Server) renderEditorPreview(doc Document) (string, error) {
@@ -2524,60 +3247,110 @@ func (s *Server) renderEditorPreview(doc Document) (string, error) {
 	if doc.Type == "post" {
 		bodyTemplate = postTemplate
 	}
-	values["content"] = doc.HTML
+	values["content"] = renderFileloomMedia(doc.HTML, fileloomMediaPreview)
 	values["content"] = renderDocumentBody(bodyTemplate, values, "")
 	output := applyTokens(layout, values)
 	if fileExists(filepath.Join(s.WebDir, "fileloom-code.css")) && fileExists(filepath.Join(s.WebDir, "fileloom-code.js")) {
 		output = ensureCodeAssets(output)
 	}
+	if (fileloomMediaContainsYouTube(output) || fileloomMediaContainsLocalVideo(output)) && fileExists(filepath.Join(s.WebDir, "fileloom-media.css")) {
+		output = ensureFileloomMediaStyles(output, "/theme/fileloom-media.css")
+	}
 	return ensureAttribution(output), nil
 }
 
 func renderRSS(config SiteConfig, posts []Document) string {
+	value, _ := renderRSSContext(context.Background(), config, posts)
+	return value
+}
+
+func renderRSSContext(ctx context.Context, config SiteConfig, posts []Document) (string, error) {
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
 	base := strings.TrimRight(config.BaseURL, "/")
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 	b.WriteString(`<rss version="2.0"><channel>`)
 	fmt.Fprintf(&b, "<title>%s</title><link>%s/</link><description>%s</description>", html.EscapeString(config.Title), html.EscapeString(base), html.EscapeString(config.Description))
 	for _, post := range posts {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
 		fmt.Fprintf(&b, "<item><title>%s</title><link>%s%s</link><guid>%s%s</guid><pubDate>%s</pubDate><description><![CDATA[%s]]></description></item>", html.EscapeString(post.Title), html.EscapeString(base), html.EscapeString(post.URL), html.EscapeString(base), html.EscapeString(post.URL), html.EscapeString(post.Date), post.HTML)
 	}
 	b.WriteString(`</channel></rss>`)
-	return b.String()
+	return b.String(), nil
 }
 
 func renderSitemap(config SiteConfig, docs []Document, tags map[string][]Document, categories map[string][]Document, years map[string][]Document) string {
+	value, _ := renderSitemapContext(context.Background(), config, docs, tags, categories, years)
+	return value
+}
+
+func renderSitemapContext(ctx context.Context, config SiteConfig, docs []Document, tags map[string][]Document, categories map[string][]Document, years map[string][]Document) (string, error) {
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
 	base := strings.TrimRight(config.BaseURL, "/")
 	urls := []string{"/"}
 	for _, doc := range docs {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
 		urls = append(urls, doc.URL)
 	}
 	for tag := range tags {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
 		urls = append(urls, "/tag/"+slugify(tag)+"/")
 	}
 	for category := range categories {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
 		urls = append(urls, "/category/"+slugify(category)+"/")
 	}
 	for year := range years {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
 		urls = append(urls, "/archive/"+slugify(year)+"/")
 	}
 	sort.Strings(urls)
+	if err := contextErr(ctx); err != nil {
+		return "", err
+	}
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n<urlset xmlns=" + `"http://www.sitemaps.org/schemas/sitemap/0.9">`)
 	for _, item := range urls {
+		if err := contextErr(ctx); err != nil {
+			return "", err
+		}
 		fmt.Fprintf(&b, "<url><loc>%s%s</loc></url>", html.EscapeString(base), html.EscapeString(item))
 	}
 	b.WriteString(`</urlset>`)
-	return b.String()
+	return b.String(), nil
 }
 
 func copyDir(source, destination string) error {
+	return copyDirContext(context.Background(), source, destination)
+}
+
+func copyDirContext(ctx context.Context, source, destination string) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	rootInfo, err := os.Lstat(source)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if canceled := contextErr(ctx); canceled != nil {
+		return canceled
 	}
 	if rootInfo.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("symlinks are not allowed in generated assets: %s", source)
@@ -2586,6 +3359,9 @@ func copyDir(source, destination string) error {
 		return fmt.Errorf("asset root is not a directory: %s", source)
 	}
 	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
+		if canceled := contextErr(ctx); canceled != nil {
+			return canceled
+		}
 		if err != nil {
 			return err
 		}
@@ -2604,6 +3380,9 @@ func copyDir(source, destination string) error {
 		}
 		target := filepath.Join(destination, rel)
 		if entry.IsDir() {
+			if err := contextErr(ctx); err != nil {
+				return err
+			}
 			return os.MkdirAll(target, 0o755)
 		}
 		info, err := entry.Info()
@@ -2624,14 +3403,57 @@ func copyDir(source, destination string) error {
 			_ = in.Close()
 			return err
 		}
-		out, err := os.Create(target)
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 		if err != nil {
 			_ = in.Close()
 			return err
 		}
-		_, copyErr := io.Copy(out, in)
+		buffer := make([]byte, buildIOChunkSize)
+		copyErr := error(nil)
+		for {
+			if canceled := contextErr(ctx); canceled != nil {
+				copyErr = canceled
+				break
+			}
+			read, readErr := in.Read(buffer)
+			if read > 0 {
+				if canceled := contextErr(ctx); canceled != nil {
+					copyErr = canceled
+					break
+				}
+				for written := 0; written < read; {
+					if canceled := contextErr(ctx); canceled != nil {
+						copyErr = canceled
+						break
+					}
+					n, writeErr := out.Write(buffer[written:read])
+					written += n
+					if writeErr != nil {
+						copyErr = writeErr
+						break
+					}
+					if n == 0 {
+						copyErr = io.ErrShortWrite
+						break
+					}
+				}
+				if copyErr != nil {
+					break
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				copyErr = readErr
+				break
+			}
+		}
 		closeErr := out.Close()
 		inputCloseErr := in.Close()
+		if canceled := contextErr(ctx); canceled != nil {
+			return canceled
+		}
 		if copyErr != nil {
 			return copyErr
 		}
@@ -2679,6 +3501,21 @@ func commentsAssetsAvailable(path string) bool {
 	}
 	return false
 }
+func mediaAssetsAvailable(path string) bool {
+	directory := filepath.Dir(path)
+	for range 5 {
+		if fileExists(filepath.Join(directory, "theme", "fileloom-media.css")) && fileExists(filepath.Join(directory, "theme", "fileloom-media.js")) {
+			return true
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			break
+		}
+		directory = parent
+	}
+	return false
+}
+
 func ensureCodeAssets(source string) string {
 	if !strings.Contains(source, "/theme/fileloom-code.css") {
 		link := `<link rel="stylesheet" href="/theme/fileloom-code.css">`
@@ -2738,7 +3575,36 @@ func ensureCommentsAssets(source string) string {
 }
 
 func writePublic(path, contents string) error {
+	return writePublicContext(context.Background(), path, contents)
+}
+
+func writePublicContext(ctx context.Context, path, contents string) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	if strings.EqualFold(filepath.Ext(path), ".html") {
+		var err error
+		contents, err = renderFileloomMediaContext(ctx, contents, fileloomMediaPublic)
+		if err != nil {
+			return err
+		}
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
+		hasYouTube, err := fileloomMediaContainsYouTubeContext(ctx, contents)
+		if err != nil {
+			return err
+		}
+		hasLocalVideo, err := fileloomMediaContainsLocalVideoContext(ctx, contents)
+		if err != nil {
+			return err
+		}
+		if (hasYouTube || hasLocalVideo) && mediaAssetsAvailable(path) {
+			contents = ensureFileloomMediaStyles(contents, "/theme/fileloom-media.css")
+		}
+		if hasYouTube && mediaAssetsAvailable(path) {
+			contents = ensureFileloomMediaAssets(contents)
+		}
 		if codeAssetsAvailable(path) {
 			contents = ensureCodeAssets(contents)
 		}
@@ -2747,10 +3613,13 @@ func writePublic(path, contents string) error {
 		}
 		contents = ensureAttribution(contents)
 	}
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+	if err := writeFileContext(ctx, path, []byte(contents), 0o644); err != nil {
 		return fmt.Errorf("write generated file %s: %w", path, err)
 	}
 	return nil
@@ -2795,10 +3664,86 @@ func (s *Server) startScheduler() {
 	})
 }
 
+func (s *Server) acquireWriteContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
+		if s.writeMu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+func (s *Server) acquireWorkspaceReadContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
+		if s.gitWorkspaceMu.TryRLock() {
+			return nil
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Server) acquireWorkspaceReadAfterWrite(w http.ResponseWriter, r *http.Request) bool {
+	if err := s.acquireWorkspaceReadContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return false
+	}
+	return true
+}
+
 func (s *Server) publishDue() {
-	s.writeMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), maxBackgroundBuildDuration)
+	defer cancel()
+	s.publishDueContext(ctx)
+}
+
+func (s *Server) publishDueContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.acquireWriteContext(ctx); err != nil {
+		slog.Warn("scheduled publishing canceled", "error", err)
+		return
+	}
 	defer s.writeMu.Unlock()
-	docs, err := s.listDocuments()
+	if err := s.acquireWorkspaceReadContext(ctx); err != nil {
+		slog.Warn("scheduled publishing canceled", "error", err)
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
+	docs, err := s.listDocumentsContext(ctx)
 	if err != nil {
 		slog.Warn("scheduled publishing scan failed", "error", err)
 		return
@@ -2810,6 +3755,13 @@ func (s *Server) publishDue() {
 	}
 	var changes []scheduledChange
 	for _, doc := range docs {
+		if err := contextErr(ctx); err != nil {
+			if len(changes) == 0 {
+				slog.Warn("scheduled publishing canceled", "error", err)
+				return
+			}
+			break
+		}
 		if strings.ToLower(strings.TrimSpace(doc.Status)) != "scheduled" || strings.TrimSpace(doc.PublishAt) == "" {
 			continue
 		}
@@ -2817,10 +3769,24 @@ func (s *Server) publishDue() {
 		if err != nil || publishAt.After(now) {
 			continue
 		}
-		source, err := s.loadSourceDocument(doc.Path)
+		source, err := s.loadSourceDocumentContext(ctx, doc.Path)
 		if err != nil {
+			if canceled := contextErr(ctx); canceled != nil {
+				if len(changes) == 0 {
+					slog.Warn("scheduled publishing canceled", "error", canceled)
+					return
+				}
+				break
+			}
 			slog.Warn("scheduled publish source read failed", "path", doc.Path, "error", err)
 			continue
+		}
+		if err := contextErr(ctx); err != nil {
+			if len(changes) == 0 {
+				slog.Warn("scheduled publishing canceled", "path", doc.Path, "error", err)
+				return
+			}
+			break
 		}
 		if _, err := s.patchDocumentSource(doc.Path, "", false, map[string]string{"status": "published", "publish_at": ""}, "", "Publish scheduled "+doc.Path); err != nil {
 			slog.Warn("scheduled publish failed", "path", doc.Path, "error", err)
@@ -2831,8 +3797,9 @@ func (s *Server) publishDue() {
 	if len(changes) == 0 {
 		return
 	}
-	if _, err := s.Build(); err != nil {
-		slog.Warn("scheduled build failed; restoring scheduled sources", "error", err)
+	_, buildErr := s.BuildContext(ctx)
+	if buildErr != nil {
+		slog.Warn("scheduled build failed; restoring scheduled sources", "error", buildErr)
 		for index := len(changes) - 1; index >= 0; index-- {
 			change := changes[index]
 			path, pathErr := safeWorkspacePath(filepath.Join(s.SiteDir, "content"), change.path)
@@ -2940,7 +3907,7 @@ func appendCSPSource(policy, directive, source string) string {
 	parts := strings.Split(policy, ";")
 	for index, part := range parts {
 		fields := strings.Fields(strings.TrimSpace(part))
-		if len(fields) == 0 || fields[0] != directive {
+		if len(fields) == 0 || !strings.EqualFold(fields[0], directive) {
 			continue
 		}
 		for _, existing := range fields[1:] {
@@ -2969,6 +3936,9 @@ func (s *Server) applySecurityHeaders(w http.ResponseWriter, r *http.Request) {
 		policy := s.PublicCSP
 		if config, err := s.loadSiteConfig(); err == nil && config.Comments.Enabled {
 			policy = appendCSPSource(policy, "connect-src", commentServerOrigin(config.Comments.Server))
+		}
+		if s.publicRequestHasYouTube(r.URL.Path) {
+			policy = appendCSPSource(policy, "frame-src", youtubeNoCookieOrigin)
 		}
 		w.Header().Set("Content-Security-Policy", policy)
 	}
@@ -3547,6 +4517,7 @@ func (s *Server) handleEditorAPI(w http.ResponseWriter, r *http.Request) {
 		Document:      source.Document,
 		Comments:      config.Comments,
 		HTML:          source.Document.HTML,
+		BodyHTML:      source.BodyHTML,
 		SourceSHA256:  sha,
 		PreviewURL:    "/_cms/editor/frame?path=" + url.QueryEscape(source.Document.Path),
 		PreviewAPI:    "/_cms/api/editor-preview",
@@ -3711,7 +4682,9 @@ func (s *Server) handleEditorPreviewAPI(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	doc = applyEditorMetadata(doc, updates)
-	if strings.TrimSpace(input.HTML) != "" {
+	if input.BodyHTML != nil {
+		doc.HTML = *input.BodyHTML
+	} else if strings.TrimSpace(input.HTML) != "" {
 		doc.HTML = extractBodyHTML(input.HTML)
 	}
 	preview, err := s.renderEditorPreview(doc)
@@ -3816,8 +4789,15 @@ type createItemInput struct {
 
 func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	limitRequestBody(w, r, maxEditorSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	var input createItemInput
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		if err := decodeJSONBody(r, &input); err != nil {
@@ -3892,7 +4872,7 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if input.Status == "published" || input.Status == "scheduled" {
-		if _, err := s.Build(); err != nil {
+		if _, err := s.buildContextWithWorkspace(r.Context()); err != nil {
 			rollbackErr := s.removeContentSource(path)
 			message := "item creation rolled back because build failed: " + err.Error()
 			if rollbackErr != nil {
@@ -3932,14 +4912,17 @@ func (s *Server) handleThemeActivateAPI(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	name := r.FormValue("name")
-	if err := s.activateTheme(name); err != nil {
+	if err := s.activateThemeContext(r.Context(), name); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -3952,8 +4935,15 @@ func (s *Server) handleItemStatusAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -3996,7 +4986,7 @@ func (s *Server) handleItemStatusAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var build BuildResult
-	build, err = s.Build()
+	build, err = s.buildContextWithWorkspace(r.Context())
 	if err != nil {
 		rollbackErr := s.writeContentSource(doc.Path, original.Source)
 		message := "status change rolled back because build failed: " + err.Error()
@@ -4039,8 +5029,15 @@ func (s *Server) handleRevisionRestoreAPI(w http.ResponseWriter, r *http.Request
 		s.handleThemeRevisionRestoreAPI(w, r)
 		return
 	}
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	targetPath := r.FormValue("path")
 	original, err := s.loadSourceDocument(targetPath)
 	if err != nil {
@@ -4058,7 +5055,7 @@ func (s *Server) handleRevisionRestoreAPI(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	build, err := s.Build()
+	build, err := s.buildContextWithWorkspace(r.Context())
 	if err != nil {
 		rollbackErr := s.writeContentSource(doc.Path, original.Source)
 		message := "revision restore rolled back because build failed: " + err.Error()
@@ -4077,8 +5074,15 @@ func (s *Server) handleRevisionRestoreAPI(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleThemeRevisionRestoreAPI(w http.ResponseWriter, r *http.Request) {
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4109,9 +5113,14 @@ func (s *Server) handleThemeRevisionRestoreAPI(w http.ResponseWriter, r *http.Re
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	build, err := s.Build()
+	build, err := s.buildContextWithWorkspace(r.Context())
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "theme revision restore failed: "+err.Error())
+		rollbackErr := writeAtomicFile(path, current)
+		message := "theme revision restore failed: " + err.Error()
+		if rollbackErr != nil {
+			message += "; rollback failed: " + rollbackErr.Error()
+		}
+		writeJSONError(w, http.StatusInternalServerError, message)
 		return
 	}
 	if err := s.gitChangeIfConfigured("Restore " + doc.Path); err != nil {
@@ -4132,9 +5141,12 @@ func (s *Server) handleBuildAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
-	result, err := s.Build()
+	result, err := s.BuildContext(r.Context())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4186,6 +5198,13 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 			Path: r.FormValue("path"), File: r.FormValue("file"), HTML: r.FormValue("html"),
 			BaseSHA: r.FormValue("base_sha256"), Theme: r.FormValue("theme"), Engine: r.FormValue("engine"),
 		}
+		if values, ok := r.Form["body_html"]; ok {
+			bodyHTML := ""
+			if len(values) > 0 {
+				bodyHTML = values[0]
+			}
+			input.BodyHTML = &bodyHTML
+		}
 	}
 	if input.Path == "" {
 		input.Path = input.File
@@ -4207,8 +5226,15 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	original, err := s.loadSourceDocument(input.Path)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -4219,7 +5245,12 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	updated, err := s.patchDocumentSource(input.Path, extractBodyHTML(input.HTML), true, metadata, baseSHA, "Edit "+input.Path)
+	var updated Document
+	if input.BodyHTML != nil {
+		updated, err = s.patchDocumentSourceExact(input.Path, *input.BodyHTML, metadata, baseSHA, "Edit "+input.Path)
+	} else {
+		updated, err = s.patchDocumentSource(input.Path, extractBodyHTML(input.HTML), true, metadata, baseSHA, "Edit "+input.Path)
+	}
 	if err != nil {
 		var conflict *sourceConflictError
 		if errors.As(err, &conflict) {
@@ -4231,7 +5262,7 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	var build BuildResult
 	if documentIsPublishable(original.Document, time.Now().UTC()) || documentIsPublishable(updated, time.Now().UTC()) {
-		build, err = s.Build()
+		build, err = s.buildContextWithWorkspace(r.Context())
 		if err != nil {
 			rollbackErr := s.writeContentSource(updated.Path, original.Source)
 			message := "edit rolled back because build failed: " + err.Error()
@@ -4247,8 +5278,12 @@ func (s *Server) handleEditorSaveAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sha := fileSHA256(filepath.Join(s.SiteDir, "content", filepath.FromSlash(updated.Path)))
+	bodyHTML := updated.HTML
+	if savedSource, sourceErr := s.loadSourceDocument(updated.Path); sourceErr == nil {
+		bodyHTML = savedSource.BodyHTML
+	}
 	setETag(w, sha)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": updated.Path, "source_sha256": sha, "document": updated, "build": build})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": updated.Path, "source_sha256": sha, "html": updated.HTML, "body_html": bodyHTML, "document": updated, "build": build})
 }
 
 func themeTemplatePlaceholders(source string) []string {
@@ -4309,6 +5344,15 @@ func (s *Server) handleThemeSaveJSONAPI(w http.ResponseWriter, r *http.Request, 
 		writeJSONError(w, http.StatusBadRequest, "theme layout not found")
 		return
 	}
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	previous, err := os.ReadFile(path)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -4323,8 +5367,6 @@ func (s *Server) handleThemeSaveJSONAPI(w http.ResponseWriter, r *http.Request, 
 		writeJSONError(w, http.StatusBadRequest, "theme template placeholders cannot be added, removed, or changed")
 		return
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if err := s.recordWorkspaceRevision(file, previous, "Edit theme layout"); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4333,7 +5375,7 @@ func (s *Server) handleThemeSaveJSONAPI(w http.ResponseWriter, r *http.Request, 
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	build, err := s.Build()
+	build, err := s.buildContextWithWorkspace(r.Context())
 	if err != nil {
 		rollbackErr := writeAtomicFile(path, previous)
 		message := "theme edit rolled back because build failed: " + err.Error()
@@ -4388,8 +5430,15 @@ func (s *Server) handleThemeSaveAPI(w http.ResponseWriter, r *http.Request, them
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	var previous []byte
 	hadPrevious := false
 	if info, statErr := os.Lstat(path); statErr == nil {
@@ -4425,7 +5474,7 @@ func (s *Server) handleThemeSaveAPI(w http.ResponseWriter, r *http.Request, them
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	build, err := s.Build()
+	build, err := s.buildContextWithWorkspace(r.Context())
 	if err != nil {
 		var rollbackErr error
 		if hadPrevious {
@@ -4534,8 +5583,15 @@ func (s *Server) handleThemeTokensAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"theme": theme, "file": rel, "sha256": sourceSHA256(data), "tokens": result})
 	case http.MethodPost:
-		s.writeMu.Lock()
+		if err := s.acquireWriteContext(r.Context()); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		defer s.writeMu.Unlock()
+		if !s.acquireWorkspaceReadAfterWrite(w, r) {
+			return
+		}
+		defer s.gitWorkspaceMu.RUnlock()
 		var input struct {
 			Theme  string            `json:"theme"`
 			SHA256 string            `json:"sha256"`
@@ -4606,7 +5662,7 @@ func (s *Server) handleThemeTokensAPI(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		build, err := s.Build()
+		build, err := s.buildContextWithWorkspace(r.Context())
 		if err != nil {
 			rollbackErr := writeAtomicFile(filePath, data)
 			message := "theme token edit rolled back because build failed: " + err.Error()
@@ -4647,9 +5703,12 @@ func (s *Server) handleExportAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
-	if _, err := s.Build(); err != nil {
+	if _, err := s.BuildContext(r.Context()); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "build failed: "+err.Error())
 		return
 	}
@@ -4800,8 +5859,12 @@ func (s *Server) handleEditorFrame(w http.ResponseWriter, r *http.Request) {
 	}
 	css, _ := os.ReadFile(cssPath)
 	cssText := strings.ReplaceAll(string(css), "</style>", "<\\/style>")
+	mediaCSS := ""
+	if fileloomMediaContainsYouTube(doc.HTML) || fileloomMediaContainsLocalVideo(doc.HTML) {
+		mediaCSS = `<link rel="stylesheet" href="/_cms/assets/fileloom-media.css">`
+	}
 	body := doc.HTML
-	frame := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>` + html.EscapeString(doc.Title) + `</title><style>` + cssText + `</style><style>body{min-height:100vh}body:before{content:"Fileloom content canvas";display:block;margin:20px auto 0;max-width:790px;color:#8c97a6;font:600 11px/1.2 system-ui;letter-spacing:.12em;text-transform:uppercase}</style></head><body>` + body + `</body></html>`
+	frame := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>` + html.EscapeString(doc.Title) + `</title>` + mediaCSS + `<style>` + cssText + `</style><style>body{min-height:100vh}body:before{content:"Fileloom content canvas";display:block;margin:20px auto 0;max-width:790px;color:#8c97a6;font:600 11px/1.2 system-ui;letter-spacing:.12em;text-transform:uppercase}</style></head><body>` + body + `</body></html>`
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, frame)
 }
@@ -4858,8 +5921,15 @@ func (s *Server) handleMediaAPI(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
 	limitRequestBody(w, r, maxUploadSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid upload: "+err.Error())
 		return
@@ -4947,7 +6017,7 @@ func (s *Server) handleMediaUploadAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if _, err := s.Build(); err != nil {
+	if _, err := s.buildContextWithWorkspace(r.Context()); err != nil {
 		rollbackErr := os.Remove(path)
 		if errors.Is(rollbackErr, os.ErrNotExist) {
 			rollbackErr = nil
@@ -5276,9 +6346,19 @@ func mediaTree(root string) ([]map[string]any, error) {
 		if fileDirectory == "." {
 			fileDirectory = ""
 		}
+		mediaType := mime.TypeByExtension(filepath.Ext(rel))
+		kind := "other"
+		if strings.HasPrefix(mediaType, "image/") {
+			kind = "image"
+		} else if strings.HasPrefix(mediaType, "video/") {
+			kind = "video"
+		} else if strings.HasPrefix(mediaType, "audio/") {
+			kind = "audio"
+		}
 		files = append(files, map[string]any{
 			"name": filepath.Base(rel), "type": "file", "path": rel,
 			"url": mediaURLPath(fileDirectory, filepath.Base(rel)), "size": info.Size(),
+			"media_type": kind, "mime": mediaType,
 		})
 		return nil
 	})
@@ -5302,7 +6382,10 @@ func runGit(repo string, args ...string) (string, error) {
 }
 
 func runGitWithTimeout(timeout time.Duration, repo string, args ...string) (string, error) {
-	commandArgs := append([]string{"-C", repo}, args...)
+	commandArgs := args
+	if repo != "" {
+		commandArgs = append([]string{"-C", repo}, args...)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, "git", commandArgs...)
@@ -5337,7 +6420,7 @@ func (s *Server) gitRepo() (string, error) {
 	if err := rejectExistingSymlinkComponents(repo, ".git"); err != nil {
 		return "", err
 	}
-	root, err := runGit(repo, "rev-parse", "--show-toplevel")
+	root, err := s.runGitCommand(maxGitCommandDuration, repo, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", err
 	}
@@ -5359,13 +6442,25 @@ func validGitRemoteName(value string) bool {
 	return value != "" && value != "." && value != ".." && !strings.HasPrefix(value, "-") && !strings.Contains(value, "..") && regexp.MustCompile(`^[A-Za-z0-9._-]+$`).MatchString(value)
 }
 
+func (s *Server) gitRemoteURLs(repo, remote string, push bool) ([]string, error) {
+	return gitRemoteURLsWithRunner(func(timeout time.Duration, repo string, args ...string) (string, error) {
+		return s.runGitCommand(timeout, repo, args...)
+	}, repo, remote, push)
+}
+
 func gitRemoteURLs(repo, remote string, push bool) ([]string, error) {
+	return gitRemoteURLsWithRunner(func(timeout time.Duration, repo string, args ...string) (string, error) {
+		return runGitWithTimeout(timeout, repo, args...)
+	}, repo, remote, push)
+}
+
+func gitRemoteURLsWithRunner(runner GitCommandRunner, repo, remote string, push bool) ([]string, error) {
 	args := []string{"remote", "get-url"}
 	if push {
 		args = append(args, "--push")
 	}
 	args = append(args, "--all", remote)
-	output, err := runGit(repo, args...)
+	output, err := runner(maxGitCommandDuration, repo, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -5388,7 +6483,7 @@ func (s *Server) gitRemoteURL(repo, remote string, unattended bool) (string, err
 	if !validGitRemoteName(remote) {
 		return "", errors.New("remote name contains invalid characters")
 	}
-	fetchURLs, err := gitRemoteURLs(repo, remote, false)
+	fetchURLs, err := s.gitRemoteURLs(repo, remote, false)
 	if err != nil {
 		return "", err
 	}
@@ -5398,7 +6493,7 @@ func (s *Server) gitRemoteURL(repo, remote string, unattended bool) (string, err
 		}
 	}
 	if unattended {
-		pushURLs, err := gitRemoteURLs(repo, remote, true)
+		pushURLs, err := s.gitRemoteURLs(repo, remote, true)
 		if err != nil {
 			return "", err
 		}
@@ -5420,6 +6515,19 @@ func (s *Server) gitScope(repo string) ([]string, error) {
 }
 
 func (s *Server) gitStatus(config GitConfig) GitStatus {
+	if !s.gitMu.TryLock() {
+		status := s.gitStatusWhileBusy()
+		s.applyGitSyncStatus(&status)
+		return status
+	}
+	status := s.gitStatusLocked(config)
+	s.gitMu.Unlock()
+	s.cacheGitStatus(status)
+	s.applyGitSyncStatus(&status)
+	return status
+}
+
+func (s *Server) gitStatusLocked(config GitConfig) GitStatus {
 	status := GitStatus{}
 	repo, err := s.gitRepo()
 	if err != nil {
@@ -5431,7 +6539,7 @@ func (s *Server) gitStatus(config GitConfig) GitStatus {
 		status.Error = err.Error()
 		return status
 	}
-	branch, _ := runGit(repo, "branch", "--show-current")
+	branch, _ := s.runGitCommand(maxGitCommandDuration, repo, "branch", "--show-current")
 	remote := config.Remote
 	if remote == "" {
 		remote = "origin"
@@ -5444,7 +6552,7 @@ func (s *Server) gitStatus(config GitConfig) GitStatus {
 	if remoteErr != nil {
 		remoteURL = ""
 	}
-	porcelain, err := runGit(repo, append([]string{"status", "--porcelain"}, append([]string{"--"}, scope...)...)...)
+	porcelain, err := s.runGitCommand(maxGitCommandDuration, repo, append([]string{"status", "--porcelain"}, append([]string{"--"}, scope...)...)...)
 	if err != nil {
 		status.Error = err.Error()
 		return status
@@ -5464,6 +6572,38 @@ func (s *Server) gitStatus(config GitConfig) GitStatus {
 }
 
 func (s *Server) gitCommitAndPush(config GitConfig, message string, push bool) (bool, error) {
+	s.gitMu.Lock()
+	defer s.gitMu.Unlock()
+	needsPush := push || config.AutoPush
+
+	s.gitWorkspaceMu.Lock()
+	var err error
+	if needsPush {
+		var repo string
+		repo, err = s.gitRepo()
+		if err == nil {
+			_, err = s.gitRemoteURL(repo, config.Remote, config.AutoPush)
+		}
+	}
+	if err == nil {
+		var committed bool
+		committed, err = s.gitCommitAndPushLocked(config, message)
+		s.gitWorkspaceMu.Unlock()
+		if err != nil {
+			return committed, err
+		}
+		if needsPush {
+			if err := s.gitPushWithPolicy(config, config.AutoPush); err != nil {
+				return committed, err
+			}
+		}
+		return committed, nil
+	}
+	s.gitWorkspaceMu.Unlock()
+	return false, err
+}
+
+func (s *Server) gitCommitAndPushLocked(config GitConfig, message string) (bool, error) {
 	repo, err := s.gitRepo()
 	if err != nil {
 		return false, err
@@ -5472,18 +6612,13 @@ func (s *Server) gitCommitAndPush(config GitConfig, message string, push bool) (
 	if err != nil {
 		return false, err
 	}
-	if push || config.AutoPush {
-		if _, err := s.gitRemoteURL(repo, config.Remote, config.AutoPush); err != nil {
-			return false, err
-		}
-	}
-	porcelain, err := runGit(repo, append([]string{"status", "--porcelain"}, append([]string{"--"}, scope...)...)...)
+	porcelain, err := s.runGitCommand(maxGitCommandDuration, repo, append([]string{"status", "--porcelain"}, append([]string{"--"}, scope...)...)...)
 	if err != nil {
 		return false, err
 	}
 	committed := false
 	if strings.TrimSpace(porcelain) != "" {
-		if _, err := runGit(repo, append([]string{"add", "--"}, scope...)...); err != nil {
+		if _, err := s.runGitCommand(maxGitCommandDuration, repo, append([]string{"add", "--"}, scope...)...); err != nil {
 			return false, err
 		}
 		message = strings.TrimSpace(message)
@@ -5493,20 +6628,21 @@ func (s *Server) gitCommitAndPush(config GitConfig, message string, push bool) (
 		if len(message) > 160 {
 			message = message[:160]
 		}
-		if _, err := runGit(repo, "commit", "-m", message); err != nil {
+		if _, err := s.runGitCommand(maxGitCommandDuration, repo, "commit", "-m", message); err != nil {
 			return false, err
 		}
 		committed = true
-	}
-	if push || config.AutoPush {
-		if err := s.gitPushWithPolicy(config, config.AutoPush); err != nil {
-			return committed, err
-		}
 	}
 	return committed, nil
 }
 
 func (s *Server) gitPush(config GitConfig) error {
+	s.gitMu.Lock()
+	defer s.gitMu.Unlock()
+	return s.gitPushLocked(config)
+}
+
+func (s *Server) gitPushLocked(config GitConfig) error {
 	return s.gitPushWithPolicy(config, config.AutoPush)
 }
 
@@ -5527,28 +6663,21 @@ func (s *Server) gitPushWithPolicy(config GitConfig, unattended bool) error {
 	}
 	branch := strings.TrimSpace(config.Branch)
 	if branch == "" {
-		branch, _ = runGit(repo, "branch", "--show-current")
+		branch, _ = s.runGitCommand(maxGitCommandDuration, repo, "branch", "--show-current")
 	}
 	if branch == "" {
 		return errors.New("git branch is not configured")
 	}
-	if err := validateGitBranch(branch); err != nil {
+	if err := s.validateGitBranch(branch); err != nil {
 		return err
 	}
-	_, err = runGitWithTimeout(maxGitPushDuration, repo, "push", remote, branch)
+	_, err = s.runGitCommand(maxGitPushDuration, repo, "push", remote, branch)
 	return err
 }
 
 func (s *Server) gitChangeIfConfigured(message string) error {
-	config, err := s.loadSiteConfig()
-	if err != nil {
-		return err
-	}
-	if !config.Git.Enabled || !config.Git.AutoCommit || strings.ToLower(config.Git.CommitOn) != "change" {
-		return nil
-	}
-	_, err = s.gitCommitAndPush(config.Git, message, false)
-	return err
+	s.queueGitSyncIfConfigured("change", message)
+	return nil
 }
 
 type commentsConfigInput struct {
@@ -5572,8 +6701,15 @@ func (s *Server) handleCommentsConfigAPI(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 
 	var input commentsConfigInput
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "application/json") {
@@ -5636,20 +6772,32 @@ func (s *Server) handleCommentsConfigAPI(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	original := config
+	var documentIDBackups []sourceBackup
 	if comments.Enabled {
-		if _, err := s.backfillDocumentIDs(); err != nil {
+		_, documentIDBackups, err = s.backfillDocumentIDsTransactionalContext(r.Context())
+		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "cannot enable comments: "+err.Error())
 			return
 		}
 	}
 	config.Comments = comments
 	if err := s.saveSiteConfig(config); err != nil {
+		if rollbackErr := restoreSourceBackups(s.SiteDir, documentIDBackups); rollbackErr != nil {
+			slog.Warn("comments source rollback failed", "error", rollbackErr)
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	build, err := s.Build()
+	build, err := s.buildContextWithWorkspace(r.Context())
 	if err != nil {
 		rollbackErr := s.saveSiteConfig(original)
+		if sourceRollbackErr := restoreSourceBackups(s.SiteDir, documentIDBackups); sourceRollbackErr != nil {
+			if rollbackErr == nil {
+				rollbackErr = sourceRollbackErr
+			} else {
+				rollbackErr = fmt.Errorf("%v; source rollback failed: %w", rollbackErr, sourceRollbackErr)
+			}
+		}
 		message := "comments settings rolled back because build failed: " + err.Error()
 		if rollbackErr != nil {
 			message += "; rollback failed: " + rollbackErr.Error()
@@ -5686,8 +6834,15 @@ func (s *Server) handleGitInitAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	gitInfo, statErr := os.Lstat(filepath.Join(s.SiteDir, ".git"))
 	if statErr == nil {
 		if gitInfo.Mode()&os.ModeSymlink != 0 || !gitInfo.IsDir() {
@@ -5700,8 +6855,11 @@ func (s *Server) handleGitInitAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, statErr.Error())
 		return
 	}
-	if _, err := runGit(s.SiteDir, "init", "-b", "main"); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+	s.gitMu.Lock()
+	_, gitErr := s.runGitCommand(maxGitCommandDuration, s.SiteDir, "init", "-b", "main")
+	s.gitMu.Unlock()
+	if gitErr != nil {
+		writeJSONError(w, http.StatusBadRequest, gitErr.Error())
 		return
 	}
 	config, err := s.loadSiteConfig()
@@ -5717,8 +6875,15 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
+	if !s.acquireWorkspaceReadAfterWrite(w, r) {
+		return
+	}
+	defer s.gitWorkspaceMu.RUnlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -5756,40 +6921,42 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "remote name contains invalid characters")
 		return
 	}
-	if err := validateGitBranch(gitConfig.Branch); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	if err := validateRemoteURLForAutomation(gitConfig.RemoteURL, gitConfig.AutoPush); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if gitConfig.RemoteURL != "" {
-		repo, err := s.gitRepo()
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "cannot configure a remote: "+err.Error())
-			return
+	if err := func() error {
+		s.gitMu.Lock()
+		defer s.gitMu.Unlock()
+		if err := s.validateGitBranch(gitConfig.Branch); err != nil {
+			return err
 		}
-		if _, remoteErr := runGit(repo, "remote", "get-url", gitConfig.Remote); remoteErr != nil {
-			if _, addErr := runGit(repo, "remote", "add", gitConfig.Remote, gitConfig.RemoteURL); addErr != nil {
-				writeJSONError(w, http.StatusBadRequest, addErr.Error())
-				return
+		if gitConfig.RemoteURL != "" {
+			repo, err := s.gitRepo()
+			if err != nil {
+				return fmt.Errorf("cannot configure a remote: %w", err)
 			}
-		} else if _, setErr := runGit(repo, "remote", "set-url", gitConfig.Remote, gitConfig.RemoteURL); setErr != nil {
-			writeJSONError(w, http.StatusBadRequest, setErr.Error())
-			return
+			if _, remoteErr := s.runGitCommand(maxGitCommandDuration, repo, "remote", "get-url", gitConfig.Remote); remoteErr != nil {
+				if _, addErr := s.runGitCommand(maxGitCommandDuration, repo, "remote", "add", gitConfig.Remote, gitConfig.RemoteURL); addErr != nil {
+					return addErr
+				}
+			} else if _, setErr := s.runGitCommand(maxGitCommandDuration, repo, "remote", "set-url", gitConfig.Remote, gitConfig.RemoteURL); setErr != nil {
+				return setErr
+			}
 		}
-	}
-	if gitConfig.AutoPush {
-		repo, err := s.gitRepo()
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "cannot enable auto-push: "+err.Error())
-			return
+		if gitConfig.AutoPush {
+			repo, err := s.gitRepo()
+			if err != nil {
+				return fmt.Errorf("cannot enable auto-push: %w", err)
+			}
+			if _, err := s.gitRemoteURL(repo, gitConfig.Remote, true); err != nil {
+				return fmt.Errorf("cannot enable auto-push: %w", err)
+			}
 		}
-		if _, err := s.gitRemoteURL(repo, gitConfig.Remote, true); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "cannot enable auto-push: "+err.Error())
-			return
-		}
+		return nil
+	}(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	config.Git = gitConfig
 	if err := s.saveSiteConfig(config); err != nil {
@@ -5799,24 +6966,6 @@ func (s *Server) handleGitConfigAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": config.Git, "status": s.gitStatus(config.Git)})
 }
 
-func validateGitBranch(value string) error {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil
-	}
-	if strings.ContainsAny(value, "\r\n\t ") {
-		return errors.New("branch name cannot contain whitespace")
-	}
-	command := exec.Command("git", "check-ref-format", "--branch", value)
-	if output, err := command.CombinedOutput(); err != nil {
-		message := strings.TrimSpace(string(output))
-		if message == "" {
-			message = "invalid Git branch name"
-		}
-		return errors.New(message)
-	}
-	return nil
-}
 func formBool(r *http.Request, key string) bool {
 	value := strings.ToLower(strings.TrimSpace(r.FormValue(key)))
 	return value == "1" || value == "true" || value == "on" || value == "yes"
@@ -5869,7 +7018,10 @@ func (s *Server) handleGitCommitAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
 	if err := r.ParseForm(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -5898,7 +7050,10 @@ func (s *Server) handleGitPushAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limitRequestBody(w, r, maxFormSize)
-	s.writeMu.Lock()
+	if err := s.acquireWriteContext(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	defer s.writeMu.Unlock()
 	config, err := s.loadSiteConfig()
 	if err != nil {

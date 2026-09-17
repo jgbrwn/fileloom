@@ -34,12 +34,14 @@ Include the affected route or feature, impact, reproduction steps, and any relev
 - Update the site's privacy notice because the external provider may process commenter identity, email, IP, User-Agent, and notification data.
 
 - SVG uploads are sanitized with an XML/element/attribute allowlist. Scripts, event handlers, foreign content, directives, external references, and unsafe CSS attributes are removed or rejected.
+- Local MP4/WebM video uploads remain same-origin and byte-preserving under the existing owner-only 16 MiB upload boundary. YouTube insertion accepts only HTTPS `youtube.com`/`youtu.be` watch, shorts, or embed URLs with an exact 11-character ID; public output uses a fixed privacy-enhanced `youtube-nocookie.com` iframe only after an explicit click, while editor and preview markers are inert.
 - Other allowed media formats are preserved as bytes; the upload body remains bounded at 16 MiB and writes use a temporary file followed by an atomic rename.
 - Builds and exports reject symlinks and non-regular files. Generated output excludes nested `.git`, `.fileloom`, and `.env` metadata paths.
 
 ## Operational hardening
 
-- CMS mutation requests have bounded bodies, admission control, HTTP server timeouts, and structured `slog` audit events containing action, route, actor, status, and result; request bodies and credentials are not logged. Build-dependent mutations roll back source/config/media changes when publication fails.
+- CMS mutation requests have bounded bodies, admission control, HTTP server timeouts, and structured `slog` audit events containing action, route, actor, status, and result; request bodies and credentials are not logged. Build-dependent mutations roll back source/config/media changes when publication fails. Filesystem builds accept request/background contexts and stop before publication when canceled, leaving the last complete public output in place.
+- Automatic Git synchronization is queued outside mutation/build/publication locks, serialized with manual Git operations, and coordinated with workspace mutations so a failed build cannot be committed as a transient state. Git failures are reported through status/logs rather than changing a successful mutation into an HTTP failure.
 - Revision snapshots are retained up to 100 per path and 128 MiB total, retaining newest snapshots first.
 - Git commands are non-interactive and time-bounded. Automatic pushes validate effective fetch/push URLs and reject local, plain-HTTP, and Git-protocol push targets.
-- CSP is opt-in through `FILELOOM_CMS_CSP` and `FILELOOM_PUBLIC_CSP`; it is intentionally not enabled by default because Deckflow editor and user-theme behavior may depend on inline or external resources.
+- CSP is opt-in through `FILELOOM_CMS_CSP` and `FILELOOM_PUBLIC_CSP`; it is intentionally not enabled by default because Deckflow editor and user-theme behavior may depend on inline or external resources. When public CSP is enabled, Fileloom adds only `https://www.youtube-nocookie.com` to `frame-src` for pages containing a valid YouTube marker; CMS CSP remains unchanged.

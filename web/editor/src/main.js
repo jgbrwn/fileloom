@@ -1,6 +1,11 @@
 import { createElementTarget } from "@deckflow/html-editor/core";
-import { patchElementInHtml } from "@deckflow/html-editor/html-patch";
+import { patchElementInHtml, patchElementsInHtml } from "@deckflow/html-editor/html-patch";
 import { mountHtmlEditor } from "@deckflow/html-editor/ui";
+import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+import { html as htmlLanguage } from "@codemirror/lang-html";
+import { EditorState, Compartment } from "@codemirror/state";
+import { oneDark } from "@codemirror/theme-one-dark";
+import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import {
   injectThemePreviewStyles,
   shieldThemeTemplate,
@@ -8,6 +13,25 @@ import {
   unshieldThemeTemplate,
 } from "./theme-template.js";
 import "./style.css";
+
+const sourceWrapStorageKey = "fileloom.editor.source-wrap-lines";
+const youtubeVideoIDPattern = /^[A-Za-z0-9_-]{11}$/;
+
+function readSourceWrapPreference() {
+  try {
+    return window.localStorage.getItem(sourceWrapStorageKey) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeSourceWrapPreference(value) {
+  try {
+    window.localStorage.setItem(sourceWrapStorageKey, value ? "true" : "false");
+  } catch {
+    // Local preferences are best effort; source editing must still work.
+  }
+}
 
 const app = document.querySelector("#app");
 const params = new URLSearchParams(window.location.search);
@@ -33,7 +57,13 @@ const state = {
   conflict: null,
   selected: null,
   codeEdit: null,
+  sourceEditorView: null,
+  sourceWrapCompartment: null,
+  sourceBodyHTML: "",
+  baseBodyHTML: "",
+  sourceBodyOverride: undefined,
   sheet: null,
+  sourceWrapLines: readSourceWrapPreference(),
 };
 
 const metadataFields = ["title", "date", "tags", "category", "excerpt", "status", "publish_at", "comments"];
@@ -74,6 +104,55 @@ function bodyHTMLFromEditorDocument(html) {
   } catch {
     return String(html || "");
   }
+}
+
+function rawBodyHTMLFromEditorDocument(html) {
+  const input = String(html || "");
+  const opening = /<body\b[^>]*>/i.exec(input);
+  if (!opening) return input;
+  const bodyStart = opening.index + opening[0].length;
+  const bodyEnd = input.toLowerCase().lastIndexOf("</body>");
+  if (bodyEnd < bodyStart) return input.slice(bodyStart);
+  return input.slice(bodyStart, bodyEnd);
+}
+
+function validYouTubeMarkerFromSource(source) {
+  try {
+    const parsed = new DOMParser().parseFromString(String(source || ""), "text/html");
+    return [...parsed.querySelectorAll("[data-fileloom-youtube]")].some((element) => youtubeVideoIDPattern.test(String(element.getAttribute("data-youtube-id") || "").trim()));
+  } catch {
+    return false;
+  }
+}
+
+function validFileloomMediaMarkerFromSource(source) {
+  try {
+    const parsed = new DOMParser().parseFromString(String(source || ""), "text/html");
+    return validYouTubeMarkerFromSource(source) || Boolean(parsed.querySelector("[data-fileloom-video], figure.fileloom-video"));
+  } catch {
+    return /data-fileloom-video|fileloom-video/i.test(String(source || ""));
+  }
+}
+
+function ensureEditorMediaStyles(html) {
+  const source = String(html || "");
+  if (!validFileloomMediaMarkerFromSource(source) || source.includes("/_cms/assets/fileloom-media.css")) return source;
+  const link = '<link rel="stylesheet" href="/_cms/assets/fileloom-media.css">';
+  const index = source.toLowerCase().indexOf("</head>");
+  return index >= 0 ? `${source.slice(0, index)}${link}${source.slice(index)}` : `${link}${source}`;
+}
+
+function rawBodyHTMLForRecord(record = state.record) {
+  if (!isThemeResource(record) && typeof record?.body_html === "string") return record.body_html;
+  return String(record?.html || "");
+}
+
+function localBodyHTML() {
+  return isThemeResource() ? sourceHTMLForSave(state.editor?.getHtml() || state.currentHTML) : state.sourceBodyHTML;
+}
+
+function baseBodyHTML() {
+  return typeof state.baseBodyHTML === "string" ? state.baseBodyHTML : rawBodyHTMLForRecord();
 }
 
 function normalizedBodyHTML(html) {
@@ -177,7 +256,8 @@ function editorDocument(record) {
     return injectThemePreviewStyles(shielded.html, record.stylesheet_css || "");
   }
   const css = String(record.stylesheet_css || "").replace(/<\/style/gi, "<\\/style");
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/_cms/assets/fileloom-code.css"><style>${css}</style><style>html{background:#fff}body{min-height:100vh;margin:0}</style></head><body>${record.html || ""}</body></html>`;
+  const mediaCSS = validFileloomMediaMarkerFromSource(rawBodyHTMLForRecord(record)) ? '<link rel="stylesheet" href="/_cms/assets/fileloom-media.css">' : "";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/_cms/assets/fileloom-code.css">${mediaCSS}<style>${css}</style><style>html{background:#fff}body{min-height:100vh;margin:0}</style></head><body>${rawBodyHTMLForRecord(record)}</body></html>`;
 }
 
 function insertIntoBody(source, fragment) {
@@ -359,6 +439,50 @@ function patchOpeningTagAttributes(tag, values = {}, remove = new Set()) {
   for (const replacement of replacements) result = `${result.slice(0, replacement.start)}${replacement.value}${result.slice(replacement.end)}`;
   return result;
 }
+function structuralSelectorMatch(element, selector) {
+  if (!element || !selector) return false;
+  if (selector === "pre.fileloom-code-block, pre[data-fileloom-code]") return element.tagName === "PRE" && (element.classList.contains("fileloom-code-block") || element.hasAttribute("data-fileloom-code"));
+  if (selector === "figure.fileloom-image") return element.tagName === "FIGURE" && element.classList.contains("fileloom-image");
+  if (selector === "figure.fileloom-video") return element.tagName === "FIGURE" && element.classList.contains("fileloom-video");
+  if (selector === "img") return element.tagName === "IMG";
+  if (selector === "video") return element.tagName === "VIDEO";
+  if (selector === "[data-fileloom-youtube]") return element.hasAttribute("data-fileloom-youtube");
+  return false;
+}
+
+function rawElementRangesForSelector(source, selector) {
+  const tagNames = selector === "img" ? ["img"] : selector === "video" ? ["video"] : selector === "pre.fileloom-code-block, pre[data-fileloom-code]" ? ["pre"] : selector === "[data-fileloom-youtube]" ? ["figure", "div"] : ["figure"];
+  const ranges = [];
+  for (const tagName of tagNames) {
+    for (const opening of rawOpeningTagRanges(source, tagName)) {
+      const commentStart = source.lastIndexOf("<!--", opening.start);
+      const commentEnd = source.lastIndexOf("-->", opening.start);
+      if (commentStart > commentEnd) continue;
+      const openingTag = source.slice(opening.start, opening.end);
+      let element = null;
+      try {
+        const parsed = new DOMParser().parseFromString(`${openingTag}</${tagName}>`, "text/html");
+        element = parsed.body?.firstElementChild || null;
+      } catch {
+        element = null;
+      }
+      if (!structuralSelectorMatch(element, selector)) continue;
+      const end = ["img"].includes(tagName) || /\/\s*>$/.test(openingTag) ? opening.end : matchingElementEnd(source, opening.start, opening.end, tagName);
+      if (end >= opening.end) ranges.push({ start: opening.start, end });
+    }
+  }
+  return ranges.sort((left, right) => left.start - right.start);
+}
+
+function sourceFallbackRange(source, info, selector) {
+  if (!info || !selector) return null;
+  const ranges = rawElementRangesForSelector(source, selector);
+  const index = Number.isInteger(info.selectorIndex) && info.selectorIndex >= 0
+    ? info.selectorIndex
+    : Number.isInteger(info.target?.selectorIndex) && info.target.selectorIndex >= 0 ? info.target.selectorIndex : 0;
+  return ranges[index] || null;
+}
+
 function sourceRangeFromHTML(source, selectedHTML, occurrence) {
   let cursor = 0;
   let index = -1;
@@ -376,15 +500,31 @@ function sourceElementRange(source, parsed, element) {
   if (!selectedHTML || ["BODY", "HTML"].includes(element.tagName)) return null;
   const candidates = [...parsed.querySelectorAll("*")].filter((candidate) => cleanSelectedHTML(candidate) === selectedHTML);
   const occurrence = candidates.indexOf(element);
-  if (occurrence < 0) return null;
-  return sourceRangeFromHTML(source, selectedHTML, occurrence);
+  if (occurrence >= 0) {
+    const exact = sourceRangeFromHTML(source, selectedHTML, occurrence);
+    if (exact) return exact;
+  }
+  const selector = element.matches?.("pre.fileloom-code-block, pre[data-fileloom-code]") ? "pre.fileloom-code-block, pre[data-fileloom-code]"
+    : element.matches?.("figure.fileloom-image") ? "figure.fileloom-image"
+    : element.matches?.("figure.fileloom-video") ? "figure.fileloom-video"
+      : element.matches?.("[data-fileloom-youtube]") ? "[data-fileloom-youtube]"
+        : element.matches?.("img") ? "img"
+          : element.matches?.("video") ? "video" : "";
+  if (!selector) return null;
+  const selectorCandidates = [...parsed.querySelectorAll(selector)];
+  const selectorIndex = selectorCandidates.indexOf(element);
+  const fallback = sourceFallbackRange(source, { element, selectorIndex }, selector);
+  return fallback ? { ...fallback, html: source.slice(fallback.start, fallback.end) } : null;
 }
 
 function sourceSelectionRange(source, selection, closestSelector = "") {
   const info = sourceSelectionInfo(source, selection, closestSelector);
   if (!info) return null;
   const range = sourceRangeFromHTML(source, info.selectedHTML, info.occurrence);
-  return range ? { ...info, ...range } : null;
+  if (range) return { ...info, ...range };
+  const fallbackSelector = closestSelector || (selection === state.selected ? selectedStructuralSelector() : "");
+  const fallback = sourceFallbackRange(source, info, fallbackSelector);
+  return fallback ? { ...info, ...fallback, html: source.slice(fallback.start, fallback.end) } : null;
 }
 
 function sourceSelectionElement(source, selection) {
@@ -404,27 +544,53 @@ function replaceSelection(source, replacement, selection, closestSelector = "") 
   return `${source.slice(0, info.start)}${replacement}${source.slice(info.end)}`;
 }
 
-function replaceEditorHTML(next, { clearSelection = true } = {}) {
-  if (!state.editor) return Promise.resolve();
+function sourceOrEditorHTML() {
+  return isThemeResource() ? (state.editor?.getHtml() || state.currentHTML) : state.sourceBodyHTML;
+}
+
+async function applySourceHTML(nextSource, options = {}) {
+  if (isThemeResource()) return applyEditorHTML(nextSource, options);
+  return applyEditorHTML(replaceEditorBodyHTML(state.editor?.getHtml() || state.currentHTML, nextSource), {
+    ...options,
+    sourceBodyHTML: nextSource,
+  });
+}
+
+function sourceBodyAfterDeckflowChange(previousBody, html, patches) {
+  if (Array.isArray(patches) && patches.length) {
+    const result = patchElementsInHtml(`<body>${previousBody}</body>`, patches);
+    if (result.matched) return rawBodyHTMLFromEditorDocument(result.html);
+  }
+  return rawBodyHTMLFromEditorDocument(html);
+}
+
+async function replaceEditorHTML(next, { clearSelection = true, sourceBodyHTML } = {}) {
+  if (!state.editor) return;
   if (clearSelection) {
     state.selected = null;
     updateSelection(null);
   }
-  return state.editor.setHtml(next).then(() => {
+  state.sourceBodyOverride = sourceBodyHTML;
+  try {
+    await state.editor.setHtml(isThemeResource() ? next : ensureEditorMediaStyles(next));
     state.currentHTML = state.editor.getHtml();
-    installEditorKeyboardShortcuts();
-  });
+  } finally {
+    if (!isThemeResource() && sourceBodyHTML !== undefined) state.sourceBodyHTML = sourceBodyHTML;
+    state.sourceBodyOverride = undefined;
+  }
+  installEditorKeyboardShortcuts();
 }
 
-function pushHostUndo(html) {
-  if (!html) return;
-  state.hostUndo.push(html);
+function pushHostUndo(entry, bodyHTML = state.sourceBodyHTML) {
+  const value = typeof entry === "string" ? { html: entry, bodyHTML } : entry;
+  if (!value?.html) return;
+  state.hostUndo.push({ html: value.html, bodyHTML: value.bodyHTML });
   if (state.hostUndo.length > 50) state.hostUndo.shift();
 }
 
-function recordHostChange(previous, next) {
+function recordHostChange(previous, next, previousBodyHTML = state.sourceBodyHTML) {
   if (!previous || previous === next) return;
-  pushHostUndo(previous);
+  pushHostUndo({ html: previous, bodyHTML: previousBodyHTML });
   state.hostRedo = [];
 }
 
@@ -461,13 +627,15 @@ function installEditorKeyboardShortcuts() {
   state.editorKeyboardCleanup = () => previewDocument.removeEventListener("keydown", handleKeyDown, true);
 }
 
-async function applyEditorHTML(next, { recordHistory = true } = {}) {
+async function applyEditorHTML(next, { recordHistory = true, sourceBodyHTML } = {}) {
   if (!state.editor) return;
   const previous = state.editor.getHtml();
-  if (next === previous) return;
-  if (recordHistory) recordHostChange(previous, next);
+  if (next === previous && sourceBodyHTML === undefined) return;
+  const previousBodyHTML = state.sourceBodyHTML;
+  if (recordHistory) recordHostChange(previous, next, previousBodyHTML);
   state.changeVersion += 1;
-  await replaceEditorHTML(next);
+  await replaceEditorHTML(next, { sourceBodyHTML });
+  if (!isThemeResource() && sourceBodyHTML === undefined) state.sourceBodyHTML = rawBodyHTMLFromEditorDocument(state.currentHTML);
   setDirty(true);
 }
 
@@ -480,10 +648,10 @@ async function undoEditorChangeNow() {
   }
   const current = state.editor.getHtml();
   const previous = state.hostUndo.pop();
-  state.hostRedo.push(current);
+  state.hostRedo.push({ html: current, bodyHTML: state.sourceBodyHTML });
   if (state.hostRedo.length > 50) state.hostRedo.shift();
   state.changeVersion += 1;
-  await replaceEditorHTML(previous);
+  await replaceEditorHTML(previous.html, { sourceBodyHTML: isThemeResource() ? undefined : previous.bodyHTML });
   setDirty(true);
   setStatus("Undid change", "dirty");
 }
@@ -501,9 +669,9 @@ async function redoEditorChangeNow() {
   }
   const current = state.editor.getHtml();
   const next = state.hostRedo.pop();
-  pushHostUndo(current);
+  pushHostUndo({ html: current, bodyHTML: state.sourceBodyHTML });
   state.changeVersion += 1;
-  await replaceEditorHTML(next);
+  await replaceEditorHTML(next.html, { sourceBodyHTML: isThemeResource() ? undefined : next.bodyHTML });
   setDirty(true);
   setStatus("Redid change", "dirty");
 }
@@ -625,17 +793,33 @@ function selectedImageBlock() {
   return candidate;
 }
 
+function selectedVideoBlock() {
+  const element = state.selected?.element;
+  const figure = element?.closest?.("figure.fileloom-video");
+  if (figure?.querySelector("video")) return figure;
+  return element?.closest?.("video") || null;
+}
+
+function selectedYouTubeBlock() {
+  return state.selected?.element?.closest?.("[data-fileloom-youtube]") || null;
+}
+
+function selectedStructuralSelector() {
+  const element = selectedStructuralElement();
+  if (!element) return "";
+  if (selectedCodeBlock()) return "pre.fileloom-code-block, pre[data-fileloom-code]";
+  if (selectedImageBlock()) return element.tagName === "FIGURE" ? "figure.fileloom-image" : "img";
+  if (selectedVideoBlock()) return element.tagName === "FIGURE" ? "figure.fileloom-video" : "video";
+  if (selectedYouTubeBlock()) return "[data-fileloom-youtube]";
+  return "";
+}
+
 function selectedStructuralElement() {
-  return selectedCodeBlock() || selectedImageBlock() || state.selected?.element || null;
+  return selectedCodeBlock() || selectedImageBlock() || selectedVideoBlock() || selectedYouTubeBlock() || state.selected?.element || null;
 }
 
 function structuralSelectionInfo(source) {
-  const selector = selectedCodeBlock()
-    ? "pre.fileloom-code-block, pre[data-fileloom-code]"
-    : selectedImageBlock()
-      ? "figure.fileloom-image, img"
-      : "";
-  return sourceSelectionRange(source, state.selected, selector);
+  return sourceSelectionRange(source, state.selected, selectedStructuralSelector());
 }
 
 function elementInspectorTarget() {
@@ -740,7 +924,7 @@ async function submitElementInspector(form) {
     setStatus("Image source is unsafe or invalid", "error");
     return;
   }
-  const source = state.editor?.getHtml() || "";
+  const source = sourceOrEditorHTML();
   const info = elementInspectorInfo(source);
   const range = sourceOpeningTagRange(source, info);
   if (!info || !range) {
@@ -754,7 +938,8 @@ async function submitElementInspector(form) {
     setStatus("No property changes", "neutral");
     return;
   }
-  await applyEditorHTML(`${source.slice(0, range.start)}${nextOpeningTag}${source.slice(range.end)}`);
+  const next = `${source.slice(0, range.start)}${nextOpeningTag}${source.slice(range.end)}`;
+  await applySourceHTML(next);
   closeSheet();
   setStatus("Element properties updated", "dirty");
 }
@@ -764,8 +949,11 @@ function selectionOperationsHTML() {
   if (!element || ["BODY", "HTML"].includes(element.tagName)) return "";
   const previous = element.previousElementSibling;
   const next = element.nextElementSibling;
-  const imageAction = selectedImageBlock() ? '<button class="secondary-button" data-action="media">Replace image</button>' : "";
-  return `<div class="selection-actions"><span class="eyebrow">Element actions</span><div class="selection-action-grid"><button class="secondary-button" data-action="properties">Edit properties</button>${imageAction}<button class="secondary-button" data-action="duplicate">Duplicate</button><button class="secondary-button" data-action="move-up" ${previous ? "" : "disabled"}>Move up</button><button class="secondary-button" data-action="move-down" ${next ? "" : "disabled"}>Move down</button><button class="secondary-button danger-button" data-action="delete-selection">Delete</button></div></div>`;
+  let mediaAction = "";
+  if (selectedImageBlock()) mediaAction = '<button class="secondary-button" data-action="media">Replace image</button>';
+  else if (selectedVideoBlock()) mediaAction = '<button class="secondary-button" data-action="media">Replace video</button>';
+  else if (selectedYouTubeBlock()) mediaAction = '<button class="secondary-button" data-action="media">Replace YouTube video</button>';
+  return `<div class="selection-actions"><span class="eyebrow">Element actions</span><div class="selection-action-grid"><button class="secondary-button" data-action="properties">Edit properties</button>${mediaAction}<button class="secondary-button" data-action="duplicate">Duplicate</button><button class="secondary-button" data-action="move-up" ${previous ? "" : "disabled"}>Move up</button><button class="secondary-button" data-action="move-down" ${next ? "" : "disabled"}>Move down</button><button class="secondary-button danger-button" data-action="delete-selection">Delete</button></div></div>`;
 }
 
 function duplicateWithoutIDs(element) {
@@ -776,13 +964,13 @@ function duplicateWithoutIDs(element) {
 }
 
 async function duplicateSelection() {
-  const source = state.editor?.getHtml() || "";
+  const source = sourceOrEditorHTML();
   const info = structuralSelectionInfo(source);
   if (!info) return;
   const duplicate = duplicateWithoutIDs(info.element);
   if (!duplicate) return;
   const next = `${source.slice(0, info.end)}\n${duplicate}\n${source.slice(info.end)}`;
-  await applyEditorHTML(next);
+  await applySourceHTML(next);
   closeSheet();
   setStatus("Element duplicated", "dirty");
 }
@@ -790,25 +978,27 @@ async function duplicateSelection() {
 function patchSelectedStructuralElement(source, operation) {
   const element = selectedStructuralElement();
   if (!element) return null;
-  const result = patchElementInHtml(source, createElementTarget(element), [operation]);
-  return result.matched ? result.html : null;
+  const patchSource = isThemeResource() ? source : `<body>${source}</body>`;
+  const result = patchElementInHtml(patchSource, createElementTarget(element), [operation]);
+  if (!result.matched) return null;
+  return isThemeResource() ? result.html : rawBodyHTMLFromEditorDocument(result.html);
 }
 
 
 async function deleteSelection() {
-  const source = state.editor?.getHtml() || "";
+  const source = sourceOrEditorHTML();
   const next = patchSelectedStructuralElement(source, { type: "delete-element" });
   if (next == null || next === source) {
     setStatus("Could not resolve the selected element", "error");
     return;
   }
-  await applyEditorHTML(next);
+  await applySourceHTML(next);
   closeSheet();
   setStatus("Element deleted", "dirty");
 }
 
 async function moveSelection(direction) {
-  const source = state.editor?.getHtml() || "";
+  const source = sourceOrEditorHTML();
   const info = structuralSelectionInfo(source);
   const sibling = direction < 0 ? info?.element?.previousElementSibling : info?.element?.nextElementSibling;
   if (!info || !sibling) {
@@ -829,7 +1019,7 @@ async function moveSelection(direction) {
     setStatus("Could not move the selected element", "error");
     return;
   }
-  await applyEditorHTML(next);
+  await applySourceHTML(next);
   closeSheet();
   setStatus(direction < 0 ? "Element moved up" : "Element moved down", "dirty");
 }
@@ -879,21 +1069,21 @@ async function submitCodeForm(form) {
   const mode = form.dataset.codeMode;
   if (mode === "update") {
     await state.editor.flush();
-    const source = state.editor.getHtml();
+    const source = sourceOrEditorHTML();
     const block = state.codeEdit?.block || selectedCodeBlock();
     const next = replaceCodeBlockSource(source, block, codeBlockFragment(language, code));
     if (next === source) {
       setStatus("Could not resolve the selected code block", "error");
       return;
     }
-    await applyEditorHTML(next);
+    await applySourceHTML(next);
     closeSheet();
     setStatus("Code block updated", "dirty");
     return;
   }
   const hadSelection = Boolean(state.selected);
-  const next = insertAfterSelection(state.editor.getHtml(), codeBlockFragment(language, code), state.selected);
-  await applyEditorHTML(next);
+  const next = insertAfterSelection(sourceOrEditorHTML(), codeBlockFragment(language, code), state.selected);
+  await applySourceHTML(next);
   closeSheet();
   setStatus(hadSelection ? "Code block added after selection" : "Code block added", "dirty");
 }
@@ -908,13 +1098,112 @@ function replaceEditorBodyHTML(source, bodyHTML) {
   return `${input.slice(0, bodyStart)}${bodyHTML || ""}${input.slice(bodyEnd)}`;
 }
 
+function sourceEditorValue() {
+  const view = state.sourceEditorView;
+  if (view) return view.state.sliceDoc();
+  return String(document.querySelector("#source-form [data-source-mirror]")?.value || "");
+}
+
+function syncSourceEditorMirror() {
+  const form = document.querySelector("#source-form");
+  const mirror = form?.querySelector("[data-source-mirror]");
+  if (mirror) mirror.value = sourceEditorValue();
+}
+
+function destroySourceEditor() {
+  state.sourceEditorView?.destroy();
+  state.sourceEditorView = null;
+  state.sourceWrapCompartment = null;
+}
+
+function sourceEditorLineSeparator(source) {
+  if (String(source).includes("\r\n")) return "\r\n";
+  if (String(source).includes("\r")) return "\r";
+  return "\n";
+}
+
+function mountSourceEditor(source) {
+  destroySourceEditor();
+  const parent = document.querySelector("[data-source-editor]");
+  if (!parent) return;
+  const wrapCompartment = new Compartment();
+  state.sourceWrapCompartment = wrapCompartment;
+  const editorState = EditorState.create({
+    doc: String(source || ""),
+    extensions: [
+      EditorState.lineSeparator.of(sourceEditorLineSeparator(source)),
+      htmlLanguage(),
+      oneDark,
+      lineNumbers(),
+      history(),
+      keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+      EditorView.contentAttributes.of({
+        spellcheck: "false",
+        autocapitalize: "off",
+        autocomplete: "off",
+        autocorrect: "off",
+        "aria-label": "HTML source",
+      }),
+      wrapCompartment.of(state.sourceWrapLines ? EditorView.lineWrapping : []),
+      EditorView.updateListener.of((update) => {
+        if (!update.docChanged) return;
+        syncSourceEditorMirror();
+      }),
+    ],
+  });
+  state.sourceEditorView = new EditorView({ state: editorState, parent });
+  parent.dataset.wrapLines = state.sourceWrapLines ? "on" : "off";
+  const cmEditor = parent.querySelector(".cm-editor");
+  if (cmEditor) cmEditor.dataset.wrapLines = parent.dataset.wrapLines;
+  syncSourceEditorMirror();
+}
+
+function updateSourceEditorWrap() {
+  const parent = document.querySelector("[data-source-editor]");
+  const wrapLines = state.sourceWrapLines ? "on" : "off";
+  if (parent) {
+    parent.dataset.wrapLines = wrapLines;
+    const cmEditor = parent.querySelector(".cm-editor");
+    if (cmEditor) cmEditor.dataset.wrapLines = wrapLines;
+  }
+  const mirror = document.querySelector("#source-form [data-source-mirror]");
+  if (mirror) mirror.dataset.wrapLines = wrapLines;
+  if (state.sourceEditorView && state.sourceWrapCompartment) {
+    state.sourceEditorView.dispatch({
+      effects: state.sourceWrapCompartment.reconfigure(state.sourceWrapLines ? EditorView.lineWrapping : []),
+    });
+  }
+  syncSourceEditorMirror();
+}
+
 function sourceSheetHTML(source) {
+  const wrapLines = state.sourceWrapLines ? "on" : "off";
   return `<div class="sheet-heading"><div><span class="eyebrow">Advanced editing</span><h2>HTML source</h2><p class="sheet-subtitle">Edit the body HTML for <strong>${escapeHTML(state.record?.path || "this page")}</strong>.</p></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
     <form id="source-form" class="source-form">
-      <label class="form-field"><span class="code-editor-label"><strong>Body HTML</strong><small>Front matter and page metadata stay protected</small></span><textarea name="html" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" aria-label="HTML source" placeholder="<p>Write HTML here…">${escapeHTML(source)}</textarea></label>
+      <div class="source-editor-toolbar"><span class="code-editor-label"><strong>Body HTML</strong><small>Front matter and page metadata stay protected</small></span><label class="source-wrap-toggle"><input type="checkbox" data-source-wrap-lines aria-label="Wrap lines" ${state.sourceWrapLines ? "checked" : ""}><span class="source-wrap-copy"><strong>Wrap lines</strong><small>Presentation only</small></span></label></div>
+      <div class="source-editor-field"><div class="source-editor" data-source-editor data-wrap-lines="${wrapLines}" aria-label="HTML source"></div><input type="hidden" name="html" data-source-mirror data-wrap-lines="${wrapLines}" value=""></div>
       <p class="source-warning"><strong>Use this for precise HTML changes.</strong> Visual edits, code blocks, comments, and custom attributes remain source-backed; the next visual edit will use this HTML.</p>
       <div class="details-actions"><button type="button" class="secondary-button" data-action="close-sheet">Cancel</button><button type="submit" class="primary-button">Apply HTML</button></div>
     </form>`;
+}
+
+function syncSourceWrapPreference() {
+  const parent = document.querySelector("[data-source-editor]");
+  const wrapLines = state.sourceWrapLines ? "on" : "off";
+  if (parent) {
+    parent.dataset.wrapLines = wrapLines;
+    const cmEditor = parent.querySelector(".cm-editor");
+    if (cmEditor) cmEditor.dataset.wrapLines = wrapLines;
+  }
+  const toggle = document.querySelector("#source-form [data-source-wrap-lines]");
+  if (toggle) toggle.checked = state.sourceWrapLines;
+  updateSourceEditorWrap();
+}
+
+function setSourceWrapPreference(value) {
+  state.sourceWrapLines = Boolean(value);
+  writeSourceWrapPreference(state.sourceWrapLines);
+  syncSourceWrapPreference();
 }
 
 async function openSourceSheet() {
@@ -923,20 +1212,22 @@ async function openSourceSheet() {
     return;
   }
   await state.editor.flush();
-  const source = bodyHTMLFromEditorDocument(state.editor.getHtml());
+  const source = state.sourceBodyHTML;
   openSheet("source");
   document.querySelector("#sheet-content").innerHTML = sourceSheetHTML(source);
+  mountSourceEditor(source);
 }
 
 async function submitSourceForm(form) {
   await state.editor.flush();
-  const source = state.editor.getHtml();
-  const next = replaceEditorBodyHTML(source, form.elements.html.value);
-  if (next === source) {
+  const bodyHTML = sourceEditorValue();
+  if (bodyHTML === state.sourceBodyHTML) {
     setStatus("No HTML changes", "neutral");
     return;
   }
-  await applyEditorHTML(next);
+  const source = state.editor.getHtml();
+  const next = replaceEditorBodyHTML(source, bodyHTML);
+  await applyEditorHTML(next, { sourceBodyHTML: bodyHTML });
   closeSheet();
   setStatus("HTML source applied", "dirty");
 }
@@ -965,10 +1256,120 @@ function blockFragment(type) {
 async function insertBlock(type) {
   if (!state.editor) return;
   const hadSelection = Boolean(state.selected);
-  const next = insertAfterSelection(state.editor.getHtml(), blockFragment(type), state.selected);
-  await applyEditorHTML(next);
+  const next = insertAfterSelection(sourceOrEditorHTML(), blockFragment(type), state.selected);
+  await applySourceHTML(next);
   closeSheet();
   setStatus(hadSelection ? "Block added after selection" : "Block added", "dirty");
+}
+
+function youtubeVideoIDFromURL(value) {
+  const input = String(value || "").trim();
+  if (!input || /[\s\u0000-\u001f\u007f]/.test(input)) throw new Error("Enter one HTTPS YouTube URL");
+  let parsed;
+  try { parsed = new URL(input); } catch { throw new Error("YouTube URL is invalid"); }
+  if (parsed.protocol !== "https:") throw new Error("YouTube URL must use HTTPS");
+  if (!parsed.hostname || parsed.username || parsed.password || parsed.port) throw new Error("YouTube URL host is not allowed");
+  if (parsed.hash) throw new Error("YouTube URL fragments are not supported");
+  const host = parsed.hostname.toLowerCase();
+  let id = "";
+  if (host === "youtube.com" || host === "www.youtube.com") {
+    if (parsed.pathname === "/watch") {
+      const values = parsed.searchParams.getAll("v");
+      if (values.length !== 1) throw new Error("YouTube watch URL must contain one video ID");
+      id = values[0];
+    } else {
+      const parts = parsed.pathname.split("/").filter((part) => part !== "");
+      if (parts.length !== 2 || !["shorts", "embed"].includes(parts[0]) || parsed.pathname !== `/${parts[0]}/${parts[1]}`) {
+        throw new Error("YouTube URL form is not allowed");
+      }
+      id = parts[1];
+    }
+  } else if (host === "youtu.be") {
+    const parts = parsed.pathname.split("/").filter((part) => part !== "");
+    if (parts.length !== 1 || parsed.pathname !== `/${parts[0]}`) throw new Error("youtu.be URL form is not allowed");
+    id = parts[0];
+  } else {
+    throw new Error("YouTube URL host is not allowed");
+  }
+  if (!youtubeVideoIDPattern.test(id)) throw new Error("YouTube video ID must be exactly 11 characters");
+  return id;
+}
+
+function youtubeMarkerFragment(id, title = "YouTube video", fallback = "Watch on YouTube") {
+  if (!youtubeVideoIDPattern.test(String(id || ""))) return "";
+  return `<figure class="fileloom-youtube" data-fileloom-youtube data-youtube-id="${escapeHTML(id)}" data-youtube-title="${escapeHTML(title)}" data-youtube-fallback="${escapeHTML(fallback)}"><div class="fileloom-youtube-placeholder" role="img" aria-label="${escapeHTML(title)}"><span class="fileloom-youtube-play" aria-hidden="true">▶</span><span class="fileloom-youtube-copy"><strong>${escapeHTML(title)}</strong><small>${escapeHTML(fallback)}</small></span></div></figure>`;
+}
+
+function mediaFileKind(file) {
+  if (["image", "video"].includes(String(file?.media_type || ""))) return String(file.media_type);
+  const name = String(file?.name || file?.path || "");
+  if (/\.(mp4|webm)$/i.test(name)) return "video";
+  if (/\.(avif|gif|jpe?g|png|svg|webp)$/i.test(name)) return "image";
+  return "other";
+}
+
+function mediaFileLabel(file) {
+  const name = String(file?.name || file?.path || "");
+  const extension = name.includes(".") ? name.split(".").pop().toUpperCase() : "MEDIA";
+  return `${extension} · ${formatMediaBytes(file?.size)}`;
+}
+
+function formatMediaBytes(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0) return "Size unavailable";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10240 ? 1 : 0)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function formatMediaDuration(value) {
+  const duration = Number(value);
+  if (!Number.isFinite(duration) || duration < 0) return "Metadata pending";
+  const total = Math.round(duration);
+  const minutes = Math.floor(total / 60);
+  const seconds = String(total % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+function mediaCardHTML(file) {
+  const kind = mediaFileKind(file);
+  const url = mediaURL(file);
+  const name = String(file?.name || file?.path || "media");
+  const metadata = mediaFileLabel(file);
+  if (kind === "video") {
+    return `<article class="media-card media-card-video"><video class="media-preview" src="${escapeHTML(url)}" controls preload="metadata" muted playsinline aria-label="Preview ${escapeHTML(name)}"></video><button type="button" class="media-select" data-media-url="${escapeHTML(url)}" data-media-name="${escapeHTML(name)}" data-media-kind="video" data-media-mime="${escapeHTML(file?.mime || (/\.webm$/i.test(name) ? "video/webm" : "video/mp4"))}"><strong>${escapeHTML(name)}</strong><span data-media-duration>Metadata pending</span><small data-media-size>${escapeHTML(metadata)}</small></button></article>`;
+  }
+  return `<button type="button" class="media-card media-select" data-media-url="${escapeHTML(url)}" data-media-name="${escapeHTML(name)}" data-media-kind="image"><img src="${escapeHTML(url)}" alt=""><span>${escapeHTML(name)}</span><small>${escapeHTML(metadata)}</small></button>`;
+}
+
+async function insertYouTube(url) {
+  const id = youtubeVideoIDFromURL(url);
+  const marker = youtubeMarkerFragment(id);
+  if (!marker) throw new Error("YouTube video ID is invalid");
+  await state.editor.flush();
+  const source = sourceOrEditorHTML();
+  const selected = selectedYouTubeBlock();
+  const next = selected
+    ? replaceSelection(source, marker, state.selected, "[data-fileloom-youtube]")
+    : insertAfterSelection(source, marker, state.selected);
+  if (selected && next === source) throw new Error("Could not resolve the selected YouTube video");
+  await applySourceHTML(next);
+  closeSheet();
+  setStatus(selected ? "YouTube video replaced" : state.selected ? "YouTube video added after selection" : "YouTube video added", "dirty");
+}
+
+async function submitYouTubeForm(form) {
+  const input = form.elements.url;
+  try {
+    await insertYouTube(input.value);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "YouTube URL is invalid";
+    input.setCustomValidity(message);
+    input.reportValidity();
+    const help = form.querySelector("[data-youtube-error]");
+    if (help) help.textContent = message;
+    setStatus(message, "error");
+  }
 }
 
 function flattenMedia(node, result = []) {
@@ -1007,19 +1408,24 @@ async function uploadMediaFiles(files) {
 }
 
 async function openMediaSheet() {
-  const replacingImage = Boolean(selectedImageBlock());
+  const selectedReplacement = selectedImageBlock() ? "image" : selectedVideoBlock() ? "video" : selectedYouTubeBlock() ? "youtube" : "";
+  const heading = selectedReplacement === "image" ? "Replace selected image" : selectedReplacement === "video" ? "Replace selected video" : selectedReplacement === "youtube" ? "Replace selected YouTube video" : "Media library";
+  const youtubeAction = selectedReplacement === "youtube" ? "Replace YouTube video" : "Insert YouTube video";
   openSheet("media");
   const content = document.querySelector("#sheet-content");
   content.innerHTML = '<div class="sheet-loading">Loading media…</div>';
   try {
     const tree = await fetchJSON("/_cms/api/media");
-    const files = flattenMedia(tree).filter((file) => /\.(avif|gif|jpe?g|png|svg|webp)$/i.test(file.name || ""));
+    const files = flattenMedia(tree).filter((file) => ["image", "video"].includes(mediaFileKind(file)));
     content.innerHTML = `
-      <div class="sheet-heading"><div><span class="eyebrow">Media library</span><h2>${replacingImage ? "Replace selected image" : "Choose an image"}</h2></div><label class="upload-button">Upload<input id="media-upload" type="file" accept="image/*" multiple></label></div>
-      <div id="media-dropzone" class="media-dropzone" tabindex="0"><strong>Drop images here</strong><span>or tap to choose files</span></div>
-      <div class="media-grid">${files.length ? files.map((file) => `<button class="media-card" data-media-url="${escapeHTML(mediaURL(file))}" data-media-name="${escapeHTML(file.name)}"><img src="${escapeHTML(mediaURL(file))}" alt=""><span>${escapeHTML(file.name)}</span></button>`).join("") : '<p class="empty-state">No images yet.</p>'}</div>`;
+      <div class="sheet-heading"><div><span class="eyebrow">${escapeHTML(heading)}</span><h2>Media</h2><p class="sheet-subtitle">Choose a local image or video, or add a privacy-friendly YouTube link.</p></div><label class="upload-button">Upload<input id="media-upload" type="file" accept="image/*,video/mp4,video/webm" multiple></label></div>
+      <div id="media-dropzone" class="media-dropzone" role="button" aria-controls="media-upload" aria-label="Upload images or MP4/WebM videos" tabindex="0"><strong>Drop images or MP4/WebM videos here</strong><span>or tap to choose files</span></div>
+      <section class="media-library-section"><div class="media-section-heading"><div><span class="eyebrow">Local files</span><h3>Images &amp; videos</h3></div><small>${files.length} file${files.length === 1 ? "" : "s"}</small></div><div class="media-grid">${files.length ? files.map((file) => mediaCardHTML(file)).join("") : '<p class="empty-state">No images or videos yet.</p>'}</div></section>
+      <section class="youtube-insert-section"><div class="media-section-heading"><div><span class="eyebrow">External video</span><h3>YouTube</h3></div><span class="youtube-privacy-note">Loads only after activation</span></div><form id="youtube-form" class="youtube-form" novalidate><label class="form-field"><span>YouTube URL</span><input name="url" type="url" inputmode="url" autocomplete="url" required placeholder="https://youtu.be/…" aria-describedby="youtube-help youtube-error"></label><p id="youtube-help" class="youtube-help">HTTPS watch, shorts, embed, and youtu.be URLs are accepted. Paste a URL only—not iframe code.</p><p id="youtube-error" class="youtube-error" data-youtube-error role="alert"></p><div class="details-actions"><button type="submit" class="primary-button">${escapeHTML(youtubeAction)}</button></div></form></section>`;
     const input = content.querySelector("#media-upload");
     const zone = content.querySelector("#media-dropzone");
+    const youtubeInput = content.querySelector('#youtube-form [name="url"]');
+    const youtubeError = content.querySelector("[data-youtube-error]");
     const chooseFiles = async (filesToUpload) => {
       try { await uploadMediaFiles(filesToUpload); } catch (error) { setStatus(error.message, "error"); }
     };
@@ -1029,6 +1435,19 @@ async function openMediaSheet() {
     ["dragenter", "dragover"].forEach((type) => zone?.addEventListener(type, (event) => { event.preventDefault(); zone.classList.add("is-dragging"); }));
     ["dragleave", "drop"].forEach((type) => zone?.addEventListener(type, (event) => { event.preventDefault(); zone.classList.remove("is-dragging"); }));
     zone?.addEventListener("drop", async (event) => chooseFiles(event.dataTransfer?.files));
+    youtubeInput?.addEventListener("input", () => {
+      youtubeInput.setCustomValidity("");
+      if (youtubeError) youtubeError.textContent = "";
+    });
+    content.querySelectorAll(".media-card-video video").forEach((video) => {
+        video.addEventListener("loadedmetadata", () => {
+          const card = video.closest(".media-card");
+          const duration = card?.querySelector("[data-media-duration]");
+          const size = card?.querySelector("[data-media-size]")?.textContent || "";
+          if (duration) duration.textContent = `${formatMediaDuration(video.duration)}${size ? ` · ${size}` : ""}`;
+          if (video.duration === Infinity && duration) duration.textContent = `Live video${size ? ` · ${size}` : ""}`;
+        });
+      });
   } catch (error) {
     content.innerHTML = `<p class="error-card">${escapeHTML(error.message)}</p>`;
   }
@@ -1038,20 +1457,42 @@ async function insertImage(url, name) {
   const replacingImage = Boolean(selectedImageBlock());
   const hadSelection = Boolean(state.selected);
   const fragment = `<figure class="fileloom-image"><img src="${escapeHTML(url)}" alt="${escapeHTML(name)}"><figcaption>${escapeHTML(name)}</figcaption></figure>`;
-  const source = state.editor.getHtml();
-  const next = replacingImage
-    ? replaceSelection(source, fragment, state.selected, "figure.fileloom-image, img")
-    : insertAfterSelection(source, fragment, state.selected);
+  await state.editor.flush();
+  const source = sourceOrEditorHTML();
+  const selected = selectedImageBlock();
+  const selector = selected?.tagName === "FIGURE" ? "figure.fileloom-image" : "img";
+  const next = replacingImage ? replaceSelection(source, fragment, state.selected, selector) : insertAfterSelection(source, fragment, state.selected);
   if (next === source && replacingImage) {
     setStatus("Could not resolve the selected image", "error");
     return;
   }
-  await applyEditorHTML(next);
+  await applySourceHTML(next);
   closeSheet();
   setStatus(replacingImage ? "Image replaced" : hadSelection ? "Image added after selection" : "Image added", "dirty");
 }
 
+async function insertVideo(url, name, mime = "") {
+  const replacingVideo = Boolean(selectedVideoBlock());
+  const hadSelection = Boolean(state.selected);
+  const normalizedMime = mime || (/\.webm$/i.test(name) ? "video/webm" : "video/mp4");
+  const fragment = `<figure class="fileloom-video" data-fileloom-video data-file-name="${escapeHTML(name)}" data-media-mime="${escapeHTML(normalizedMime)}"><video src="${escapeHTML(url)}" controls preload="metadata" playsinline aria-label="${escapeHTML(name)}">${escapeHTML(name)} could not be played by this browser.</video><figcaption>${escapeHTML(name)}</figcaption><a class="fileloom-video-fallback" href="${escapeHTML(url)}" download>Download ${escapeHTML(name)}</a></figure>`;
+  await state.editor.flush();
+  const source = sourceOrEditorHTML();
+  const selected = selectedVideoBlock();
+  const selector = selected?.tagName === "FIGURE" ? "figure.fileloom-video" : "video";
+  const next = replacingVideo ? replaceSelection(source, fragment, state.selected, selector) : insertAfterSelection(source, fragment, state.selected);
+  if (next === source && replacingVideo) {
+    setStatus("Could not resolve the selected video", "error");
+    return;
+  }
+  await applySourceHTML(next);
+  closeSheet();
+  setStatus(replacingVideo ? "Video replaced" : hadSelection ? "Video added after selection" : "Video added", "dirty");
+}
+
+
 function openSheet(kind) {
+  if (state.sheet === "source" && kind !== "source") destroySourceEditor();
   state.sheet = kind;
   const backdrop = document.querySelector("#sheet-backdrop");
   const sheet = document.querySelector("#editor-sheet");
@@ -1076,6 +1517,7 @@ function openSheet(kind) {
 }
 
 function closeSheet() {
+  if (state.sheet === "source") destroySourceEditor();
   state.sheet = null;
   state.codeEdit = null;
   const backdrop = document.querySelector("#sheet-backdrop");
@@ -1086,7 +1528,7 @@ function closeSheet() {
 
 function blockCatalogHTML() {
   return `<div class="sheet-heading"><div><span class="eyebrow">Insert</span><h2>Choose a block</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div><div class="block-grid">${[
-    ["heading", "Heading", "Aa"], ["paragraph", "Paragraph", "¶"], ["quote", "Quote", "❞"], ["list", "List", "☷"], ["code", "Code", "<>"], ["divider", "Divider", "—"], ["link", "Link", "↗"], ["media", "Image", "▧"],
+    ["heading", "Heading", "Aa"], ["paragraph", "Paragraph", "¶"], ["quote", "Quote", "❞"], ["list", "List", "☷"], ["code", "Code", "<>"], ["divider", "Divider", "—"], ["link", "Link", "↗"], ["media", "Media", "▧"],
   ].map(([type, label, icon]) => `<button class="block-card" data-block="${type}"><span>${icon}</span><strong>${label}</strong><small>Tap to add</small></button>`).join("")}</div>`;
 }
 
@@ -1171,18 +1613,17 @@ function conflictSheetHTML() {
     return `<div class="sheet-heading"><div><span class="eyebrow">Save conflict</span><h2>Someone changed this page</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div><div class="info-card conflict-card"><p>Your local edits are safe in this canvas. Loading the current source…</p></div>`;
   }
   const merge = conflict.merge || metadataMerge(remote.document);
-  const baseBody = state.baseHTML || state.record?.html || "";
-  const localBody = isThemeResource()
-    ? sourceHTMLForSave(state.editor?.getHtml() || state.currentHTML)
-    : bodyHTMLFromEditorDocument(state.editor?.getHtml() || state.currentHTML);
+  const baseBody = baseBodyHTML();
+  const localBody = localBodyHTML();
+  const remoteBody = rawBodyHTMLForRecord(remote);
   const localChanged = normalizedBodyHTML(localBody) !== normalizedBodyHTML(baseBody);
-  const remoteChanged = normalizedBodyHTML(remote.html) !== normalizedBodyHTML(baseBody);
-  const bodyConflict = localChanged && remoteChanged && normalizedBodyHTML(localBody) !== normalizedBodyHTML(remote.html);
+  const remoteChanged = normalizedBodyHTML(remoteBody) !== normalizedBodyHTML(baseBody);
+  const bodyConflict = localChanged && remoteChanged && normalizedBodyHTML(localBody) !== normalizedBodyHTML(remoteBody);
   const fields = merge.conflicts.length ? `<p class="conflict-fields"><strong>Metadata conflicts:</strong> ${escapeHTML(merge.conflicts.join(", "))}</p>` : `<p class="conflict-fields">Metadata changes can be merged safely.</p>`;
   const mergeDisabled = bodyConflict || merge.conflicts.length > 0;
   return `<div class="sheet-heading"><div><span class="eyebrow">Save conflict</span><h2>Review newer source</h2></div><button class="icon-button" data-action="close-sheet" aria-label="Close">×</button></div>
     <div class="info-card conflict-card"><p>The source changed after this editor opened. Choose deliberately; nothing has been overwritten yet.</p><small>Remote source: ${escapeHTML(String(remote.source_sha256 || conflict.current_sha256 || "").slice(0, 12))}…</small>${fields}</div>
-    <div class="conflict-diff"><article><span class="eyebrow">Your local body</span><p>${escapeHTML(textSummary(localBody))}</p><small>${localChanged ? "Changed locally" : "Unchanged locally"}</small></article><article><span class="eyebrow">Remote body</span><p>${escapeHTML(textSummary(remote.html))}</p><small>${remoteChanged ? "Changed remotely" : "Unchanged remotely"}</small></article></div>
+    <div class="conflict-diff"><article><span class="eyebrow">Your local body</span><p>${escapeHTML(textSummary(localBody))}</p><small>${localChanged ? "Changed locally" : "Unchanged locally"}</small></article><article><span class="eyebrow">Remote body</span><p>${escapeHTML(textSummary(remoteBody))}</p><small>${remoteChanged ? "Changed remotely" : "Unchanged remotely"}</small></article></div>
     <div class="conflict-actions conflict-actions-stack"><button class="secondary-button" data-action="reload-conflict">Use remote version</button><button class="secondary-button" data-action="merge-conflict" ${mergeDisabled ? "disabled" : ""}>Merge safe changes, keep local body</button><button class="primary-button" data-action="overwrite-conflict">Keep all local edits</button></div>`;
 }
 
@@ -1251,6 +1692,7 @@ async function overwriteConflict() {
   state.record = remote;
   state.baseDocument = metadataFromDocument(remote.document);
   state.baseHTML = remote.html || "";
+  state.baseBodyHTML = rawBodyHTMLForRecord(remote);
   state.record.source_sha256 = remote.source_sha256;
   state.conflict = null;
   closeSheet();
@@ -1262,20 +1704,20 @@ async function mergeConflict() {
   const remote = state.conflict?.remote;
   const merge = state.conflict?.merge;
   if (!remote || !merge || merge.conflicts.length) return;
-  const baseBody = state.baseHTML || state.record?.html || "";
-  const localBody = isThemeResource()
-    ? sourceHTMLForSave(state.editor?.getHtml() || state.currentHTML)
-    : bodyHTMLFromEditorDocument(state.editor?.getHtml() || state.currentHTML);
+  const baseBody = baseBodyHTML();
+  const localBody = localBodyHTML();
+  const remoteBody = rawBodyHTMLForRecord(remote);
   const localChanged = normalizedBodyHTML(localBody) !== normalizedBodyHTML(baseBody);
-  const remoteChanged = normalizedBodyHTML(remote.html) !== normalizedBodyHTML(baseBody);
-  if (localChanged && remoteChanged && normalizedBodyHTML(localBody) !== normalizedBodyHTML(remote.html)) return;
+  const remoteChanged = normalizedBodyHTML(remoteBody) !== normalizedBodyHTML(baseBody);
+  if (localChanged && remoteChanged && normalizedBodyHTML(localBody) !== normalizedBodyHTML(remoteBody)) return;
   if (!localChanged && remoteChanged) {
-    await replaceEditorHTML(editorDocument(remote));
+    await replaceEditorHTML(editorDocument(remote), { sourceBodyHTML: isThemeResource() ? undefined : remoteBody });
     state.currentHTML = state.editor.getHtml();
   }
   state.record = remote;
   state.baseDocument = metadataFromDocument(remote.document);
   state.baseHTML = remote.html || "";
+  state.baseBodyHTML = remoteBody;
   state.record.source_sha256 = remote.source_sha256;
   state.metadata = merge.merged;
   state.conflict = null;
@@ -1333,6 +1775,7 @@ async function saveDocument() {
     const html = sourceHTMLForSave(await state.editor.flush());
     const versionAtStart = state.changeVersion;
     const metadata = isThemeResource() ? undefined : metadataPayload();
+    const bodyHTML = isThemeResource() ? undefined : state.sourceBodyHTML;
     const payload = await fetchJSON("/_cms/api/editor-save", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1340,21 +1783,27 @@ async function saveDocument() {
         resource: state.resource,
         theme: isThemeResource() ? state.record.theme : undefined,
         path: state.record.path,
-        html,
+        html: isThemeResource() ? html : undefined,
+        body_html: isThemeResource() ? undefined : bodyHTML,
         metadata,
         base_sha256: state.record.source_sha256,
         engine: "deckflow",
       }),
     });
+    const hasNewerEdits = state.changeVersion !== versionAtStart;
     state.record.source_sha256 = payload.source_sha256;
     state.record.document = payload.document || state.record.document;
-    state.record.html = payload.document?.html || payload.html || state.record.html;
+    if (payload.document && Object.prototype.hasOwnProperty.call(payload.document, "html")) state.record.html = payload.document.html;
+    else if (Object.prototype.hasOwnProperty.call(payload, "html")) state.record.html = payload.html;
+    if (!isThemeResource() && typeof payload.body_html === "string") state.record.body_html = payload.body_html;
     state.baseDocument = metadataFromDocument(state.record.document);
     state.baseHTML = state.record.html || "";
-    state.currentHTML = html;
+    state.baseBodyHTML = isThemeResource() ? state.baseHTML : rawBodyHTMLForRecord(state.record);
     state.conflict = null;
     updateDocumentHeading();
-    if (state.changeVersion === versionAtStart) {
+    if (!hasNewerEdits) {
+      if (!isThemeResource() && typeof payload.body_html === "string") state.sourceBodyHTML = payload.body_html;
+      state.currentHTML = html;
       state.metadata = metadataFromDocument(state.record.document);
       setDirty(false);
       setStatus("Saved", "success");
@@ -1383,14 +1832,16 @@ async function refreshDocument(force = false) {
   state.resource = fresh.resource || state.resource;
   state.path = fresh.path || state.path;
   state.currentHTML = editorDocument(fresh);
+  state.sourceBodyHTML = rawBodyHTMLForRecord(fresh);
   state.baseHTML = fresh.html || "";
+  state.baseBodyHTML = state.sourceBodyHTML;
   state.baseDocument = metadataFromDocument(fresh.document);
   state.metadata = metadataFromDocument(fresh.document);
   state.hostUndo = [];
   state.hostRedo = [];
   state.conflict = null;
   state.changeVersion += 1;
-  await replaceEditorHTML(state.currentHTML);
+  await replaceEditorHTML(state.currentHTML, { sourceBodyHTML: isThemeResource(fresh) ? undefined : state.sourceBodyHTML });
   updateDocumentHeading();
   setDirty(false);
   setStatus("Reloaded", "success");
@@ -1412,7 +1863,8 @@ async function openPreview() {
         resource: state.resource,
         theme: isThemeResource() ? state.record.theme : undefined,
         path: state.record.path,
-        html,
+        html: isThemeResource() ? html : undefined,
+        body_html: isThemeResource() ? undefined : state.sourceBodyHTML,
         metadata: isThemeResource() ? undefined : metadataPayload(),
       }),
       cache: "no-store",
@@ -1517,7 +1969,8 @@ async function handleAction(action) {
 app.addEventListener("click", async (event) => {
   const media = event.target.closest("[data-media-url]");
   if (media) {
-    await insertImage(media.dataset.mediaUrl, media.dataset.mediaName || "image");
+    if (media.dataset.mediaKind === "video") await insertVideo(media.dataset.mediaUrl, media.dataset.mediaName || "video", media.dataset.mediaMime || "");
+    else await insertImage(media.dataset.mediaUrl, media.dataset.mediaName || "image");
     return;
   }
   const block = event.target.closest("[data-block]");
@@ -1545,9 +1998,16 @@ app.addEventListener("input", (event) => {
 app.addEventListener("change", (event) => {
   const field = event.target.closest("#details-form [data-metadata]");
   if (field) updateMetadataDraft(field);
+  const wrapToggle = event.target.closest("#source-form [data-source-wrap-lines]");
+  if (wrapToggle) setSourceWrapPreference(wrapToggle.checked);
 });
 
 app.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && event.target.closest("#source-form .cm-content")) {
+    event.preventDefault();
+    event.target.closest("#source-form")?.requestSubmit();
+    return;
+  }
   const textarea = event.target.closest("#code-form textarea[name=code]");
   if (!textarea) return;
   if (event.key === "Tab" && !event.shiftKey) {
@@ -1568,11 +2028,13 @@ app.addEventListener("submit", async (event) => {
   const codeForm = event.target.closest("#code-form");
   const sourceForm = event.target.closest("#source-form");
   const inspectorForm = event.target.closest("#element-inspector-form");
-  if (!codeForm && !sourceForm && !inspectorForm) return;
+  const youtubeForm = event.target.closest("#youtube-form");
+  if (!codeForm && !sourceForm && !inspectorForm && !youtubeForm) return;
   event.preventDefault();
   if (codeForm) await submitCodeForm(codeForm);
   else if (sourceForm) await submitSourceForm(sourceForm);
-  else await submitElementInspector(inspectorForm);
+  else if (inspectorForm) await submitElementInspector(inspectorForm);
+  else await submitYouTubeForm(youtubeForm);
 });
 
 document.addEventListener("keydown", (event) => {
@@ -1597,7 +2059,9 @@ async function start() {
   state.record = await fetchJSON(editorRequestURL());
   state.resource = state.record.resource || (themeParam ? "theme-layout" : "content");
   state.path = state.record.path || path;
+  state.sourceBodyHTML = rawBodyHTMLForRecord(state.record);
   state.baseHTML = state.record.html || "";
+  state.baseBodyHTML = state.sourceBodyHTML;
   state.baseDocument = metadataFromDocument(state.record.document);
   state.metadata = metadataFromDocument(state.record.document);
   if (!state.record.editor?.engines?.some((engine) => engine.name === "deckflow" && engine.available)) {
@@ -1614,10 +2078,14 @@ async function start() {
     fit: "none",
     showScaleToggle: false,
     title: `${state.record.document?.title || state.record.path} editor canvas`,
-    onChange: ({ html, reason }) => {
+    onChange: ({ html, patches, reason }) => {
       const previous = state.currentHTML;
+      const previousBodyHTML = state.sourceBodyHTML;
       state.currentHTML = html;
-      if (reason !== "undo" && reason !== "redo") recordHostChange(previous, html);
+      if (!isThemeResource() && state.sourceBodyOverride === undefined) {
+        state.sourceBodyHTML = sourceBodyAfterDeckflowChange(previousBodyHTML, html, patches);
+      }
+      if (reason !== "undo" && reason !== "redo") recordHostChange(previous, html, previousBodyHTML);
       state.changeVersion += 1;
       setDirty(true);
     },

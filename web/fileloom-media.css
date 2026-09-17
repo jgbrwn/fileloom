@@ -1,0 +1,134 @@
+:root {
+  --fileloom-media-border: var(--fileloom-theme-media-border, color-mix(in srgb, currentColor 16%, transparent));
+  --fileloom-media-bg: var(--fileloom-theme-media-bg, color-mix(in srgb, currentColor 6%, transparent));
+  --fileloom-media-muted: var(--fileloom-theme-media-muted, color-mix(in srgb, currentColor 62%, transparent));
+  --fileloom-media-accent: var(--fileloom-theme-media-accent, #d71920);
+}
+
+.fileloom-video {
+  width: min(100%, 860px);
+  margin: 1.5rem auto;
+}
+.fileloom-video video {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--fileloom-media-border);
+  border-radius: .7rem;
+  background: #080b10;
+  box-shadow: 0 .5rem 1.5rem #0002;
+}
+.fileloom-video-fallback {
+  display: inline-block;
+  margin-top: .45rem;
+  color: inherit;
+  font-size: .8rem;
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+}
+.fileloom-video figcaption {
+  margin-top: .45rem;
+  color: var(--fileloom-media-muted);
+  font-size: .82rem;
+  overflow-wrap: anywhere;
+}
+
+.fileloom-youtube {
+  width: min(100%, 860px);
+  margin: 1.5rem auto;
+  overflow: hidden;
+  border: 1px solid var(--fileloom-media-border);
+  border-radius: .8rem;
+  background: var(--fileloom-media-bg);
+  box-shadow: 0 .5rem 1.5rem #0002;
+}
+.fileloom-youtube-placeholder,
+.fileloom-youtube-load {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  width: 100%;
+  min-height: 190px;
+  padding: 2rem;
+  color: inherit;
+}
+.fileloom-youtube-load {
+  border: 0;
+  cursor: pointer;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--fileloom-media-accent) 15%, transparent), transparent 62%), var(--fileloom-media-bg);
+  text-align: left;
+  transition: filter 140ms ease, transform 140ms ease;
+}
+.fileloom-youtube-load:hover,
+.fileloom-youtube-load:focus-visible {
+  filter: brightness(1.05);
+}
+.fileloom-youtube-load:active {
+  transform: scale(.995);
+}
+.fileloom-youtube-play {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 3.25rem;
+  height: 3.25rem;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--fileloom-media-accent);
+  font-size: 1.2rem;
+  line-height: 1;
+  box-shadow: 0 .35rem .9rem #0003;
+}
+.fileloom-youtube-copy {
+  display: grid;
+  gap: .3rem;
+  min-width: 0;
+}
+.fileloom-youtube-copy strong {
+  font-size: 1.02rem;
+  overflow-wrap: anywhere;
+}
+.fileloom-youtube-copy small,
+.fileloom-youtube-noscript {
+  color: var(--fileloom-media-muted);
+  font-size: .8rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.fileloom-youtube iframe {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  min-height: 190px;
+  border: 0;
+}
+.fileloom-youtube-fallback,
+.fileloom-youtube-noscript {
+  display: block;
+  padding: .8rem 1rem 1rem;
+  color: inherit;
+  text-align: center;
+  text-decoration: underline;
+}
+.fileloom-youtube-preview,
+.fileloom-youtube[data-fileloom-youtube]:not(.fileloom-youtube-public) {
+  cursor: default;
+}
+.fileloom-youtube-preview .fileloom-youtube-placeholder,
+.fileloom-youtube[data-fileloom-youtube]:not(.fileloom-youtube-public) .fileloom-youtube-placeholder {
+  pointer-events: none;
+}
+
+@media (max-width: 640px) {
+  .fileloom-youtube-placeholder,
+  .fileloom-youtube-load {
+    min-height: 150px;
+    padding: 1.25rem;
+  }
+  .fileloom-youtube-play {
+    width: 2.8rem;
+    height: 2.8rem;
+  }
+}

@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -16,6 +17,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -184,6 +187,114 @@ func TestEditorAPIGetAndJSONSaveContract(t *testing.T) {
 	server.Handler().ServeHTTP(missingRes, missingReq)
 	if missingRes.Code != http.StatusPreconditionRequired {
 		t.Fatalf("missing precondition status = %d: %s", missingRes.Code, missingRes.Body)
+	}
+}
+
+func TestEditorRawBodyHTMLRoundTripPreservesExactWhitespace(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	path := filepath.Join(siteDir, "content", "pages", "about.html")
+	current, err := server.loadSourceDocument("pages/about.html")
+	if err != nil {
+		t.Fatalf("load source: %v", err)
+	}
+	prefix := string(current.Source[:current.BodyStart])
+	initialBody := "\n  <section data-probe=\"initial\">\n<!-- keep this comment -->\n<script>\n  const initial = true;\n</script>\n<style>\n  .initial { color: red; }\n</style>\n\n"
+	initialSource := prefix + initialBody
+	if err := os.WriteFile(path, []byte(initialSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Build(); err != nil {
+		t.Fatalf("build initial source: %v", err)
+	}
+
+	get := func() struct {
+		HTML         string `json:"html"`
+		BodyHTML     string `json:"body_html"`
+		SourceSHA256 string `json:"source_sha256"`
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/_cms/api/editor?path=pages%2Fabout.html&engine=deckflow", nil)
+		req.Header.Set("X-ExeDev-Email", "owner@example.com")
+		res := httptest.NewRecorder()
+		server.Handler().ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("editor GET status = %d: %s", res.Code, res.Body)
+		}
+		var response struct {
+			HTML         string `json:"html"`
+			BodyHTML     string `json:"body_html"`
+			SourceSHA256 string `json:"source_sha256"`
+		}
+		if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	opened := get()
+	if opened.BodyHTML != initialBody || opened.SourceSHA256 == "" {
+		t.Fatalf("GET did not expose the exact raw body: %#v", opened)
+	}
+	if strings.TrimSpace(opened.HTML) != strings.TrimSpace(initialBody) {
+		t.Fatalf("legacy html contract changed unexpectedly: %q", opened.HTML)
+	}
+
+	previewBody := "\n  <div data-probe=\"preview\">\n<!-- preview comment -->\n<script>const preview = true;</script>\n\n"
+	previewPayload, _ := json.Marshal(map[string]any{
+		"path":      "pages/about.html",
+		"html":      "<p>legacy preview body</p>",
+		"body_html": previewBody,
+	})
+	previewReq := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-preview", bytes.NewReader(previewPayload))
+	previewReq.Header.Set("Content-Type", "application/json")
+	previewReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	previewRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(previewRes, previewReq)
+	if previewRes.Code != http.StatusOK {
+		t.Fatalf("raw body preview status = %d: %s", previewRes.Code, previewRes.Body)
+	}
+	if !strings.Contains(previewRes.Body.String(), `data-probe="preview"`) || !strings.Contains(previewRes.Body.String(), "const preview = true;") {
+		t.Fatalf("preview did not use body_html: %s", previewRes.Body)
+	}
+
+	savedBody := "\n\t<article data-probe=\"saved\">\n  <!-- saved comment -->\n<script>\n\tconst saved = true;\n</script>\n\n"
+	savePayload, _ := json.Marshal(map[string]any{
+		"path":        "pages/about.html",
+		"html":        "<p>legacy save body</p>",
+		"body_html":   savedBody,
+		"base_sha256": opened.SourceSHA256,
+		"engine":      "deckflow",
+	})
+	saveReq := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", bytes.NewReader(savePayload))
+	saveReq.Header.Set("Content-Type", "application/json")
+	saveReq.Header.Set("X-ExeDev-Email", "owner@example.com")
+	saveRes := httptest.NewRecorder()
+	server.Handler().ServeHTTP(saveRes, saveReq)
+	if saveRes.Code != http.StatusOK {
+		t.Fatalf("raw body save status = %d: %s", saveRes.Code, saveRes.Body)
+	}
+	var saved struct {
+		BodyHTML string `json:"body_html"`
+	}
+	if err := json.Unmarshal(saveRes.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.BodyHTML != savedBody {
+		t.Fatalf("save response body_html = %q, want %q", saved.BodyHTML, savedBody)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(updated) != prefix+savedBody {
+		t.Fatalf("raw body save changed source bytes:\n%s", updated)
+	}
+	reloaded := get()
+	if reloaded.BodyHTML != savedBody || !strings.Contains(reloaded.HTML, `data-probe="saved"`) {
+		t.Fatalf("reload did not preserve raw body: %#v", reloaded)
 	}
 }
 
@@ -1038,6 +1149,258 @@ func TestGitPushURLIsValidated(t *testing.T) {
 		t.Fatalf("SSH remote with username rejected: %v", err)
 	}
 }
+func configureGitAutomationForTest(t *testing.T, server *Server, commitOn string) {
+	t.Helper()
+	if _, err := runGit(server.SiteDir, "init", "-q"); err != nil {
+		t.Fatalf("init site repo: %v", err)
+	}
+	config, err := server.loadSiteConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Git = GitConfig{Enabled: true, AutoCommit: true, CommitOn: commitOn, Remote: "origin"}
+	if err := server.saveSiteConfig(config); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForGitSyncIdle(t *testing.T, server *Server) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		server.gitQueueMu.Lock()
+		busy := server.gitSyncRunning || server.gitSyncPending
+		server.gitQueueMu.Unlock()
+		if !busy {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("automatic Git sync worker did not become idle")
+}
+
+func TestAutomaticGitSyncDoesNotBlockSuccessfulMutation(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	configureGitAutomationForTest(t, server, "change")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	server.SetGitCommandRunner(func(timeout time.Duration, repo string, args ...string) (string, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return runGitWithTimeout(timeout, repo, args...)
+	})
+
+	form := "file=pages%2Fabout.html&html=%3Cp%3EAsync+Git+probe%3C%2Fp%3E"
+	request := httptest.NewRequest(http.MethodPost, "/_cms/api/editor-save", strings.NewReader(form))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("X-ExeDev-Email", "owner@example.com")
+	startedAt := time.Now()
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	elapsed := time.Since(startedAt)
+	if response.Code != http.StatusOK {
+		t.Fatalf("mutation status = %d: %s", response.Code, response.Body)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("successful mutation waited for optional Git: %s", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("automatic Git worker did not start")
+	}
+	status := server.gitStatus(GitConfig{Remote: "origin"})
+	if !status.Pending || !status.Running {
+		t.Fatalf("Git status did not expose an in-flight automatic sync: %#v", status)
+	}
+	statusRequest := httptest.NewRequest(http.MethodGet, "/_cms/api/git", nil)
+	statusRequest.Header.Set("X-ExeDev-Email", "owner@example.com")
+	statusResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(statusResponse, statusRequest)
+	if statusResponse.Code != http.StatusOK || !strings.Contains(statusResponse.Body.String(), `"pending":true`) || !strings.Contains(statusResponse.Body.String(), `"running":true`) {
+		t.Fatalf("Git API did not expose in-flight status: %d %s", statusResponse.Code, statusResponse.Body)
+	}
+	close(release)
+	waitForGitSyncIdle(t, server)
+}
+
+func TestAutomaticGitSyncSerializesAndCoalescesQueuedChanges(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	configureGitAutomationForTest(t, server, "change")
+
+	var calls atomic.Int32
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var blockOnce sync.Once
+	server.SetGitCommandRunner(func(timeout time.Duration, repo string, args ...string) (string, error) {
+		current := active.Add(1)
+		for {
+			previous := maxActive.Load()
+			if current <= previous || maxActive.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		defer active.Add(-1)
+		calls.Add(1)
+		if len(args) > 0 && args[0] == "status" {
+			blockOnce.Do(func() {
+				close(started)
+				<-release
+			})
+		}
+		switch {
+		case len(args) >= 2 && args[0] == "rev-parse" && args[1] == "--show-toplevel":
+			return server.SiteDir, nil
+		case len(args) > 0 && args[0] == "status":
+			return "", nil
+		default:
+			return "", nil
+		}
+	})
+
+	server.enqueueGitSync("first change")
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first automatic Git job did not reach its delayed command")
+	}
+	server.enqueueGitSync("second change")
+	server.enqueueGitSync("third change")
+	server.enqueueGitSync("fourth change")
+	close(release)
+	waitForGitSyncIdle(t, server)
+
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("Git commands overlapped: max active = %d", got)
+	}
+	if got := calls.Load(); got != 4 {
+		t.Fatalf("queued Git changes were not coalesced into one follow-up job: calls = %d, want 4", got)
+	}
+}
+
+func TestManualGitOperationWaitsForAutomaticWorkerWithoutDeadlock(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	configureGitAutomationForTest(t, server, "change")
+	config, err := server.loadSiteConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var blockOnce sync.Once
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	server.SetGitCommandRunner(func(timeout time.Duration, repo string, args ...string) (string, error) {
+		current := active.Add(1)
+		for {
+			previous := maxActive.Load()
+			if current <= previous || maxActive.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		defer active.Add(-1)
+		if len(args) > 0 && args[0] == "status" {
+			blockOnce.Do(func() {
+				close(started)
+				<-release
+			})
+			return "", nil
+		}
+		if len(args) >= 2 && args[0] == "rev-parse" && args[1] == "--show-toplevel" {
+			return server.SiteDir, nil
+		}
+		return "", nil
+	})
+
+	server.enqueueGitSync("automatic change")
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("automatic Git worker did not start")
+	}
+	manualDone := make(chan error, 1)
+	go func() {
+		_, manualErr := server.gitCommitAndPush(config.Git, "manual change", false)
+		manualDone <- manualErr
+	}()
+	select {
+	case err := <-manualDone:
+		t.Fatalf("manual Git operation completed while automatic worker held the mutex: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-manualDone:
+		if err != nil {
+			t.Fatalf("manual Git operation failed after worker release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manual Git operation deadlocked with automatic worker")
+	}
+	waitForGitSyncIdle(t, server)
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("manual and automatic Git commands overlapped: max active = %d", got)
+	}
+}
+func TestAutomaticGitSyncFailureIsLoggedAndExposedWithoutMutationFailure(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join(t.TempDir(), "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	configureGitAutomationForTest(t, server, "change")
+	server.SetGitCommandRunner(func(time.Duration, string, ...string) (string, error) {
+		return "", errors.New("injected Git failure")
+	})
+
+	if err := server.gitChangeIfConfigured("failure status probe"); err != nil {
+		t.Fatalf("optional Git failure leaked to mutation: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		server.gitQueueMu.Lock()
+		lastError := server.gitSyncLastError
+		server.gitQueueMu.Unlock()
+		if strings.Contains(lastError, "injected Git failure") {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	server.gitQueueMu.Lock()
+	lastError := server.gitSyncLastError
+	server.gitQueueMu.Unlock()
+	if !strings.Contains(lastError, "injected Git failure") {
+		t.Fatal("automatic Git failure was not retained in sync status")
+	}
+	status := server.gitStatus(GitConfig{Remote: "origin"})
+	if !strings.Contains(status.LastError, "injected Git failure") || status.Pending || status.Running {
+		t.Fatalf("unexpected automatic Git status: %#v", status)
+	}
+	if status.LastErrorAt == "" {
+		t.Fatal("automatic Git failure did not expose a timestamp")
+	}
+	request := httptest.NewRequest(http.MethodGet, "/_cms/api/git", nil)
+	request.Header.Set("X-ExeDev-Email", "owner@example.com")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"last_error":"injected Git failure"`) || !strings.Contains(response.Body.String(), `"pending":false`) {
+		t.Fatalf("Git API did not expose asynchronous failure state: %d %s", response.Code, response.Body)
+	}
+}
+
 func TestDeckflowSavePreservesArbitraryBodyMarkup(t *testing.T) {
 	siteDir := filepath.Join(t.TempDir(), "site")
 	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
@@ -1217,6 +1580,179 @@ func TestDeckflowMediaJSONUploadAndPublicAsset(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(siteDir, "public", "media", "uploads", "hero.png")); err != nil {
 		t.Fatalf("generated public media missing: %v", err)
+	}
+}
+
+func TestYouTubeURLValidationAndCanonicalMarkers(t *testing.T) {
+	valid := map[string]string{
+		"https://www.youtube.com/watch?v=dQw4w9WgXcQ":       "dQw4w9WgXcQ",
+		"https://youtube.com/shorts/dQw4w9WgXcQ?si=shared":  "dQw4w9WgXcQ",
+		"https://www.youtube.com/embed/dQw4w9WgXcQ?start=4": "dQw4w9WgXcQ",
+		"https://youtu.be/dQw4w9WgXcQ?si=shared":            "dQw4w9WgXcQ",
+	}
+	for input, want := range valid {
+		if got, err := normalizeYouTubeURL(input); err != nil || got != want {
+			t.Fatalf("normalizeYouTubeURL(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
+	invalid := []string{
+		"http://youtu.be/dQw4w9WgXcQ",
+		"https://evil.example/watch?v=dQw4w9WgXcQ",
+		"https://youtube.com/watch?v=short",
+		"https://youtube.com/watch?v=dQw4w9WgXcQ&v=anotherID",
+		"https://youtube.com/playlist?list=dQw4w9WgXcQ",
+		"https://youtube.com/iframe/dQw4w9WgXcQ",
+		`<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>`,
+	}
+	for _, input := range invalid {
+		if got, err := normalizeYouTubeURL(input); err == nil {
+			t.Fatalf("normalizeYouTubeURL(%q) accepted ID %q", input, got)
+		}
+	}
+	marker := youtubeMarkerHTML("dQw4w9WgXcQ", `A "quoted" <video>`, `Fallback & details`)
+	if !strings.Contains(marker, `data-fileloom-youtube`) || !strings.Contains(marker, `data-youtube-id="dQw4w9WgXcQ"`) {
+		t.Fatalf("canonical marker missing semantic attributes: %s", marker)
+	}
+	if strings.Contains(marker, `A "quoted" <video>`) || strings.Contains(marker, `Fallback & details`) {
+		t.Fatalf("canonical marker did not escape labels: %s", marker)
+	}
+	if !strings.Contains(marker, `A &#34;quoted&#34; &lt;video&gt;`) || !strings.Contains(marker, `Fallback &amp; details`) {
+		t.Fatalf("canonical marker escaped labels unexpectedly: %s", marker)
+	}
+}
+
+func TestYouTubePublicAndPreviewRenderingIsClickToLoad(t *testing.T) {
+	literal := youtubeMarkerHTML("dQw4w9WgXcQ", "Literal", "Do not render")
+	source := `<p>before</p><script>const keep = "<figure data-fileloom-youtube>";</script><textarea>` + literal + `</textarea>` + youtubeMarkerHTML("dQw4w9WgXcQ", "Demo", "Open video") + `<!-- keep this comment --><p>after</p>`
+	public := renderFileloomMedia(source, fileloomMediaPublic)
+	if !strings.Contains(public, `data-fileloom-rendered="public"`) || !strings.Contains(public, "youtube-nocookie.com") {
+		t.Fatalf("public rendering did not mark the privacy-enhanced loader: %s", public)
+	}
+	if strings.Count(public, `data-fileloom-rendered="public"`) != 1 {
+		t.Fatalf("media renderer rewrote a literal marker in a textarea: %s", public)
+	}
+	if strings.Contains(public, `src="https://www.youtube-nocookie.com/embed/`) || strings.Contains(public, "<iframe") {
+		t.Fatalf("public rendering made an external requestable frame before activation: %s", public)
+	}
+	if !strings.Contains(public, `<button type="button"`) || !strings.Contains(public, `data-fileloom-youtube-load`) || !strings.Contains(public, `data-fileloom-youtube-fallback`) {
+		t.Fatalf("public rendering missing click-to-load control: %s", public)
+	}
+	if !strings.Contains(public, `<script>const keep`) || !strings.Contains(public, "keep this comment") {
+		t.Fatalf("targeted media rendering changed unrelated owner HTML: %s", public)
+	}
+	preview := renderFileloomMedia(source, fileloomMediaPreview)
+	if !strings.Contains(preview, "Preview is inert") || strings.Contains(preview, "<iframe") || strings.Contains(preview, "youtube-nocookie.com") {
+		t.Fatalf("preview rendering was not inert: %s", preview)
+	}
+}
+
+func TestDeckflowVideoMediaUploadAndPublicAsset(t *testing.T) {
+	server, err := New(filepath.Join(t.TempDir(), "site"), filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	fixtures := []struct {
+		name string
+		mime string
+		path string
+	}{
+		{name: "clip.mp4", mime: "video/mp4", path: filepath.Join("..", "web", "editor", "e2e", "fixtures", "tiny.mp4")},
+		{name: "clip.webm", mime: "video/webm", path: filepath.Join("..", "web", "editor", "e2e", "fixtures", "tiny.webm")},
+	}
+	for _, fixture := range fixtures {
+		data, err := os.ReadFile(fixture.path)
+		if err != nil {
+			t.Fatalf("read %s fixture: %v", fixture.name, err)
+		}
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, err := writer.CreateFormFile("file", fixture.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write(data); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/_cms/api/media", &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("X-ExeDev-Email", "owner@example.com")
+		res := httptest.NewRecorder()
+		server.Handler().ServeHTTP(res, req)
+		if res.Code != http.StatusCreated {
+			t.Fatalf("%s upload status = %d: %s", fixture.name, res.Code, res.Body)
+		}
+		var uploaded struct {
+			URL string `json:"url"`
+		}
+		if err := json.Unmarshal(res.Body.Bytes(), &uploaded); err != nil {
+			t.Fatal(err)
+		}
+		publicReq := httptest.NewRequest(http.MethodGet, uploaded.URL, nil)
+		publicRes := httptest.NewRecorder()
+		server.Handler().ServeHTTP(publicRes, publicReq)
+		if publicRes.Code != http.StatusOK || publicRes.Header().Get("Content-Type") != fixture.mime || !bytes.Equal(publicRes.Body.Bytes(), data) {
+			t.Fatalf("%s public response = %d %q %q", fixture.name, publicRes.Code, publicRes.Header().Get("Content-Type"), publicRes.Body.Bytes())
+		}
+		if _, err := os.Stat(filepath.Join(server.SiteDir, "public", "media", fixture.name)); err != nil {
+			t.Fatalf("generated public video missing for %s: %v", fixture.name, err)
+		}
+	}
+}
+
+func TestYouTubeCSPIsAddedOnlyForRenderedPublicMedia(t *testing.T) {
+	siteDir := filepath.Join(t.TempDir(), "site")
+	server, err := New(siteDir, filepath.Join("..", "web"), "owner@example.com")
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	server.PublicCSP = defaultPublicCSP
+	path := filepath.Join(siteDir, "content", "pages", "about.html")
+	current, err := server.loadSourceDocument("pages/about.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := youtubeMarkerHTML("dQw4w9WgXcQ", "CSP test", "Watch")
+	if err := os.WriteFile(path, append(current.Source[:current.BodyStart], []byte(body)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Build(); err != nil {
+		t.Fatalf("build YouTube source: %v", err)
+	}
+	publicOutput, err := os.ReadFile(filepath.Join(siteDir, "public", "about", "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(publicOutput), "/theme/fileloom-media.css") || !strings.Contains(string(publicOutput), "/theme/fileloom-media.js") {
+		t.Fatalf("public YouTube output did not include shared media assets: %s", publicOutput)
+	}
+	if _, err := os.Stat(filepath.Join(siteDir, "public", "theme", "fileloom-media.css")); err != nil {
+		t.Fatalf("public media CSS missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(siteDir, "public", "theme", "fileloom-media.js")); err != nil {
+		t.Fatalf("public media JS missing: %v", err)
+	}
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/about/", nil)
+		res := httptest.NewRecorder()
+		server.Handler().ServeHTTP(res, req)
+		return res
+	}
+	withVideo := request()
+	if withVideo.Code != http.StatusOK || !strings.Contains(withVideo.Header().Get("Content-Security-Policy"), "frame-src 'self' https://www.youtube-nocookie.com") {
+		t.Fatalf("YouTube public CSP = %d %q", withVideo.Code, withVideo.Header().Get("Content-Security-Policy"))
+	}
+	if err := os.WriteFile(path, append(current.Source[:current.BodyStart], []byte(`<p>No video here</p>`)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Build(); err != nil {
+		t.Fatalf("build without YouTube source: %v", err)
+	}
+	withoutVideo := request()
+	if withoutVideo.Header().Get("Content-Security-Policy") != defaultPublicCSP {
+		t.Fatalf("public CSP changed without YouTube media: %q", withoutVideo.Header().Get("Content-Security-Policy"))
 	}
 }
 

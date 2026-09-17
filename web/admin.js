@@ -75,9 +75,20 @@ function renderGit(data) {
   const status = data.status || data || {};
   const config = data.config || {};
   const pill = $("#git-status-pill");
+  const automationMessage = status.running
+    ? "Automatic Git sync is running."
+    : status.pending
+      ? "Automatic Git sync is queued."
+      : status.last_error
+        ? `Automatic Git sync failed: ${status.last_error}`
+        : "";
   if (!status.available) {
-    pill.textContent = "Unavailable"; pill.className = "status draft";
-    $("#git-summary").textContent = status.error || "This site is not inside a Git repository.";
+    pill.textContent = status.running ? "Syncing…" : "Unavailable"; pill.className = "status draft";
+    $("#git-summary").textContent = [status.error || "This site is not inside a Git repository.", automationMessage].filter(Boolean).join(" ");
+  } else if (automationMessage) {
+    pill.textContent = status.running ? "Syncing…" : status.pending ? "Queued" : "Sync error";
+    pill.className = "status draft";
+    $("#git-summary").textContent = automationMessage;
   } else {
     pill.textContent = status.clean ? "Clean" : `${status.changes} change${status.changes === 1 ? "" : "s"}`;
     pill.className = `status ${status.clean ? "" : "draft"}`;

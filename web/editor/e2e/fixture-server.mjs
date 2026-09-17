@@ -12,6 +12,12 @@ const targetSite = join(tempRoot, "site");
 const ownerEmail = process.env.FILELOOM_E2E_EMAIL || "owner@example.com";
 const port = process.env.FILELOOM_E2E_PORT || "8010";
 
+const childEnv = { ...process.env };
+if (process.env.FILELOOM_E2E_CSP) {
+  childEnv.FILELOOM_CMS_CSP = process.env.FILELOOM_E2E_CSP;
+  childEnv.FILELOOM_PUBLIC_CSP = process.env.FILELOOM_E2E_CSP;
+}
+
 await cp(sourceSite, targetSite, {
   recursive: true,
   filter: (source) => !source.includes(`${join("site", ".fileloom")}`) && !source.includes(`${join("site", "public")}`),
@@ -19,6 +25,7 @@ await cp(sourceSite, targetSite, {
 
 const child = spawn("go", ["run", "./cmd/fileloom", "-listen", `127.0.0.1:${port}`, "-site", targetSite, "-web", join(root, "web"), "-owner-email", ownerEmail], {
   cwd: root,
+  env: childEnv,
   stdio: "inherit",
 });
 

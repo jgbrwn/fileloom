@@ -1,9 +1,15 @@
+import { readFileSync } from "node:fs";
 import { test, expect } from "@playwright/test";
 
 const editorURL = "/_cms/editor?path=pages%2Fabout.html";
 const themeEditorURL = "/_cms/editor?theme=brutalist";
 const e2eBaseURL = process.env.FILELOOM_E2E_URL || "http://127.0.0.1:8010";
 const e2eOwnerEmail = process.env.FILELOOM_E2E_EMAIL || "owner@example.com";
+const sourceWrapStorageKey = "fileloom.editor.source-wrap-lines";
+const builtInThemes = ["bento", "brutalist", "default", "editorial", "midnight", "terminal"];
+const cspRegressionEnabled = Boolean(
+  process.env.FILELOOM_E2E_CSP || (process.env.FILELOOM_CMS_CSP && process.env.FILELOOM_PUBLIC_CSP),
+);
 
 async function openEditor(page) {
   await page.goto(editorURL);
@@ -86,6 +92,7 @@ async function restoreEditorDocument(page, original) {
       path: original.path,
       engine: "deckflow",
       html: original.html,
+      body_html: original.body_html,
       metadata: editorMetadata(original.document),
       base_sha256: current.source_sha256,
     }),
@@ -102,6 +109,17 @@ async function insertParagraphBlock(page) {
 async function openDetails(page) {
   await page.locator('[data-action="details"]:visible').first().click();
   await expect(page.locator("#details-form")).toBeVisible();
+}
+
+async function openSourceSheet(page) {
+  const mobile = await page.locator(".mobile-nav").isVisible();
+  if (mobile) {
+    await page.locator('[data-action="details"]:visible').click();
+    await page.locator('#sheet-content [data-action="source"]').click();
+  } else {
+    await page.locator('.topbar-actions [data-action="source"]:visible').click();
+  }
+  await expect(page.locator("#source-form")).toBeVisible();
 }
 
 async function focusTextEnd(page, locator) {
@@ -314,13 +332,106 @@ test.describe("Deckflow Fileloom editor", () => {
       await page.locator('.topbar-actions [data-action="source"]:visible').click();
     }
     await expect(page.locator("#source-form")).toBeVisible();
-    await expect(page.locator('#source-form [name="html"]')).toHaveValue(/ordinary HTML file/);
-    await page.locator('#source-form [name="html"]').fill('<p data-source-edit="yes">Edited directly in HTML.</p>\n<pre class="fileloom-code-block" data-fileloom-code data-language="javascript"><code class="language-javascript" data-language="javascript">const source = true;</code></pre>');
+    const sourceEditor = page.locator('#source-form [data-source-editor] .cm-content');
+    await expect(sourceEditor).toBeVisible();
+    await expect(page.locator('#source-form [data-source-mirror]')).toHaveValue(/ordinary HTML file/);
+    await sourceEditor.fill('<p data-source-edit="yes">Edited directly in HTML.</p>\n<pre class="fileloom-code-block" data-fileloom-code data-language="javascript"><code class="language-javascript" data-language="javascript">const source = true;</code></pre>');
     await page.locator('#source-form button[type="submit"]').click();
     const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
     await expect(page.locator("#editor-status")).toHaveText("HTML source applied");
     await expect(frame.locator('p[data-source-edit="yes"]')).toHaveText("Edited directly in HTML.");
     await expect(frame.locator('pre[data-fileloom-code]')).toHaveAttribute("data-language", "javascript");
+  });
+
+  test("preserves exact body source and highlights nested HTML, comments, JavaScript, and CSS", async ({ page }) => {
+    const original = await getEditorDocument(page);
+    const initialBody = "\n<section class=\"source-probe\">\n  <!-- source comment -->\n  <h2>Source probe</h2>\n  <script>\n    const answer = 42;\n  </script>\n  <style>\n    .source-probe { color: rebeccapurple; }\n  </style>\n</section>\n\n";
+    const seeded = await cmsJSON(page, "/_cms/api/editor-save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: original.path,
+        engine: "deckflow",
+        html: "<p>legacy body should not win</p>",
+        body_html: initialBody,
+        metadata: editorMetadata(original.document),
+        base_sha256: original.source_sha256,
+      }),
+    });
+    expect(seeded.status, JSON.stringify(seeded.body)).toBe(200);
+    try {
+      await openEditor(page);
+      await openSourceSheet(page);
+      const source = page.locator("#source-form [data-source-editor]");
+      const content = source.locator(".cm-content");
+      await expect(content).toBeVisible();
+      await expect(page.locator("#source-form [data-source-mirror]")).toHaveValue(initialBody);
+      const syntax = await content.locator("span").evaluateAll((elements) => elements.map((element) => ({ text: element.textContent, className: element.className })));
+      expect(syntax.length).toBeGreaterThan(8);
+      expect(syntax.some(({ text }) => text.includes("source comment"))).toBeTruthy();
+      expect(syntax.some(({ text }) => text.includes("const"))).toBeTruthy();
+      expect(syntax.some(({ text }) => text.includes("color"))).toBeTruthy();
+
+      const editedBody = initialBody.replace("Source probe", "Edited source probe").replace(/\n\n$/, "\n  \n\n");
+      if (await page.locator(".mobile-nav").isVisible()) {
+        await content.click();
+        await content.press("ControlOrMeta+A");
+        await content.press("Backspace");
+        await page.keyboard.insertText(editedBody);
+      } else {
+        await content.fill(editedBody);
+      }
+      await page.locator("#source-form button[type=submit]").click();
+      await expect(page.locator("#editor-status")).toHaveText("HTML source applied");
+      await page.locator('[data-action="save"]:visible').first().click();
+      await expect(page.locator("#editor-status")).toHaveText("Saved");
+
+      const saved = await getEditorDocument(page);
+      expect(saved.body_html).toBe(editedBody);
+      expect(saved.html).toContain("Edited source probe");
+      await page.reload();
+      await openSourceSheet(page);
+      await expect(page.locator("#source-form [data-source-mirror]")).toHaveValue(editedBody);
+    } finally {
+      await restoreEditorDocument(page, original);
+    }
+  });
+
+  test("keeps source wrapping presentation-only and locally persistent", async ({ page }) => {
+    await openEditor(page);
+    await page.evaluate((key) => localStorage.removeItem(key), sourceWrapStorageKey);
+    await page.reload();
+    await expect(page.locator(".editor-shell")).toBeVisible();
+    await openSourceSheet(page);
+
+    const sourceEditor = page.locator('#source-form [data-source-editor]');
+    const sourceMirror = page.locator('#source-form [data-source-mirror]');
+    const toggle = page.locator('#source-form [data-source-wrap-lines]');
+    const original = await sourceMirror.inputValue();
+    await expect(toggle).not.toBeChecked();
+    await expect(sourceEditor).toHaveAttribute("data-wrap-lines", "off");
+    expect(await sourceEditor.locator('.cm-content').evaluate((element) => getComputedStyle(element).whiteSpace)).toBe("pre");
+
+    await toggle.check();
+    await expect(toggle).toBeChecked();
+    await expect(sourceEditor).toHaveAttribute("data-wrap-lines", "on");
+    expect(await sourceEditor.locator('.cm-content').evaluate((element) => getComputedStyle(element).whiteSpace)).toBe("pre-wrap");
+    expect(await sourceMirror.inputValue()).toBe(original);
+
+    const sheetBox = await page.locator("#editor-sheet").boundingBox();
+    const viewport = page.viewportSize();
+    expect(sheetBox).not.toBeNull();
+    expect(viewport).not.toBeNull();
+    expect(sheetBox.x).toBeGreaterThanOrEqual(0);
+    expect(sheetBox.y).toBeGreaterThanOrEqual(0);
+    expect(sheetBox.x + sheetBox.width).toBeLessThanOrEqual(viewport.width + 1);
+    expect(sheetBox.y + sheetBox.height).toBeLessThanOrEqual(viewport.height + 1);
+
+    await page.reload();
+    await expect(page.locator(".editor-shell")).toBeVisible();
+    await openSourceSheet(page);
+    await expect(page.locator('#source-form [data-source-wrap-lines]')).toBeChecked();
+    await expect(page.locator('#source-form [data-source-mirror]')).toHaveValue(original);
   });
 
   test("opens the actual theme-applied preview", async ({ page }) => {
@@ -714,6 +825,95 @@ test.describe("Deckflow Fileloom editor", () => {
     await expect(frame.locator(`img[src="/media/${firstName}"]`)).toHaveCount(0);
   });
 
+  test("uploads MP4/WebM videos, validates YouTube URLs, and preserves media through save/reload", async ({ page }) => {
+    const original = await getEditorDocument(page);
+    try {
+      const suffix = test.info().project.name;
+      const mp4Name = `editor-${suffix}.mp4`;
+      const webmName = `editor-${suffix}.webm`;
+      await openEditor(page);
+      const mobile = await page.locator(".mobile-nav").isVisible();
+      if (mobile) await page.locator('[data-action="media"]:visible').click();
+      else await page.locator('.desktop-blocks [data-block="media"]').click();
+      await expect(page.locator("#youtube-form")).toBeVisible();
+      await page.locator("#media-upload").setInputFiles([
+        { name: mp4Name, mimeType: "video/mp4", buffer: readFileSync(new URL("./fixtures/tiny.mp4", import.meta.url)) },
+        { name: webmName, mimeType: "video/webm", buffer: readFileSync(new URL("./fixtures/tiny.webm", import.meta.url)) },
+      ]);
+      await expect(page.locator(`[data-media-name="${mp4Name}"]`)).toBeVisible();
+      await expect(page.locator(`[data-media-name="${webmName}"]`)).toBeVisible();
+      const mp4Card = page.locator('.media-card-video').filter({ has: page.locator(`[data-media-name="${mp4Name}"]`) });
+      await expect(mp4Card.locator("video")).toHaveAttribute("controls", "");
+      await expect(mp4Card.locator("video")).toHaveAttribute("preload", "metadata");
+      await page.locator(`[data-media-name="${mp4Name}"]`).click();
+
+      const frame = page.frameLocator("iframe.deckflow-html-editor__preview");
+      await expect(frame.locator(`figure.fileloom-video video[src="/media/${mp4Name}"]`)).toBeVisible();
+      await frame.locator(`figure.fileloom-video video[src="/media/${mp4Name}"]`).click();
+      if (mobile) await page.locator('[data-action="details"]:visible').click();
+      await expect(page.locator('[data-action="media"]:visible').filter({ hasText: "Replace video" })).toBeVisible();
+      await page.locator('[data-action="media"]:visible').filter({ hasText: "Replace video" }).click();
+      await expect(page.locator("#sheet-content")).toContainText("Replace selected video");
+      await page.locator(`[data-media-name="${webmName}"]`).click();
+      await expect(frame.locator(`figure.fileloom-video video[src="/media/${webmName}"]`)).toBeVisible();
+      await expect(frame.locator(`figure.fileloom-video video[src="/media/${mp4Name}"]`)).toHaveCount(0);
+
+      if (mobile) await page.locator('[data-action="media"]:visible').click();
+      else await page.locator('.desktop-blocks [data-block="media"]').click();
+      const youtubeURL = page.locator('#youtube-form [name="url"]');
+      await youtubeURL.fill("https://evil.example/watch?v=dQw4w9WgXcQ");
+      await page.locator("#youtube-form button[type=submit]").click();
+      await expect(page.locator("[data-youtube-error]")).toContainText("host is not allowed");
+      await youtubeURL.fill('<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>');
+      await page.locator("#youtube-form button[type=submit]").click();
+      await expect(page.locator("[data-youtube-error]")).toContainText(/HTTPS YouTube URL|invalid/);
+      await expect(frame.locator("[data-fileloom-youtube]")).toHaveCount(0);
+      await youtubeURL.fill("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+      await page.locator("#youtube-form button[type=submit]").click();
+      await expect(frame.locator('[data-fileloom-youtube][data-youtube-id="dQw4w9WgXcQ"]')).toBeVisible();
+      await expect(frame.locator('[data-fileloom-youtube] iframe')).toHaveCount(0);
+      await frame.locator("[data-fileloom-youtube]").click();
+      if (mobile) await page.locator('[data-action="details"]:visible').click();
+      await page.locator('[data-action="media"]:visible').filter({ hasText: "Replace YouTube video" }).click();
+      await page.locator('#youtube-form [name="url"]').fill("https://youtu.be/M7lc1UVf-VE");
+      await page.locator("#youtube-form button[type=submit]").click();
+      await expect(frame.locator('[data-fileloom-youtube][data-youtube-id="M7lc1UVf-VE"]')).toBeVisible();
+
+      const savedBody = await getEditorDocument(page);
+      await page.locator('[data-action="save"]:visible').first().click();
+      await expect(page.locator("#editor-status")).toHaveText("Saved");
+      const afterSave = await getEditorDocument(page);
+      expect(afterSave.body_html).toContain('data-fileloom-youtube');
+      expect(afterSave.body_html).toContain('data-youtube-id="M7lc1UVf-VE"');
+      expect(afterSave.body_html).toContain(`/media/${webmName}`);
+      expect(afterSave.body_html).not.toContain("evil.example");
+      expect(afterSave.body_html).not.toBe(savedBody.body_html);
+
+      await page.reload();
+      await openSourceSheet(page);
+      await expect(page.locator("#source-form [data-source-mirror]")).toHaveValue(afterSave.body_html);
+      await page.locator('#editor-sheet [data-action="close-sheet"]').first().click();
+      await page.goto("/about/");
+      await expect(page.locator(`.fileloom-video video[src="/media/${webmName}"]`)).toBeVisible();
+    await expect(page.locator('link[href="/theme/fileloom-media.css"]')).toHaveCount(1);
+      await expect(page.locator('[data-fileloom-youtube-load]')).toBeVisible();
+      await expect(page.locator('[data-fileloom-youtube-fallback]')).toBeVisible();
+      await expect(page.locator('[data-fileloom-youtube] iframe')).toHaveCount(0);
+      const youtubeRequests = [];
+      page.on("request", (request) => {
+        if (request.url().startsWith("https://www.youtube-nocookie.com/")) youtubeRequests.push(request.url());
+      });
+      await page.waitForTimeout(100);
+      expect(youtubeRequests).toEqual([]);
+      await page.locator("[data-fileloom-youtube-load]").click();
+      await expect(page.locator('[data-fileloom-youtube] iframe[src^="https://www.youtube-nocookie.com/embed/M7lc1UVf-VE"]')).toHaveCount(1);
+      await expect(page.locator('[data-fileloom-youtube-fallback]')).toBeVisible();
+      await expect.poll(() => youtubeRequests.length).toBeGreaterThan(0);
+
+    } finally {
+      await restoreEditorDocument(page, original);
+    }
+  });
   test("restores a source revision from the editor history sheet", async ({ page }) => {
     const original = await getEditorDocument(page);
     try {
@@ -736,6 +936,75 @@ test.describe("Deckflow Fileloom editor", () => {
       await expect(page.frameLocator("iframe.deckflow-html-editor__preview").locator("p").filter({ hasText: "Write something here." })).toHaveCount(0);
     } finally {
       await restoreEditorDocument(page, original);
+    }
+  });
+
+  test("keeps Deckflow and every built-in public theme working under opt-in CSP", async ({ page }) => {
+    test.skip(!cspRegressionEnabled, "Run with FILELOOM_E2E_CSP=default to exercise the opt-in CSP profile");
+
+    const violations = [];
+    page.on("console", (message) => {
+      if (message.type() === "error" && /content security policy|refused to (load|execute|connect)/i.test(message.text())) {
+        violations.push(message.text());
+      }
+    });
+    await page.addInitScript(() => {
+      window.__fileloomCSPViolations = [];
+      document.addEventListener("securitypolicyviolation", (event) => {
+        window.__fileloomCSPViolations.push({
+          blockedURI: event.blockedURI,
+          directive: event.effectiveDirective,
+        });
+      });
+    });
+
+    const editorResponse = await page.goto(editorURL);
+    expect(editorResponse?.status()).toBe(200);
+    expect(editorResponse?.headers()["content-security-policy"]).toBeTruthy();
+    await expect(page.locator(".editor-shell")).toBeVisible();
+    await expect(page.frameLocator("iframe.deckflow-html-editor__preview").locator("body")).toBeVisible();
+
+    const originalSite = await cmsJSON(page, "/_cms/api/site");
+    expect(originalSite.status, JSON.stringify(originalSite.body)).toBe(200);
+    const themesResponse = await cmsJSON(page, "/_cms/api/themes");
+    expect(themesResponse.status, JSON.stringify(themesResponse.body)).toBe(200);
+    expect(themesResponse.body.themes.map((theme) => theme.name).sort()).toEqual([...builtInThemes].sort());
+
+    const readViolations = async () => {
+      const frameViolations = await Promise.all(page.frames().map((frame) => frame.evaluate(() => window.__fileloomCSPViolations || []).catch(() => [])));
+      return [...violations, ...frameViolations.flat()];
+    };
+
+    try {
+      for (const theme of builtInThemes) {
+        const activated = await cmsJSON(page, "/_cms/api/themes/activate", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `name=${encodeURIComponent(theme)}`,
+        });
+        expect(activated.status, `${theme}: ${JSON.stringify(activated.body)}`).toBe(200);
+
+        const publicResponse = await page.goto("/");
+        expect(publicResponse?.status(), `${theme}: public page`).toBe(200);
+        expect(publicResponse?.headers()["content-security-policy"], `${theme}: public CSP`).toBeTruthy();
+        await expect(page.locator("header.site-header")).toBeVisible();
+        await expect(page.locator('link[href^="/theme/style.css"]')).toHaveCount(1);
+        const activeSite = await cmsJSON(page, "/_cms/api/site");
+        expect(activeSite.body.site.theme).toBe(theme);
+        const stylesheet = await page.request.get(new URL("/theme/style.css", e2eBaseURL).toString());
+        expect(stylesheet.status(), `${theme}: stylesheet`).toBe(200);
+        expect(await readViolations(), `${theme}: CSP violations`).toEqual([]);
+      }
+    } finally {
+      const originalTheme = originalSite.body.site?.theme;
+      if (originalTheme) {
+        const restored = await cmsJSON(page, "/_cms/api/themes/activate", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `name=${encodeURIComponent(originalTheme)}`,
+        });
+        expect(restored.status, JSON.stringify(restored.body)).toBe(200);
+      }
     }
   });
 
